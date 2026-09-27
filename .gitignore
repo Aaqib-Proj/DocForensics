@@ -1,0 +1,40 @@
+# Python Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest & testing cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+err.log
+out.log
+
+# Temporary and backup files
+*.bak
+*.tmp
+*~
+
+# Test artifacts
+test_rtl.pdf
+
+# Scratch / experiments directory
+scratch/
+
+# Environments
+.env
+.venv/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
