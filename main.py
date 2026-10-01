@@ -218,10 +218,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 APP_NAME = "DocForensics Analyzer"
-APP_VERSION = "MVP-30"
+APP_VERSION = "MVP-31"
 
 _SHORTCUTS = [
     ("Open Original / Suspect", "Ctrl+O / Ctrl+Shift+O"),
+    ("Merge Suspect Files", "Ctrl+Shift+M"),
     ("Compare", "F5"),
     ("Next / previous difference", "F8 / Shift+F8"),
     ("Accept / Reject / Reset selected", "A / R / U (in the list)"),
@@ -300,6 +301,8 @@ class MainWindow(QMainWindow):
             # a Word document is laid out in the background first.
             panel.loaded.connect(self._on_document_loaded)
             panel.loading.connect(self._on_document_loading)
+        self.suspect_panel.merge_completed.connect(self._on_suspect_merge_completed)
+        self.original_panel.merge_completed.connect(self._on_original_merge_completed)
 
         splitter = QSplitter()
         splitter.setObjectName("documents")
@@ -364,6 +367,17 @@ class MainWindow(QMainWindow):
         )
         self.open_suspect_action = self._action(
             "Open &Suspect\u2026", self.suspect_panel.on_load_clicked, "Ctrl+Shift+O"
+        )
+        self.merge_suspect_action = self._action(
+            "Merge &Suspect Files\u2026",
+            lambda: self.suspect_panel.on_merge_clicked(can_compare=bool(self.original_panel.file_path)),
+            "Ctrl+Shift+M",
+            tip="Merge multiple split files into the Suspect document (Ctrl+Shift+M)",
+        )
+        self.merge_original_action = self._action(
+            "Merge &Original Files\u2026",
+            lambda: self.original_panel.on_merge_clicked(can_compare=bool(self.suspect_panel.file_path)),
+            tip="Merge multiple split files into the Original document",
         )
         self.compare_action = self._action("&Compare", self.on_compare_clicked, "F5")
         self.crop_action = self._action("Crop &Header/Footer...", self.on_crop_clicked, "Ctrl+H")
@@ -438,6 +452,8 @@ class MainWindow(QMainWindow):
         bar = self.menuBar()
         file_menu = bar.addMenu("&File")
         file_menu.addActions([self.open_original_action, self.open_suspect_action])
+        file_menu.addSeparator()
+        file_menu.addActions([self.merge_suspect_action, self.merge_original_action])
         file_menu.addSeparator()
         file_menu.addAction(self.compare_action)
         file_menu.addAction(self.crop_action)
@@ -696,6 +712,16 @@ class MainWindow(QMainWindow):
             self.crop_button.setEnabled(any_loaded)
         if hasattr(self, "crop_action"):
             self.crop_action.setEnabled(any_loaded)
+        self.suspect_panel.can_compare = bool(self.original_panel.file_path)
+        self.original_panel.can_compare = bool(self.suspect_panel.file_path)
+
+    def _on_suspect_merge_completed(self, merged_path: str, should_compare: bool) -> None:
+        if should_compare and self.original_panel.file_path:
+            QTimer.singleShot(150, self.on_compare_clicked)
+
+    def _on_original_merge_completed(self, merged_path: str, should_compare: bool) -> None:
+        if should_compare and self.suspect_panel.file_path:
+            QTimer.singleShot(150, self.on_compare_clicked)
 
     # ------------------------------------------------------------------
     # Crop

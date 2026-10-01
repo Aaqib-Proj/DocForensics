@@ -1376,3 +1376,77 @@ back as one clean "4" -> "8" row, and the missing copy must be reported
 as whole sections -- nothing added, nothing falsely moved. Without the
 context tie-break all three checks fail (6 crossed pairings, and the
 dosage edit shredded into a deleted sentence plus an added one).
+
+## 32. A paragraph is compared with its own counterpart, not with any paragraph that shares its boilerplate
+
+Reported from paragraph-wise proofing: a paragraph was being compared
+against every paragraph in the other document, so when several
+paragraphs ended with the same few lines -- storage conditions, a
+"keep out of reach of children" warning, a repeated footer -- a
+paragraph could be claimed by one of those look-alikes. Its real
+counterpart was then left to pair with whatever remained, and both
+paragraphs came back reading as completely rewritten.
+
+The pairing (`_match_sections`) scored every chunk against every other
+chunk and took the best score, with no notion of where in the document
+either one sat. Nothing stopped a paragraph 40 pages away from winning
+on a fractionally higher similarity.
+
+Three changes, in the order they now apply:
+
+1. **A 100% match ends the question** (`_identical_pairs`). A chunk
+   whose text is identical to one in the other document -- and which
+   occurs exactly once on each side, so there is nothing to choose
+   between -- is paired immediately and taken out of the search
+   entirely. It is never scored against anything else. This is also
+   where most of the time goes on a long document: every anchored pair
+   removes a whole row and column from the similarity search.
+
+   Repeated identical text is deliberately NOT anchored this way.
+   Boilerplate that appears twenty times is identical to every copy of
+   itself, so "identical" cannot say which copy belongs to which --
+   and the copies that happen to be identical in one document are
+   often not the same ones in the other. Those are left to step 3.
+
+2. **Document order comes next.** Those anchors, reduced to the subset
+   that reads in order in both documents (`_monotone_backbone`, the
+   classic patience-diff anchor set, so one relocated copy cannot drag
+   the order off course), bracket every remaining chunk: a chunk
+   between two anchors should pair with something between their
+   partners. A pair that does not fit has to beat one that does by
+   `_OUT_OF_SEQUENCE_PENALTY` (0.15) to win, so a look-alike elsewhere
+   in the document no longer wins on a hair's breadth -- while a
+   section that genuinely moved, which is a far better match than
+   anything in its place, still wins and is still reported as moved.
+
+3. **Then the best percentage**, as before: header number and title,
+   then body similarity, with the surrounding text
+   (`_ContextSimilarity`) and the n-th occurrence breaking ties. The
+   final tie-break is now document order -- of two copies that are
+   otherwise indistinguishable, the earlier one wins, where the list
+   previously handed out the last.
+
+### Verified
+
+On a real pair where the same paragraph is repeated on every page
+(`sample 5 search parawsie`), the approved paragraphs used to pair with
+the LAST copy in the suspect, on page 8; they now pair with the copy on
+page 1, in reading order, so the viewers land where the reviewer
+expects.
+
+Across the real pairs on hand -- the 100-page prescribing information,
+the pixel leaflet, the medley report, the Rusan foil, the Matrix pair,
+the superscript pair, `_d4`/`_d5` and the sample 2 DOCX/PDF -- the
+reported differences are unchanged, and the 100-page comparison got
+faster (0.95s to 0.68s; section matching alone 4.5s to 0.5s).
+
+`dev_tests/test_extraction_diff_smoke.py` TEST 23 is the regression
+test: two packaging paragraphs ending in the same three lines of
+storage boilerplate, where the suspect rewrote the first one to
+describe what the second one describes (0.97 similar to the other
+paragraph, 0.89 to its own original) and reworded the second, so
+neither side has an exact copy to fall back on. With the previous
+pairing the two paragraphs swap partners, producing the nonsense row
+"Tablet presentation." -> "Oral suspension pack." and two invented
+"moved" rows, while the actual rewrite is never reported. Each
+paragraph must now pair with its own counterpart, in order.

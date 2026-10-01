@@ -130,9 +130,10 @@ word diff -- byte-for-byte the MVP-1..7 behavior.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -1011,6 +1012,27 @@ def _match_sections(
     when the context is equally good does the n-th occurrence prefer the
     n-th on the other side, as before.
 
+    Two things settle WHICH of several similar chunks a chunk pairs
+    with, before similarity is even consulted:
+
+      1. A chunk whose text is IDENTICAL on both sides is paired
+         straight away (`_identical_pairs`) and taken out of the search
+         entirely -- a 100% match needs no competitor, and skipping it
+         is also most of the work saved on a document that repeats
+         itself. Repeated identical chunks pair in document order, so
+         the first copy pairs with the first copy.
+      2. Everything else is matched in the order the documents read.
+         Those identical pairs form a monotone backbone
+         (`_monotone_backbone`), and a pair that does not fit between
+         its neighbouring anchors has to beat the one that does by
+         `_OUT_OF_SEQUENCE_PENALTY` to win. Without this, a paragraph
+         sharing a few lines of boilerplate with a paragraph elsewhere
+         in the document could claim it on a hair's-breadth higher
+         similarity, which leaves the real counterpart unmatched and
+         reports both as wholly changed. A genuinely relocated
+         section still wins when it is clearly the better match, so
+         move detection is unaffected.
+
     Returns:
         (b_to_a, unmatched_a, unmatched_b): b_to_a maps a suspect
         section index to its matched approved index; the sets are the
@@ -1025,13 +1047,26 @@ def _match_sections(
     # one side prefers the n-th on the other.
     rank_a = _occurrence_ranks(keys_a)
     rank_b = _occurrence_ranks(keys_b)
+
+    # 1. Identical text pairs itself up and leaves the search.
+    identical = _identical_pairs(texts_a, texts_b)
+    b_to_a: dict[int, int] = {b_idx: a_idx for a_idx, b_idx in identical}
+    used_a: set[int] = {a_idx for a_idx, _b_idx in identical}
+    # 2. Those pairs, reduced to the ones that read in order on both
+    #    sides, are the backbone the rest is matched against.
+    in_sequence = _SequenceBounds(_monotone_backbone(identical))
+
     context_ratio = _ContextSimilarity(sections_a, sections_b)
     body_ratio = _BodySimilarity(texts_a, texts_b)
     title_ratio = _TitleSimilarity()
-    candidates: list[tuple[float, float, bool, int, int]] = []
+    candidates: list[tuple[float, bool, float, bool, int, int]] = []
     for a_idx, ta in enumerate(texts_a):
+        if a_idx in used_a:
+            continue
         num_a, title_a = keys_a[a_idx]
         for b_idx, tb in enumerate(texts_b):
+            if b_idx in b_to_a:
+                continue
             num_b, title_b = keys_b[b_idx]
             score: Optional[float] = None
             t_ratio = 0.0
@@ -1080,24 +1115,32 @@ def _match_sections(
                 if ratio >= _SECTION_MATCH_RATIO:
                     score = ratio
             if score is not None:
-                # Tie-breakers, in order: the surrounding text, then the
-                # n-th-occurrence preference. Kept OUT of the score so
-                # they can only choose between equally-scoring pairs,
-                # never promote a worse pair over a better one.
+                # A pair that does not read in order has to be clearly
+                # better than one that does. Then the tie-breakers: the
+                # surrounding text, then the n-th-occurrence
+                # preference. Both are kept OUT of the score so they
+                # can only choose between equally-scoring pairs.
+                ordered = in_sequence(a_idx, b_idx)
                 candidates.append(
                     (
-                        score,
+                        score if ordered else score - _OUT_OF_SEQUENCE_PENALTY,
+                        ordered,
                         context_ratio(a_idx, b_idx),
                         rank_a[a_idx] == rank_b[b_idx],
-                        a_idx,
-                        b_idx,
+                        # Last word goes to document order: of two
+                        # copies that are otherwise indistinguishable
+                        # (the same paragraph repeated on every page),
+                        # the earlier one is the one a reader means.
+                        -a_idx,
+                        -b_idx,
                     )
                 )
-    candidates.sort(reverse=True)  # best-first: score, context, occurrence, (a, b)
+    # best-first: score (order-adjusted), in order, context, occurrence,
+    # then earliest in the document
+    candidates.sort(reverse=True)
 
-    b_to_a: dict[int, int] = {}
-    used_a: set[int] = set()
-    for _ratio, _context, _same_rank, a_idx, b_idx in candidates:
+    for _score, _ordered, _context, _same_rank, neg_a, neg_b in candidates:
+        a_idx, b_idx = -neg_a, -neg_b
         if b_idx in b_to_a or a_idx in used_a:
             continue
         b_to_a[b_idx] = a_idx
@@ -1105,6 +1148,115 @@ def _match_sections(
     unmatched_a = set(range(len(sections_a))) - used_a
     unmatched_b = set(range(len(sections_b))) - set(b_to_a)
     return b_to_a, unmatched_a, unmatched_b
+
+
+# How much better an out-of-order pair must score to beat one that
+# reads in order (see `_match_sections`). Small enough that a section
+# genuinely relocated -- which is a much better match than anything in
+# its place -- still wins and is still reported as moved; large enough
+# that two paragraphs sharing boilerplate cannot swap partners on a
+# fractionally higher similarity.
+_OUT_OF_SEQUENCE_PENALTY = 0.15
+
+
+def _identical_pairs(
+    texts_a: list[list[str]], texts_b: list[list[str]]
+) -> list[tuple[int, int]]:
+    """(approved, suspect) index pairs whose text is exactly the same.
+
+    A 100% match is the end of the question: the pair is taken and
+    neither side is compared with anything else, which is both the
+    right answer and the cheapest one -- on a document that repeats
+    itself, this is most of the pairs, and each one removed takes a
+    whole row and column out of the similarity search.
+
+    Only text occurring ONCE on each side is anchored here, because
+    only then is there nothing to get wrong. Text repeated down a
+    document -- a boilerplate warning, a bare header, a leaflet printed
+    several times -- is identical to every other copy of itself, so
+    "identical" cannot say which copy belongs to which; worse, the
+    copies that happen to be identical in one document are often not
+    the same ones in the other (a leaflet whose third copy was edited),
+    so pairing them off in order would hand out partners pages away
+    from where they belong. Those are left to the scored pass, where
+    the surrounding text and the document order decide.
+    """
+    by_text_a: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for index, text in enumerate(texts_a):
+        if text:
+            by_text_a[tuple(text)].append(index)
+    by_text_b: dict[tuple[str, ...], list[int]] = defaultdict(list)
+    for index, text in enumerate(texts_b):
+        if text:
+            by_text_b[tuple(text)].append(index)
+    return [
+        (a_indices[0], by_text_b[text][0])
+        for text, a_indices in by_text_a.items()
+        if len(a_indices) == 1 and len(by_text_b.get(text, ())) == 1
+    ]
+
+
+def _monotone_backbone(pairs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """The largest subset of ``pairs`` that reads in order in BOTH
+    documents -- the part of the alignment that is certainly not a move.
+
+    Identical text can also be text that MOVED, and one moved copy must
+    not drag the order check off course, so the backbone is the longest
+    increasing run rather than every pair (the classic patience-diff
+    anchor set).
+    """
+    if not pairs:
+        return []
+    # One pair per suspect chunk (`_identical_pairs` already guarantees
+    # this; kept so the backbone is well-defined for any input).
+    ordered: list[tuple[int, int]] = []
+    for pair in sorted(pairs, key=lambda pair: (pair[1], pair[0])):
+        if not ordered or ordered[-1][1] != pair[1]:
+            ordered.append(pair)
+    # Patience sort over the approved indices: `tails[k]` is the
+    # smallest approved index that can end an increasing run of k+1.
+    tails: list[int] = []
+    tail_pairs: list[tuple[int, int]] = []
+    previous: list[int] = []  # index in `ordered` of the pair before each one
+    positions: list[int] = []  # index in `ordered` of each tail's pair
+    for position, (a_idx, _b_idx) in enumerate(ordered):
+        slot = bisect.bisect_left(tails, a_idx)
+        previous.append(positions[slot - 1] if slot > 0 else -1)
+        if slot == len(tails):
+            tails.append(a_idx)
+            positions.append(position)
+            tail_pairs.append(ordered[position])
+        else:
+            tails[slot] = a_idx
+            positions[slot] = position
+            tail_pairs[slot] = ordered[position]
+    backbone: list[tuple[int, int]] = []
+    position = positions[-1] if positions else -1
+    while position >= 0:
+        backbone.append(ordered[position])
+        position = previous[position]
+    backbone.reverse()
+    return backbone
+
+
+class _SequenceBounds:
+    """Whether a pair fits the document order the backbone establishes.
+
+    A chunk between two anchored chunks must pair with something
+    between their partners; anything else is reading out of order. With
+    no anchors at all (two documents with nothing identical in them)
+    every pair is in order, so the order rule simply does not apply.
+    """
+
+    def __init__(self, backbone: list[tuple[int, int]]) -> None:
+        self._approved = [a_idx for a_idx, _b_idx in backbone]
+        self._suspect = [b_idx for _a_idx, b_idx in backbone]
+
+    def __call__(self, a_idx: int, b_idx: int) -> bool:
+        slot = bisect.bisect_left(self._suspect, b_idx)
+        low = self._approved[slot - 1] if slot > 0 else -1
+        high = self._approved[slot] if slot < len(self._approved) else None
+        return low < a_idx and (high is None or a_idx < high)
 
 
 # Words of surrounding text used to tell two copies of the same header

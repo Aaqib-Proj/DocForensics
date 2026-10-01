@@ -286,7 +286,8 @@ class _ZoomableGraphicsView(QGraphicsView):
     zoom_requested = Signal(float, QPointF)  # relative multiplier (>1 zooms in), scene anchor
     clicked = Signal(QPointF)  # scene position of a left click that wasn't a drag
     interacted = Signal()  # any mouse/wheel use of this view
-    file_dropped = Signal(str)  # a supported document dropped onto the view
+    file_dropped = Signal(str)  # a single supported document dropped onto the view
+    files_dropped = Signal(list)  # multiple supported documents dropped onto the view
 
     def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None) -> None:
         super().__init__(scene, parent)
@@ -296,31 +297,36 @@ class _ZoomableGraphicsView(QGraphicsView):
         self.setAcceptDrops(True)
 
     @staticmethod
-    def _dropped_path(event) -> str | None:
+    def _dropped_paths(event) -> list[str]:
         urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
-        if len(urls) == 1 and urls[0].isLocalFile():
-            path = urls[0].toLocalFile()
-            if path.lower().endswith(_OPENABLE_EXTENSIONS):
-                return path
-        return None
+        paths = []
+        for url in urls:
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if path.lower().endswith(_OPENABLE_EXTENSIONS):
+                    paths.append(path)
+        return paths
 
     def dragEnterEvent(self, event) -> None:
-        if self._dropped_path(event):
+        if self._dropped_paths(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:
-        if self._dropped_path(event):
+        if self._dropped_paths(event):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        path = self._dropped_path(event)
-        if path:
+        paths = self._dropped_paths(event)
+        if len(paths) == 1:
             event.acceptProposedAction()
-            self.file_dropped.emit(path)
+            self.file_dropped.emit(paths[0])
+        elif len(paths) > 1:
+            event.acceptProposedAction()
+            self.files_dropped.emit(paths)
 
     def event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.Gesture:
@@ -402,6 +408,8 @@ class DocumentPanel(QWidget):
     interacted = Signal()
     point_clicked = Signal(int, float, float)
     loaded = Signal(str)
+    # Emitted with (merged_path, should_compare) when multiple files are merged and loaded
+    merge_completed = Signal(str, bool)
     # Emitted with the file path when a document starts loading in the
     # background (a Word document being laid out); `file_path` is None
     # until the matching `loaded`.
@@ -410,6 +418,9 @@ class DocumentPanel(QWidget):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.file_path: str | None = None
+        self.source_files: list[str] | None = None
+        self.source_file_infos: list[dict] | None = None
+        self.can_compare: bool = False
         self._pixmap_item = None  # page 1's item; None while no document is shown
         self._base_pixmap: QPixmap | None = None  # unused; kept for compatibility
         # PDF shown (drawn page by page in the background) and the pages
@@ -452,7 +463,7 @@ class DocumentPanel(QWidget):
         self._page_border_items: list[QGraphicsRectItem] = []
         self._message_item = None
 
-        # --- header: role, file name, details, Open ---
+        # --- header: role, file name, details, Open, Merge ---
         header = QWidget()
         header.setObjectName("panelHeader")
         self.title_label = QLabel(title.upper())
@@ -466,15 +477,24 @@ class DocumentPanel(QWidget):
         self.load_button = QPushButton("Open\u2026")
         self.load_button.setToolTip(f"Open the {title} document (PDF, Word, PowerPoint or Excel)")
         self.load_button.clicked.connect(self.on_load_clicked)
+        self.merge_button = QPushButton("Merge\u2026")
+        self.merge_button.setToolTip(f"Merge multiple split files into the {title} document")
+        self.merge_button.clicked.connect(lambda: self.on_merge_clicked())
         text_column = QVBoxLayout()
         text_column.setSpacing(1)
         text_column.addWidget(self.title_label)
         text_column.addWidget(self.file_label)
         text_column.addWidget(self.meta_label)
+        btn_widget = QWidget()
+        btn_layout = QHBoxLayout(btn_widget)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(6)
+        btn_layout.addWidget(self.load_button)
+        btn_layout.addWidget(self.merge_button)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
         header_layout.addLayout(text_column, stretch=1)
-        header_layout.addWidget(self.load_button, alignment=Qt.AlignmentFlag.AlignVCenter)
+        header_layout.addWidget(btn_widget, alignment=Qt.AlignmentFlag.AlignVCenter)
 
         # --- navigation strip: pages and zoom ---
         nav = QWidget()
@@ -536,6 +556,7 @@ class DocumentPanel(QWidget):
         self.view.interacted.connect(self.interacted)
         self.view.clicked.connect(self._on_view_clicked)
         self.view.file_dropped.connect(self.load_document)
+        self.view.files_dropped.connect(lambda paths: self.on_merge_clicked(initial_files=paths))
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -702,13 +723,53 @@ class DocumentPanel(QWidget):
     # ------------------------------------------------------------------
 
     def on_load_clicked(self) -> None:
-        """Open a file dialog and load the chosen document."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, f"Open {self._title} document", DocumentPanel.last_dir, _OPEN_FILTER
+        """Open a file dialog and load the chosen document(s)."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, f"Open {self._title} document(s)", DocumentPanel.last_dir, _OPEN_FILTER
         )
-        if path:
-            DocumentPanel.last_dir = os.path.dirname(path)
-            self.load_document(path)
+        if paths:
+            DocumentPanel.last_dir = os.path.dirname(paths[0])
+            if len(paths) == 1:
+                self.load_document(paths[0])
+            else:
+                self.on_merge_clicked(initial_files=paths)
+
+    def on_merge_clicked(
+        self,
+        initial_files: list[str] | None = None,
+        can_compare: bool | None = None,
+    ) -> None:
+        """Open the merge dialog to combine multiple split files into this document."""
+        from PySide6.QtWidgets import QDialog
+        from ui.merge_dialog import MergeDocumentsDialog
+
+        if can_compare is None:
+            can_compare = self.can_compare
+
+        dialog = MergeDocumentsDialog(
+            parent=self,
+            initial_files=initial_files,
+            title=self._title,
+            can_compare=can_compare,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.merged_path:
+            self.load_merged_document(
+                dialog.merged_path,
+                source_files=dialog.source_files,
+                file_infos=dialog.file_infos,
+            )
+            self.merge_completed.emit(dialog.merged_path, dialog.should_compare)
+
+    def load_merged_document(
+        self,
+        merged_path: str,
+        source_files: list[str],
+        file_infos: list[dict] | None = None,
+    ) -> None:
+        """Load a merged document, keeping track of its source constituent files."""
+        self.source_files = list(source_files)
+        self.source_file_infos = file_infos or []
+        self.render_pdf(merged_path)
 
     def load_document(self, path: str) -> None:
         """Show ``path`` in this panel; emits `loaded` once it's shown.
@@ -721,6 +782,8 @@ class DocumentPanel(QWidget):
         from core.document_extractor import document_kind
         from core.office_convert import CONVERTIBLE_EXTENSIONS
 
+        self.source_files = None
+        self.source_file_infos = None
         self._converting_path = None  # a newer load supersedes any pending conversion
         try:
             kind = document_kind(path)
@@ -932,10 +995,31 @@ class DocumentPanel(QWidget):
         shown = source_path or path
         kind_label = "Word document" if source_path else "PDF"
         pages = f"{self._page_count} page{'s' if self._page_count != 1 else ''}"
-        self._set_file_info(
-            os.path.basename(shown),
-            f"{kind_label} \u00b7 {pages}" + (" \u00b7 laid out by Microsoft Word" if source_path else ""),
-        )
+
+        if self.source_files and len(self.source_files) > 1:
+            names = [os.path.basename(f) for f in self.source_files]
+            label_text = f"Merged ({len(self.source_files)} files): {' + '.join(names[:2])}"
+            if len(names) > 2:
+                label_text += f" + {len(names) - 2} more"
+            details = f"Merged PDF \u00b7 {self._page_count} pages ({len(self.source_files)} files)"
+            self._set_file_info(label_text, details)
+
+            # Build a rich tooltip listing all constituent files with their page ranges
+            tooltip_lines = [f"Merged Document ({len(self.source_files)} files, {self._page_count} total pages):"]
+            for i, info in enumerate(self.source_file_infos or []):
+                start = info.get("start_page", "?")
+                end = info.get("end_page", "?")
+                rng = f"p. {start}" if start == end else f"pp. {start}\u2013{end}"
+                tooltip_lines.append(f"  {i+1}. {info.get('name', '')} ({rng}, {info.get('size_formatted', '')})")
+            if not self.source_file_infos:
+                for i, f in enumerate(self.source_files):
+                    tooltip_lines.append(f"  {i+1}. {os.path.basename(f)}")
+            self.file_label.setToolTip("\n".join(tooltip_lines))
+        else:
+            self._set_file_info(
+                os.path.basename(shown),
+                f"{kind_label} \u00b7 {pages}" + (" \u00b7 laid out by Microsoft Word" if source_path else ""),
+            )
         self.layout_note.hide()
         self.file_path = source_path or path  # set before `loaded` so listeners see it
         self.loaded.emit(self.file_path)

@@ -2139,6 +2139,107 @@ def main() -> None:
         print("PASS: contents list vs. section pairing.")
 
     print()
+    print("=" * 70)
+    print("TEST 23: a paragraph is compared with its own counterpart, not")
+    print("         with another paragraph that shares its boilerplate")
+    print("=" * 70)
+    ok23 = True
+    from core.diff_engine import _identical_pairs  # _match_sections: imported at module level
+
+    def paragraph_words(paragraphs, page=1):
+        """One Word per token, paragraphs separated by a blank-line gap
+        (what `_split_paragraphs` chunks on)."""
+        words = []
+        y = 50.0
+        for para in paragraphs:
+            for line in para:
+                x = 50.0
+                for tok in line.split():
+                    words.append(
+                        Word(text=tok, x0=x, x1=x + len(tok) * 5.0,
+                             top=y, bottom=y + 10.0, page=page)
+                    )
+                    x += len(tok) * 5.0 + 4.0
+                y += 12.0
+            y += 22.0  # paragraph gap
+        return words
+
+    # The same three lines of storage boilerplate end both packaging
+    # paragraphs -- the "same few lines" that let one paragraph claim
+    # the other.
+    boiler = [
+        "Store below 25 C in a dry place away from direct sunlight and moisture.",
+        "Keep this medicine out of the sight and reach of children at all times.",
+        "Do not use this medicine after the expiry date printed on the carton.",
+    ]
+    unique_1 = ["This leaflet describes the treatment of adult patients with chronic spasticity."]
+    unique_2 = ["The prescriber should review renal function before every change of the dose."]
+    unique_3 = ["Report any suspected adverse reaction to the national pharmacovigilance system."]
+    para_approved = [
+        unique_1,
+        ["Tablet presentation. The tablets are supplied in blister packs of thirty."] + boiler,
+        unique_2,
+        ["Suspension presentation. The suspension is supplied in cartons of ninety."] + boiler,
+        unique_3,
+    ]
+    # The suspect rewrote the TABLET paragraph to describe the
+    # suspension, so it now reads more like the OTHER paragraph than
+    # like its own original (0.97 vs 0.89), and reworded the suspension
+    # paragraph too, so neither side has an exact copy to fall back on.
+    para_suspect = [
+        unique_1,
+        ["Suspension presentation. The suspension is supplied in cartons of ninety tablets."] + boiler,
+        unique_2,
+        ["Oral suspension pack. The product is supplied in cartons of ninety."] + boiler,
+        unique_3,
+    ]
+    para_a = build_comparison_tokens(paragraph_words(para_approved))
+    para_b = build_comparison_tokens(paragraph_words(para_suspect))
+
+    chunks_a = _split_sections(para_a)
+    chunks_b = _split_sections(para_b)
+    if len(chunks_a) == len(chunks_b) == 5:
+        print("PASS: both documents split into the same five paragraphs.")
+    else:
+        print(f"FAIL: paragraph split gave {len(chunks_a)} / {len(chunks_b)} chunks, expected 5 / 5.")
+        ok23 = False
+
+    # The three paragraphs that are untouched are identical and occur
+    # once: they pair without being compared against anything.
+    anchors = sorted(_identical_pairs([c.text_tokens for c in chunks_a],
+                                      [c.text_tokens for c in chunks_b]))
+    if anchors == [(0, 0), (2, 2), (4, 4)]:
+        print("PASS: the unchanged paragraphs pair on identical text alone.")
+    else:
+        print(f"FAIL: identical-text pairs were {anchors}, expected [(0, 0), (2, 2), (4, 4)].")
+        ok23 = False
+
+    pairing = {b: a for b, a in _match_sections(chunks_a, chunks_b)[0].items()}
+    if pairing == {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}:
+        print("PASS: each paragraph pairs with its own counterpart, in order.")
+    else:
+        print(f"FAIL: paragraphs paired {pairing} -- a paragraph claimed another one's partner.")
+        ok23 = False
+
+    para_items = diff_documents(para_a, para_b)
+    texts = [(d.approved_text, d.suspect_text) for d in para_items]
+    # Comparing the tablet paragraph against the suspension paragraph
+    # produces this nonsense row, and claims a section move with it.
+    crossed = [pair for pair in texts if pair == ("Tablet presentation.", "Oral suspension pack.")]
+    moved = [d for d in para_items if d.kind == "reordered_section"]
+    reported = any("Tablet" == a and "Suspension" == b for a, b in texts)
+    if not crossed and not moved and reported:
+        print("PASS: the rewritten paragraph is reported against its own original, "
+              "and nothing is claimed as moved.")
+    else:
+        print(f"FAIL: crossed rows {crossed}, {len(moved)} 'moved' row(s), "
+              f"own-counterpart row reported: {reported}")
+        ok23 = False
+
+    if ok23:
+        print("PASS: paragraph-to-paragraph pairing.")
+
+    print()
     print(f"(test PDFs written to {tmp} if you want to open them manually)")
 
 
