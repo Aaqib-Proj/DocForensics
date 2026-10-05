@@ -311,6 +311,13 @@ def _extract_docx_words(path: str) -> list[Word]:
     y = _DOCX_MARGIN_PT
     max_x = _DOCX_PAGE_WIDTH_PT - _DOCX_MARGIN_PT
 
+    # Headers first and footers last, each distinct one once: document
+    # code, version and revision date live there, and they are part of
+    # what a controlled document is approved as.
+    headers, footers = _docx_header_footer_texts(document)
+    for text in headers:
+        y = _place_line(words, text, _DOCX_MARGIN_PT, y, max_x, page=1)
+
     for kind, element in _iter_docx_body_order(document):
         if kind == "paragraph":
             text = _docx_paragraph_text(element)
@@ -318,6 +325,10 @@ def _extract_docx_words(path: str) -> list[Word]:
                 y = _place_line(words, text, _DOCX_MARGIN_PT, y, max_x, page=1)
             else:
                 y += _DOCX_LINE_HEIGHT_PT * 0.5  # a blank paragraph still takes some space
+            # Text boxes anchored in this paragraph: their text is not in
+            # the paragraph's runs, so it was never compared.
+            for box_text in _docx_textbox_texts(element):
+                y = _place_line(words, box_text, _DOCX_MARGIN_PT, y, max_x, page=1)
         elif kind == "table":
             y += _DOCX_LINE_HEIGHT_PT * 0.25
             for row in element.rows:
@@ -339,7 +350,90 @@ def _extract_docx_words(path: str) -> list[Word]:
                         row_max_y = max(row_max_y, end_y)
                     x += col_width
                 y = max(row_max_y, row_start_y + _DOCX_LINE_HEIGHT_PT)
+
+    for text in _docx_note_texts(document) + footers:
+        y = _place_line(words, text, _DOCX_MARGIN_PT, y, max_x, page=1)
     return words
+
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback"
+
+
+def _xml_paragraph_text(p_element) -> str:
+    return "".join(t.text or "" for t in p_element.iter(f"{{{_W_NS}}}t"))
+
+
+def _docx_textbox_texts(paragraph) -> list[str]:
+    """Text of the text boxes anchored in ``paragraph``. Word stores a
+    modern box and a legacy copy of it (mc:Choice / mc:Fallback); only
+    the first is read, so a box is never counted twice."""
+    texts = []
+    for box in paragraph._p.iter(f"{{{_W_NS}}}txbxContent"):
+        ancestor = box.getparent()
+        in_fallback = False
+        while ancestor is not None:
+            if ancestor.tag == _MC_FALLBACK:
+                in_fallback = True
+                break
+            ancestor = ancestor.getparent()
+        if in_fallback:
+            continue
+        for p in box.iter(f"{{{_W_NS}}}p"):
+            text = _xml_paragraph_text(p)
+            if text.strip():
+                texts.append(text)
+    return texts
+
+
+def _docx_header_footer_texts(document) -> tuple[list[str], list[str]]:
+    headers: list[str] = []
+    footers: list[str] = []
+    for section in document.sections:
+        for target, parts in (
+            (headers, ("header", "first_page_header", "even_page_header")),
+            (footers, ("footer", "first_page_footer", "even_page_footer")),
+        ):
+            for name in parts:
+                try:
+                    part = getattr(section, name)
+                    if part.is_linked_to_previous:
+                        continue
+                    texts = [_docx_paragraph_text(p) for p in part.paragraphs]
+                    for table in part.tables:
+                        for row in table.rows:
+                            texts.extend(
+                                "\n".join(_docx_paragraph_text(p) for p in cell.paragraphs)
+                                for cell in row.cells
+                            )
+                except Exception:  # noqa: BLE001 -- a malformed header part is skipped, not fatal
+                    continue
+                for text in texts:
+                    if text.strip() and text not in target:
+                        target.append(text)
+    return headers, footers
+
+
+def _docx_note_texts(document) -> list[str]:
+    """Footnote and endnote text (python-docx exposes neither)."""
+    from docx.oxml import parse_xml
+
+    texts: list[str] = []
+    for rel in document.part.rels.values():
+        if not rel.reltype.endswith(("/footnotes", "/endnotes")):
+            continue
+        try:
+            root = parse_xml(rel.target_part.blob)
+        except Exception:  # noqa: BLE001 -- unreadable notes part: nothing to add
+            continue
+        for note in root:
+            if note.get(f"{{{_W_NS}}}type") in ("separator", "continuationSeparator", "continuationNotice"):
+                continue
+            for p in note.iter(f"{{{_W_NS}}}p"):
+                text = _xml_paragraph_text(p)
+                if text.strip():
+                    texts.append(text)
+    return texts
 
 
 def _docx_run_script(run) -> str | None:
@@ -429,28 +523,78 @@ def _extract_pptx_words(path: str) -> list[Word]:
         raise ValueError(f"Could not open '{path}' as a PowerPoint file: {exc}") from exc
 
     words: list[Word] = []
+    slide_height = _emu_to_pt(presentation.slide_height) or 540.0
     for slide_number, slide in enumerate(presentation.slides, start=1):
         # Shapes in a slide's own XML order approximate the visual
         # reading order well enough for word-level diffing (top-level
         # title/body placeholders are typically added before free
         # shapes) -- there is no more authoritative "reading order"
         # exposed by python-pptx.
-        for shape in slide.shapes:
-            if shape.has_table:
-                _place_pptx_table(words, shape, slide_number)
-            elif shape.has_text_frame:
-                _place_pptx_text_frame(words, shape, slide_number)
+        _place_pptx_shapes(words, slide.shapes, slide_number, _identity_geometry)
+        # Speaker notes are part of what a promotional deck is approved
+        # with; they are placed below the slide, on the same page.
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame
+            if notes is not None:
+                y = slide_height + 20.0
+                for paragraph in notes.paragraphs:
+                    text = _pptx_paragraph_text(paragraph)
+                    if text.strip():
+                        y = _place_line(words, text, 36.0, y, 680.0, page=slide_number)
     return words
 
+
+def _identity_geometry(shape) -> tuple[float, float, float]:
+    return _emu_to_pt(shape.left), _emu_to_pt(shape.top), _emu_to_pt(shape.width) or 400.0
+
+
+def _place_pptx_shapes(words: list[Word], shapes, slide_number: int, geometry) -> None:
+    """Place every shape's text -- descending into GROUPS, whose members
+    are otherwise invisible: a group is neither a table nor a text frame,
+    so a slide built from grouped boxes used to extract no text at all."""
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            _place_pptx_shapes(words, shape.shapes, slide_number, _group_geometry(shape, geometry))
+        elif getattr(shape, "has_table", False) and shape.has_table:
+            _place_pptx_table(words, shape, slide_number, geometry(shape))
+        elif getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            _place_pptx_text_frame(words, shape, slide_number, geometry(shape))
+
+
+def _group_geometry(group, outer):
+    """Map a group member's coordinates (in the group's own child space)
+    onto the slide."""
+    xfrm = group._element.grpSpPr.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm"
+    )
+    try:
+        child_off = xfrm.find("{http://schemas.openxmlformats.org/drawingml/2006/main}chOff")
+        child_ext = xfrm.find("{http://schemas.openxmlformats.org/drawingml/2006/main}chExt")
+        cx0, cy0 = int(child_off.get("x")), int(child_off.get("y"))
+        cw, ch = int(child_ext.get("cx")) or 1, int(child_ext.get("cy")) or 1
+    except (AttributeError, TypeError, ValueError):
+        return outer  # no child transform recorded: members are already in slide space
+    g_left, g_top, g_width = outer(group)
+    g_height = _emu_to_pt(group.height)
+    scale_x = g_width / _emu_to_pt(cw)
+    scale_y = (g_height / _emu_to_pt(ch)) if ch else scale_x
+
+    def geometry(shape):
+        left = g_left + _emu_to_pt((shape.left or 0) - cx0) * scale_x
+        top = g_top + _emu_to_pt((shape.top or 0) - cy0) * scale_y
+        width = (_emu_to_pt(shape.width) * scale_x) or 400.0
+        return left, top, width
+
+    return geometry
 
 def _emu_to_pt(emu) -> float:
     return (emu or 0) / EMU_PER_INCH * POINTS_PER_INCH
 
 
-def _place_pptx_text_frame(words: list[Word], shape, slide_number: int) -> None:
-    left = _emu_to_pt(shape.left)
-    top = _emu_to_pt(shape.top)
-    width = _emu_to_pt(shape.width) or 400.0
+def _place_pptx_text_frame(words: list[Word], shape, slide_number: int, geometry=None) -> None:
+    left, top, width = geometry or _identity_geometry(shape)
     line_height = 14.0
     y = top
     for paragraph in shape.text_frame.paragraphs:
@@ -475,11 +619,9 @@ def _pptx_paragraph_text(paragraph) -> str:
     return join_runs(runs) or paragraph.text
 
 
-def _place_pptx_table(words: list[Word], shape, slide_number: int) -> None:
+def _place_pptx_table(words: list[Word], shape, slide_number: int, geometry=None) -> None:
     table = shape.table
-    left = _emu_to_pt(shape.left)
-    top = _emu_to_pt(shape.top)
-    width = _emu_to_pt(shape.width) or 400.0
+    left, top, width = geometry or _identity_geometry(shape)
     col_count = max(len(table.columns), 1)
     col_width = width / col_count
     row_height = 16.0
@@ -496,6 +638,30 @@ def _place_pptx_table(words: list[Word], shape, slide_number: int) -> None:
 # ---------------------------------------------------------------------------
 # XLSX
 # ---------------------------------------------------------------------------
+
+
+def _xlsx_uncached_formulas(path: str) -> dict[tuple[int, int, int], str]:
+    """{(sheet, row, column): formula text} for every formula cell."""
+    import openpyxl
+
+    found: dict[tuple[int, int, int], str] = {}
+    try:
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    except Exception:  # noqa: BLE001 -- the value pass reports an unreadable file
+        return found
+    try:
+        for sheet_number, worksheet in enumerate(workbook.worksheets, start=1):
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    value = getattr(cell, "value", None)
+                    if value is None or getattr(cell, "row", None) is None:
+                        continue
+                    text = getattr(value, "text", value)  # ArrayFormula keeps its text in .text
+                    if isinstance(text, str) and text.startswith("="):
+                        found[(sheet_number, cell.row, cell.column)] = text
+    finally:
+        workbook.close()
+    return found
 
 _XLSX_COL_WIDTH_PT = 64.0
 _XLSX_ROW_HEIGHT_PT = 14.0
@@ -515,14 +681,24 @@ def _extract_xlsx_words(path: str) -> list[Word]:
     except Exception as exc:
         raise ValueError(f"Could not open '{path}' as an Excel workbook: {exc}") from exc
 
+    # A formula cell's value is whatever Excel last CACHED in the file. A
+    # workbook written by a script, or never recalculated, caches nothing,
+    # and the cell read as empty -- so a computed total dose simply
+    # dropped out of the comparison. Such a cell is compared by its
+    # formula instead ("=B1*B2"), which still shows when it changed.
+    formulas = _xlsx_uncached_formulas(path)
+
     words: list[Word] = []
     try:
         for sheet_number, worksheet in enumerate(workbook.worksheets, start=1):
             for row in worksheet.iter_rows():
                 for cell in row:
-                    if cell.value is None:
+                    value = cell.value
+                    if value is None and getattr(cell, "row", None) is not None:
+                        value = formulas.get((sheet_number, cell.row, cell.column))
+                    if value is None:
                         continue
-                    text = str(cell.value)
+                    text = str(value)
                     if not text.strip():
                         continue
                     # Whole-cell superscript/subscript formatting. (Rich

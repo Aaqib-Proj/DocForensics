@@ -216,6 +216,11 @@ class TokenMap:
     def has_tokens(self, side: str) -> bool:
         return bool(self._tokens[side])
 
+    def tokens(self, side: str) -> list[ComparisonToken]:
+        """That document's full token stream, as the comparison read it
+        (what `core.rematch` searches)."""
+        return self._tokens[side]
+
     # ------------------------------------------------------------------
     # Context around a discrepancy (for the comparator pane)
     # ------------------------------------------------------------------

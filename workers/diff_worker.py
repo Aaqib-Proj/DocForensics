@@ -20,16 +20,24 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from concurrent.futures import FIRST_EXCEPTION, Future, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
+from core.coverage_check import coverage_is_serious, coverage_warnings
 from core.diff_engine import DiffItem, diff_documents
+from core.review_store import comparison_key
 from core.document_extractor import extract_document_tokens
 from core.token_map import TokenMap
 
 logger = logging.getLogger(__name__)
+
+# How often differences found so far are handed to the UI. Short enough
+# that the list visibly fills, long enough that a document with
+# thousands of them does not drown the event loop in signals.
+_FOUND_INTERVAL_S = 0.12
 
 
 @dataclass
@@ -38,12 +46,23 @@ class ComparisonResult:
     # Word-level correspondence between the two documents, for
     # click-to-navigate from one viewer to the other.
     token_map: TokenMap
+    # What the comparison could NOT read (scanned pages, a near-empty
+    # side, undecodable fonts) -- see core/coverage_check.py.
+    warnings: list[str] = field(default_factory=list)
+    # One side yielded a fraction of the other's words: needs acknowledging.
+    serious_warning: bool = False
+    # Identity of this exact pair of files, for keeping the review.
+    review_key: str = ""
 
 
 class DiffWorkerSignals(QObject):
     """Signals for DiffWorker (QRunnable can't emit signals itself)."""
 
     finished = Signal(object)  # ComparisonResult
+    # Differences as they are found, in batches, so the list fills
+    # while the comparison runs. Provisional: `finished` carries the
+    # authoritative set (see core.diff_engine.diff_documents).
+    found = Signal(list)  # list[DiffItem]
     failed = Signal(str)  # human-readable error message, on failure
     progress = Signal(str)  # human-readable stage label
 
@@ -81,6 +100,9 @@ class DiffWorker(QRunnable):
         self.crop_data = crop_data or {}
         self.signals = DiffWorkerSignals()
         self._cancelled = False
+        # Differences found but not yet handed to the UI.
+        self._pending: list = []
+        self._last_emit = 0.0
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -114,8 +136,24 @@ class DiffWorker(QRunnable):
 
             self._progress("Comparing text...")
             matches: list = []
-            items = diff_documents(approved_tokens, suspect_tokens, matches)
-            result = ComparisonResult(items, TokenMap(approved_tokens, suspect_tokens, matches))
+            items = diff_documents(
+                approved_tokens, suspect_tokens, matches, on_found=self._on_found
+            )
+            self._progress("Checking what could be compared...")
+            warnings = coverage_warnings(
+                self.approved_path, self.suspect_path, approved_tokens, suspect_tokens
+            )
+            try:
+                review_key = comparison_key(self.approved_path, self.suspect_path)
+            except OSError:
+                review_key = ""
+            result = ComparisonResult(
+                items,
+                TokenMap(approved_tokens, suspect_tokens, matches),
+                warnings=warnings,
+                serious_warning=coverage_is_serious(approved_tokens, suspect_tokens),
+                review_key=review_key,
+            )
         except Exception as exc:  # noqa: BLE001 -- surface any failure to the UI
             logger.exception("DiffWorker failed")
             self.signals.failed.emit(str(exc) or type(exc).__name__)
@@ -123,7 +161,26 @@ class DiffWorker(QRunnable):
 
         if self._cancelled:
             return
+        if self._pending:
+            self.signals.found.emit(self._pending)
+            self._pending = []
         self.signals.finished.emit(result)
+
+    def _on_found(self, found: list) -> None:
+        """Hand a batch of differences to the UI as they are found.
+
+        Batched on a short timer rather than emitted one at a time: a
+        signal per difference would cost more in queued events than the
+        comparison itself takes.
+        """
+        if self._cancelled:
+            return
+        self._pending.extend(found)
+        now = time.monotonic()
+        if now - self._last_emit >= _FOUND_INTERVAL_S:
+            self._last_emit = now
+            batch, self._pending = self._pending, []
+            self.signals.found.emit(batch)
 
     def _await_extractions(self) -> None:
         """Wait for any still-running background extraction, raising a

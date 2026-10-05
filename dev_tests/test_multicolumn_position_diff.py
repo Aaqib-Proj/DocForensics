@@ -20,6 +20,7 @@ from core.section_diff import (
     is_likely_header_line,
 )
 from core.diff_engine import (
+    category_of,
     _tokens_to_blocks,
     diff_documents,
 )
@@ -365,8 +366,10 @@ class TestMulticolumnAndPositionAgnosticDiff(unittest.TestCase):
         ]
         self.assertEqual(len(equal_diffs), 0, f"Whitespace-equal text must not raise diff: {equal_diffs}")
 
-        # Real typo 'خلاصة' vs 'خلاصئية' must be reported
-        typo_diffs = [d for d in diffs if d.severity == "typo"]
+        # Real misspelling 'خلاصة' vs 'خلاصئية' must be reported. Letters were
+        # ADDED, which text-layer noise never does, so it is a real
+        # misspelling at "major" (Spelling), not the hideable "typo" tier.
+        typo_diffs = [d for d in diffs if d.severity == "major" and category_of(d) == "spelling"]
         self.assertEqual(len(typo_diffs), 1)
         self.assertEqual(typo_diffs[0].approved_text, "خلاصة")
         self.assertEqual(typo_diffs[0].suspect_text, "خلاصئية")

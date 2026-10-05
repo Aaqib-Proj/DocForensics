@@ -42,6 +42,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QScrollArea,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -53,6 +54,12 @@ from PySide6.QtWidgets import (
 )
 
 from core.diff_engine import CATEGORY_LABELS, DiffItem, Location, category_of
+from core.char_compare import (
+    align_characters,
+    character_changes,
+    describe,
+    summary_note,
+)
 from core.inline_diff import Segment, changed_words, inline_segments
 from core.token_map import APPROVED, SUSPECT, TokenMap
 from ui import theme
@@ -64,6 +71,12 @@ _VISIBLE_SPACE = "·"
 _ELLIPSIS = "…"
 
 _EMPTY_MESSAGE = "Select a difference to see what changed."
+
+# Letter-by-letter view: longer texts are listed character by character
+# without the full alignment, which would be unreadable anyway.
+_MAX_ALIGNED_CHARS = 90
+_CARET = "‸"  # ‸ -- where the other side has text this side lacks
+_MAX_LISTED_CHARS = 6
 _MISSING_SIDE = {
     "removed_in_suspect": "Not present in the Suspect document.",
     "added_in_suspect": "Not present in the Original document.",
@@ -93,6 +106,22 @@ def _escape_marked(text: str) -> str:
     if text and not text.strip():
         return _VISIBLE_SPACE * len(text)
     return _escape(text)
+
+
+class _CompactTextView(QTextBrowser):
+    """A text view that ASKS for its minimum height.
+
+    QTextBrowser's own size hint is about 190px. Three of them stacked
+    in the comparator demand some 700px before anything is laid out,
+    which in a docked pane means the bottom of the pane -- the
+    letter-by-letter block -- is pushed out of sight. Each view still
+    grows to fill whatever room the pane has.
+    """
+
+    def sizeHint(self):  # noqa: N802 -- Qt override
+        hint = super().sizeHint()
+        hint.setHeight(self.minimumHeight())
+        return hint
 
 
 class ComparatorPanel(QWidget):
@@ -126,6 +155,17 @@ class ComparatorPanel(QWidget):
         self.context_checkbox.setToolTip("Show a few words of surrounding context around the difference.")
         self.context_checkbox.toggled.connect(self._on_context_toggled)
 
+        self._show_letters = True
+        self.letters_checkbox = QCheckBox("Letters")
+        self.letters_checkbox.setChecked(True)
+        self.letters_checkbox.setStyleSheet("color: #888888; font-size: 11px;")
+        self.letters_checkbox.setToolTip(
+            "Compare the difference letter by letter: the two texts lined up "
+            "character under character, and every character that differs named "
+            "with its Unicode code point."
+        )
+        self.letters_checkbox.toggled.connect(self._on_letters_toggled)
+
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
         header.setSpacing(8)
@@ -133,6 +173,7 @@ class ComparatorPanel(QWidget):
         header.addWidget(self.category_label)
         header.addStretch()
         header.addWidget(self.context_checkbox)
+        header.addWidget(self.letters_checkbox)
         header.addWidget(self.pages_label)
 
         # Stepper bar to navigate across all repeated occurrences
@@ -166,12 +207,26 @@ class ComparatorPanel(QWidget):
 
         self.original_view = self._make_text_view()
         self.suspect_view = self._make_text_view()
+        # Letter by letter: the two texts lined up character under
+        # character, then every differing character named.
+        self.letters_caption = self._caption("Letter by letter")
+        self.letters_view = self._make_text_view()
+        self.letters_view.setMinimumHeight(60)
+        self.letters_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # The character list wraps; the alignment table is a table, so
+        # it scrolls sideways instead of folding.
+        self.letters_view.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+
         self.summary_label = QLabel()
         self.summary_label.setObjectName("muted")
         self.summary_label.setWordWrap(True)
         self.summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        layout = QVBoxLayout()
+        # The pane's own content, inside a scroll area: when the
+        # Deviations dock is short, the letter-by-letter block at the
+        # bottom has to stay reachable rather than be cut off.
+        self._content = QWidget()
+        layout = QVBoxLayout(self._content)
         layout.setContentsMargins(12, 8, 6, 6)
         layout.setSpacing(6)
         layout.addLayout(header)
@@ -181,8 +236,21 @@ class ComparatorPanel(QWidget):
         layout.addWidget(self.original_view, 1)
         layout.addWidget(self._caption("Suspect"))
         layout.addWidget(self.suspect_view, 1)
+        layout.addWidget(self.letters_caption)
+        # Shares the pane's height with the two texts rather than
+        # queueing behind them, so it is on screen without scrolling.
+        layout.addWidget(self.letters_view, 1)
         layout.addWidget(self.summary_label)
-        self.setLayout(layout)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(self._content)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.scroll_area)
+        self.setLayout(outer)
         self.setMinimumWidth(240)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
@@ -244,7 +312,7 @@ class ComparatorPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _make_text_view(self) -> QTextBrowser:
-        view = QTextBrowser()
+        view = _CompactTextView()
         view.setFrameShape(QFrame.Shape.NoFrame)
         view.setOpenExternalLinks(False)
         view.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
@@ -257,6 +325,10 @@ class ComparatorPanel(QWidget):
         label = QLabel(text.upper())
         label.setObjectName("comparatorCaption")
         return label
+
+    def _on_letters_toggled(self, checked: bool) -> None:
+        self._show_letters = checked
+        self._restyle()
 
     def _on_context_toggled(self, checked: bool) -> None:
         self._show_context = checked
@@ -281,6 +353,7 @@ class ComparatorPanel(QWidget):
             self.summary_label.clear()
             self.original_view.setHtml(self._html([], "", "", "", muted_message=_EMPTY_MESSAGE))
             self.suspect_view.setHtml(self._html([], "", "", ""))
+            self._show_letter_comparison(None)
             return
 
         fg, bg = t.severity(item.severity)
@@ -341,6 +414,99 @@ class ComparatorPanel(QWidget):
             self._side_html(item, SUSPECT, suspect_segments, t.success, item.suspect_location)
         )
         self.summary_label.setText(self._summary(item))
+        self._show_letter_comparison(item)
+
+    def _show_letter_comparison(self, item: DiffItem | None) -> None:
+        """The two texts lined up character under character, then every
+        character that differs named with its code point -- the view a
+        proofing station shows for a flagged string."""
+        show = item is not None and self._show_letters
+        self.letters_caption.setVisible(show)
+        self.letters_view.setVisible(show)
+        if not show:
+            return
+        self.letters_view.setHtml(self._letters_html(item))
+
+    def _letters_html(self, item: DiffItem) -> str:
+        t = theme.tokens()
+        approved, suspect = item.approved_text, item.suspect_text
+        muted = f"color: {t.muted}; font-size: 12px; font-style: italic;"
+        if not approved or not suspect:
+            side = "Original" if approved else "Suspect"
+            return (
+                f"<div style='{muted}'>Only the {side} has text here, so there is "
+                "nothing to line up letter by letter.</div>"
+            )
+
+        changes = character_changes(approved, suspect)
+        if not changes:
+            return f"<div style='{muted}'>Every character is identical.</div>"
+
+        parts = []
+        if max(len(approved), len(suspect)) <= _MAX_ALIGNED_CHARS:
+            parts.append(self._aligned_html(approved, suspect))
+        else:
+            parts.append(
+                f"<div style='{muted}'>Too long to line up in full "
+                f"({len(approved)} against {len(suspect)} characters); "
+                "the characters that differ are listed below.</div>"
+            )
+        parts.append(self._changes_html(changes))
+        return "".join(parts)
+
+    def _aligned_html(self, approved: str, suspect: str) -> str:
+        """The two texts one above the other, a character per column."""
+        t = theme.tokens()
+        removed_tint = _mix(t.danger, t.surface, 0.28 if t.dark else 0.18)
+        added_tint = _mix(t.success, t.surface, 0.28 if t.dark else 0.18)
+        rows = []
+        for label, side, color, tint in (
+            ("ORG", 0, t.danger, removed_tint),
+            ("SUS", 1, t.success, added_tint),
+        ):
+            cells = [
+                f"<td style='color: {t.muted}; font-size: 10px; padding-right: 6px'>{label}</td>"
+            ]
+            for column in align_characters(approved, suspect):
+                char = column[side]
+                shown = _escape(char) if char else "&middot;"
+                if column[2]:
+                    cells.append(
+                        f"<td style='background-color: {tint}; color: {color};"
+                        f" font-weight: 600; padding: 1px 3px'>{shown}</td>"
+                    )
+                else:
+                    cells.append(f"<td style='color: {t.text}; padding: 1px 3px'>{shown}</td>")
+            rows.append("<tr>" + "".join(cells) + "</tr>")
+        return (
+            "<table cellspacing='0' cellpadding='0' style=\"font-family: Consolas, "
+            "'Courier New', monospace; font-size: 13px\">" + "".join(rows) + "</table>"
+        )
+
+    def _changes_html(self, changes: list) -> str:
+        """Every differing character: what it is on each side, by code
+        point and Unicode name, and what kind of change it is."""
+        t = theme.tokens()
+        lines = []
+        for change in changes[:_MAX_LISTED_CHARS]:
+            lines.append(
+                f"<div style='margin-top: 3px'>"
+                f"<span style='color: {t.danger}'>{_escape(describe(change.approved))}</span>"
+                f"<span style='color: {t.muted}'> &rarr; </span>"
+                f"<span style='color: {t.success}'>{_escape(describe(change.suspect))}</span>"
+                f"<span style='color: {t.muted}'> &mdash; {_escape(change.note)}</span></div>"
+            )
+        if len(changes) > _MAX_LISTED_CHARS:
+            lines.append(
+                f"<div style='color: {t.muted}; margin-top: 3px'>"
+                f"and {len(changes) - _MAX_LISTED_CHARS} more "
+                f"character{'' if len(changes) - _MAX_LISTED_CHARS == 1 else 's'}; "
+                f"{_escape(summary_note(changes))}</div>"
+            )
+        return (
+            f"<div style=\"font-family: Consolas, 'Courier New', monospace; "
+            f"font-size: 11px; margin-top: 6px\">" + "".join(lines) + "</div>"
+        )
 
     def _pages_text(self, item: DiffItem) -> str:
         def page_of(location: Location | None, caret: Location | None) -> str:
@@ -403,7 +569,11 @@ class ComparatorPanel(QWidget):
         if before:
             parts.append(f"<span style='color: {t.muted}'>{_ELLIPSIS} {_escape(before)} </span>")
         for changed, text in segments:
-            if changed:
+            if changed and not text:
+                # A caret: the other side has characters here that this
+                # side does not.
+                parts.append(f"<span style='color: {mark_color}; font-weight: 700'>{_CARET}</span>")
+            elif changed:
                 parts.append(
                     f"<span style='background-color: {tint}; color: {mark_color};"
                     f" font-weight: 600'>{_escape_marked(text)}</span>"

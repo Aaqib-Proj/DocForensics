@@ -42,12 +42,13 @@ import getpass
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QItemSelectionModel, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -63,9 +64,11 @@ from PySide6.QtWidgets import (
 )
 
 from core.diff_engine import CATEGORY_LABELS, CATEGORY_ORDER, DiffItem, category_of
+from core.review_store import fingerprints
 from core.token_map import TokenMap
 from ui import theme
 from ui.comparator_panel import ComparatorPanel
+from ui.flow_layout import FlowLayout, FlowRow
 
 _SEVERITY_LABEL = {"reorder": "Moved"}
 
@@ -81,6 +84,17 @@ _COL_STATUS, _COL_SEVERITY, _COL_CATEGORY, _COL_COUNT, _COL_APPROVED, _COL_SUSPE
 _MAX_CELL_CHARS = 320
 
 _MINOR_AND_BELOW = ("minor", "typo", "reorder")
+
+# "Moved" is text both documents contain, in a different place. It is
+# shown as a category (with its count) but not listed by default --
+# see the chip tooltip below.
+_MOVED_CATEGORY = "moved"
+_MOVED_CHIP_TOOLTIP = (
+    "Text that BOTH documents contain, in a different place -- a column that "
+    "reflowed, a block printed in a different order, a section relocated. "
+    "Any wording that actually changed inside a moved passage is reported as "
+    "its own row, at its own severity."
+)
 
 
 @dataclass
@@ -109,13 +123,27 @@ class ResultsPanel(QWidget):
 
     item_activated = Signal(object)  # DiffItem
     view_changed = Signal()
+    # A decision, a "viewed" mark or a rematch changed: the review worth
+    # keeping on disk (see core/review_store.py) is different now.
+    review_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._items: list[DiffItem] = []
         self._categories: dict[int, str] = {}  # id(item) -> category
         self._decisions: dict[int, Decision] = {}  # id(item) -> decision
+        # (position, original item, rows that replaced it) per rematch,
+        # newest last -- `undo_rematch` walks it back.
+        self._rematches: list[tuple[int, DiffItem, list[DiffItem]]] = []
+        # Coalesces comparator redraws while the selection is moving.
+        self._comparator_timer = QTimer(self)
+        self._comparator_timer.setSingleShot(True)
+        self._comparator_timer.setInterval(30)
+        self._comparator_timer.timeout.connect(lambda: self._update_comparator(immediate=True))
         self._viewed_items: set[int] = set()  # id(item) -> marked as viewed
+        # Every rematch and undo, oldest first, for the report: a row a
+        # rematch removed is otherwise gone without a trace.
+        self._rematch_log: list[dict] = []
         # Row `i` shows the group self._row_groups[i]; self._visible_items[i]
         # is its first member (the one a click navigates to).
         self._row_groups: list[list[DiffItem]] = []
@@ -127,30 +155,42 @@ class ResultsPanel(QWidget):
 
         # --- category chips ---
         self._chips: dict[str, QToolButton] = {}
-        chip_layout = QHBoxLayout()
-        chip_layout.setContentsMargins(0, 0, 0, 0)
-        chip_layout.setSpacing(6)
+        # Wrapping rows: a plain QHBoxLayout refuses to be narrower
+        # than everything in it, which pinned the whole window's
+        # minimum width at about 2000px -- on a smaller screen its
+        # edges ended up off the desktop.
+        chip_layout = FlowLayout(spacing=6)
         show_label = QLabel("Show")
         show_label.setObjectName("muted")
         chip_layout.addWidget(show_label)
         for category in CATEGORY_ORDER:
             chip = QToolButton()
             chip.setCheckable(True)
+            # Every category is listed by default, "Moved" included: a
+            # moved row can be the only place a relocated passage is
+            # mentioned, so hiding it by default would quietly take
+            # that passage off the review. One click still hides it.
             chip.setChecked(True)
             chip.setProperty("chip", True)
-            chip.setToolTip(f"Show or hide '{CATEGORY_LABELS[category]}' differences")
+            chip.setToolTip(
+                _MOVED_CHIP_TOOLTIP
+                if category == _MOVED_CATEGORY
+                else f"Show or hide '{CATEGORY_LABELS[category]}' differences"
+            )
             chip.toggled.connect(self._refresh_table)
             self._chips[category] = chip
             chip_layout.addWidget(chip)
-        chip_layout.addStretch()
         self._update_chip_labels()
 
         # --- view options ---
         self.ignore_minor_checkbox = QCheckBox("Ignore minor and below")
         self.ignore_minor_checkbox.setToolTip(
-            "Hides (does not delete) everything at or below 'minor': "
-            "punctuation-only changes, character-level typos, and moved "
-            "text -- leaving only critical and major differences."
+            "Hides (does not delete) rows rated minor or below: spacing and "
+            "punctuation, labels inside charts and diagrams, text-layer noise "
+            "(a letter lost from a ligature or a doubled letter), and text "
+            "found at another position. Every changed word or number, every "
+            "added or deleted passage and every misspelling stays visible. "
+            "Hidden rows are still in the report -- review them before sign-off."
         )
         self.ignore_minor_checkbox.stateChanged.connect(self._refresh_table)
         self.group_checkbox = QCheckBox("Group identical")
@@ -166,6 +206,14 @@ class ResultsPanel(QWidget):
         self.hide_viewed_checkbox = QCheckBox("Hide viewed")
         self.hide_viewed_checkbox.setToolTip("Hide differences already viewed, focusing on unseen ones.")
         self.hide_viewed_checkbox.stateChanged.connect(self._refresh_table)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Sort: severity", "Sort: page order"])
+        self.sort_combo.setToolTip(
+            "Severity puts critical rows first. Page order walks the Original "
+            "document from top to bottom, the way a proofreader reads."
+        )
+        self.sort_combo.currentIndexChanged.connect(self._refresh_table)
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Filter by text…")
@@ -192,17 +240,15 @@ class ResultsPanel(QWidget):
         self.reset_button.setToolTip("Clear the review decision of the selected differences (U)")
         self.reset_button.clicked.connect(lambda: self.decide_selected(None))
 
-        options_layout = QHBoxLayout()
-        options_layout.setContentsMargins(0, 0, 0, 0)
-        options_layout.setSpacing(10)
+        options_layout = FlowLayout(spacing=10)
         options_layout.addWidget(self.ignore_minor_checkbox)
         options_layout.addWidget(self.group_checkbox)
         options_layout.addWidget(self.hide_reviewed_checkbox)
         options_layout.addWidget(self.hide_viewed_checkbox)
+        options_layout.addWidget(self.sort_combo)
         options_layout.addWidget(self.search_box)
         options_layout.addWidget(self.unseen_badge)
         options_layout.addWidget(self.summary_label)
-        options_layout.addStretch()
         options_layout.addWidget(self.unview_button)
         options_layout.addWidget(self.accept_button)
         options_layout.addWidget(self.reject_button)
@@ -253,11 +299,22 @@ class ResultsPanel(QWidget):
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setSizes([760, 420])
 
+        self.coverage_banner = QLabel()
+        self.coverage_banner.setObjectName("coverageBanner")
+        self.coverage_banner.setWordWrap(True)
+        self.coverage_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.coverage_banner.setVisible(False)
+
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
-        layout.addLayout(chip_layout)
-        layout.addLayout(options_layout)
+        layout.addWidget(self.coverage_banner)
+        # Each wrapping row lives in its own widget, capped at the
+        # height it actually needs: as a bare sub-layout the vertical
+        # layout handed it the spare space, which came straight out of
+        # the comparator below.
+        for row in (chip_layout, options_layout):
+            layout.addWidget(FlowRow(row))
         layout.addWidget(self.splitter)
         self.setLayout(layout)
         self.table.itemSelectionChanged.connect(self._update_comparator)
@@ -267,6 +324,27 @@ class ResultsPanel(QWidget):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_warnings(self, warnings: list[str]) -> None:
+        """Show what the comparison could NOT read (see
+        core/coverage_check.py) above the list, until the next run."""
+        self._warnings = list(warnings)
+        if not warnings:
+            self.coverage_banner.setVisible(False)
+            return
+        t = theme.tokens()
+        self.coverage_banner.setStyleSheet(
+            f"QLabel#coverageBanner {{ color: {t.danger}; border: 1px solid {t.danger};"
+            " border-radius: 4px; padding: 6px 8px; }"
+        )
+        self.coverage_banner.setText(
+            "<b>\u26a0 Not everything could be compared.</b><br>"
+            + "<br>".join("\u2022 " + w.replace("&", "&amp;").replace("<", "&lt;") for w in warnings)
+        )
+        self.coverage_banner.setVisible(True)
+
+    def warnings(self) -> list[str]:
+        return list(getattr(self, "_warnings", []))
 
     def set_token_map(self, token_map: TokenMap | None) -> None:
         """Hand the comparison's word alignment to the comparator, which
@@ -281,17 +359,196 @@ class ResultsPanel(QWidget):
     def comparator_visible(self) -> bool:
         return self.comparator.isVisible()
 
-    def set_results(self, diff_items: list[DiffItem]) -> None:
-        """Replace the list with a fresh set of results (decisions reset)."""
+    def set_results(self, diff_items: list[DiffItem], keep_review: bool = False) -> None:
+        """Replace the list with a fresh set of results.
+
+        A new comparison starts with no decisions. ``keep_review`` is for
+        the authoritative list arriving at the END of a comparison whose
+        rows were already shown while it ran: decisions and "viewed"
+        marks the reviewer gave those rows are kept for every row still
+        in the final list (they used to be silently wiped).
+        """
+        if keep_review:
+            kept = {id(item) for item in diff_items}
+            self._decisions = {k: v for k, v in self._decisions.items() if k in kept}
+            self._viewed_items = {k for k in self._viewed_items if k in kept}
+        else:
+            self._decisions = {}
+            self._viewed_items = set()
+            self._rematch_log = []
         self._items = diff_items
         self._categories = {id(item): category_of(item) for item in diff_items}
-        self._decisions = {}
-        self._viewed_items = set()
         self._update_chip_labels()
         self._refresh_table()
 
+    def append_results(self, diff_items: list[DiffItem]) -> None:
+        """Add differences found so far, while the comparison is still
+        running, so the list fills as they are found rather than all at
+        once at the end.
+
+        The new rows are APPENDED to the table rather than the table
+        being rebuilt: rebuilding costs as much as the whole first fill
+        every time, so a long comparison arriving in sixty batches spent
+        seconds redoing work and the list stuttered the whole way
+        through. (Grouping identical rows does need a rebuild, since a
+        new difference can join an existing group.)
+
+        These rows are provisional -- the comparison's closing passes
+        can still merge or re-rank them -- so `set_results` replaces the
+        lot when it finishes.
+        """
+        if not diff_items:
+            return
+        self._items.extend(diff_items)
+        for item in diff_items:
+            self._categories[id(item)] = category_of(item)
+        self._update_chip_labels()
+        if self.group_checkbox.isChecked() or self._page_order():
+            # Grouping can merge a new row into an existing one, and page
+            # order can put it anywhere: both need the full rebuild.
+            self._refresh_table(keep_selection=True)
+            return
+
+        listed = [item for item in diff_items if self._passes_filters(item)]
+        if listed:
+            start = self.table.rowCount()
+            self._programmatic = True
+            self.table.setUpdatesEnabled(False)
+            try:
+                self.table.setRowCount(start + len(listed))
+                for offset, item in enumerate(listed):
+                    group = [item]
+                    self._row_groups.append(group)
+                    self._visible_items.append(item)
+                    self._fill_row(start + offset, group)
+            finally:
+                self.table.setUpdatesEnabled(True)
+                self._programmatic = False
+        self._update_summary_labels(len(self._visible_items))
+        self._update_action_buttons()
+        # No `view_changed` here: redrawing every difference on both
+        # documents for each batch is far more work than the comparison
+        # itself, and the highlights are drawn once at the end anyway.
+
     def clear_results(self) -> None:
         self.set_results([])
+        self._rematches = []
+
+    def replace_item(
+        self, item: DiffItem, replacements: list[DiffItem], reason: str = ""
+    ) -> list[DiffItem]:
+        """Swap one difference for the rows a rematch produced, in its
+        place in the list. Returns the new rows (empty when the rematch
+        left nothing to report). Undone by `undo_rematch`. Every rematch
+        is logged (`rematch_log`), so a removed row stays on record."""
+        try:
+            position = next(i for i, existing in enumerate(self._items) if existing is item)
+        except StopIteration:
+            return []
+        self._log_rematch(
+            item,
+            "removed" if not replacements else f"replaced by {len(replacements)} row(s)",
+            reason,
+        )
+        self._rematches.append((position, item, list(replacements)))
+        self._items[position : position + 1] = replacements
+        self._decisions.pop(id(item), None)
+        self._categories.pop(id(item), None)
+        self._viewed_items.discard(id(item))
+        for new_item in replacements:
+            self._categories[id(new_item)] = category_of(new_item)
+        self._renumber()
+        self._update_chip_labels()
+        self._refresh_table()
+        self.review_changed.emit()
+        return replacements
+
+    def undo_rematch(self) -> DiffItem | None:
+        """Put the most recently rematched difference back. Returns it,
+        or None when nothing has been rematched."""
+        if not self._rematches:
+            return None
+        position, item, replacements = self._rematches.pop()
+        self._log_rematch(item, "rematch undone (row restored)", "")
+        start = next(
+            (i for i, existing in enumerate(self._items)
+             if any(existing is new_item for new_item in replacements)),
+            position,
+        )
+        remaining = [i for i in self._items if not any(i is r for r in replacements)]
+        remaining.insert(min(start, len(remaining)), item)
+        self._items = remaining
+        self._categories = {id(i): self._categories.get(id(i)) or category_of(i) for i in self._items}
+        self._renumber()
+        self._update_chip_labels()
+        self._refresh_table()
+        self.review_changed.emit()
+        return item
+
+    def _log_rematch(self, item: DiffItem, outcome: str, reason: str) -> None:
+        self._rematch_log.append({
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "reviewer": self.reviewer,
+            "outcome": outcome,
+            "severity": item.severity,
+            "approved_text": item.approved_text,
+            "suspect_text": item.suspect_text,
+            "reason": reason,
+        })
+
+    def rematch_log(self) -> list[dict]:
+        return list(self._rematch_log)
+
+    # --- keeping the review (core/review_store.py) -------------------------
+
+    def review_state(self) -> dict:
+        """Decisions, "viewed" marks and the rematch log, keyed by what
+        each difference IS rather than where it sits in the list."""
+        keys = fingerprints(self._items)
+        decisions = {}
+        viewed = []
+        for key, item in zip(keys, self._items):
+            decision = self._decisions.get(id(item))
+            if decision is not None:
+                decisions[key] = {
+                    "status": decision.status,
+                    "reviewer": decision.reviewer,
+                    "decided_at": decision.decided_at.isoformat(),
+                }
+            if id(item) in self._viewed_items:
+                viewed.append(key)
+        return {"version": 1, "decisions": decisions, "viewed": viewed, "rematch_log": self._rematch_log}
+
+    def restore_review(self, state: dict) -> int:
+        """Put back a saved review for these same two documents. Returns
+        how many decisions were restored."""
+        if not state:
+            return 0
+        saved = state.get("decisions") or {}
+        viewed = set(state.get("viewed") or [])
+        restored = 0
+        for key, item in zip(fingerprints(self._items), self._items):
+            entry = saved.get(key)
+            if entry and id(item) not in self._decisions:
+                try:
+                    decided_at = datetime.fromisoformat(entry["decided_at"])
+                except (KeyError, ValueError):
+                    decided_at = datetime.now(timezone.utc)
+                self._decisions[id(item)] = Decision(entry.get("status", ""), entry.get("reviewer", ""), decided_at)
+                restored += 1
+            if key in viewed:
+                self._viewed_items.add(id(item))
+        if not self._rematch_log:
+            self._rematch_log = list(state.get("rematch_log") or [])
+        self._refresh_table(keep_selection=True)
+        return restored
+
+    def can_undo_rematch(self) -> bool:
+        return bool(self._rematches)
+
+    def _renumber(self) -> None:
+        for index, item in enumerate(self._items):
+            item.index = index
 
     def rowCount(self) -> int:  # noqa: N802 -- QTableWidget-style name, for callers/tests
         return self.table.rowCount()
@@ -310,6 +567,11 @@ class ResultsPanel(QWidget):
     def all_items(self) -> list[DiffItem]:
         return list(self._items)
 
+    def selected_items(self) -> list[DiffItem]:
+        """Every difference in the selected rows (a grouped row stands
+        for all its members)."""
+        return self._selected_items()
+
     def select_item(self, item: DiffItem) -> bool:
         """Select and scroll to ``item``'s row without emitting
         ``item_activated``. Returns False if the row is hidden by a
@@ -326,7 +588,7 @@ class ResultsPanel(QWidget):
                     self.table.item(row, 0), QAbstractItemView.ScrollHint.PositionAtCenter
                 )
                 self._update_action_buttons()
-                self._update_comparator()
+                self._update_comparator(immediate=True)
                 return True
         self._programmatic = True
         try:
@@ -334,7 +596,7 @@ class ResultsPanel(QWidget):
         finally:
             self._programmatic = False
         self._update_action_buttons()
-        self._update_comparator()
+        self._update_comparator(immediate=True)
         return False
 
     def select_adjacent(self, step: int) -> bool:
@@ -375,6 +637,7 @@ class ResultsPanel(QWidget):
         for item in selected:
             self._viewed_items.discard(id(item))
         self._refresh_table(keep_selection=True)
+        self.review_changed.emit()
 
     def view_selected(self) -> None:
         """Mark the selected deviation(s) as viewed."""
@@ -388,6 +651,7 @@ class ResultsPanel(QWidget):
         for item in selected:
             self._viewed_items.add(id(item))
         self._refresh_table(keep_selection=True)
+        self.review_changed.emit()
 
     def decide(self, items: list[DiffItem], status: str | None) -> None:
         """Accept (``ACCEPTED``), reject (``REJECTED``) or reset (None)
@@ -400,6 +664,7 @@ class ResultsPanel(QWidget):
             else:
                 self._decisions[id(item)] = Decision(status, self.reviewer, now)
         self._refresh_table(keep_selection=True)
+        self.review_changed.emit()
 
     def decide_selected(self, status: str | None) -> None:
         self.decide(self._selected_items(), status)
@@ -446,6 +711,8 @@ class ResultsPanel(QWidget):
         )
 
         listed = [item for item in self._items if self._passes_filters(item)]
+        if self._page_order():
+            listed.sort(key=_page_position)
         if self.group_checkbox.isChecked():
             groups: dict[tuple, list[DiffItem]] = {}
             for item in listed:
@@ -477,6 +744,9 @@ class ResultsPanel(QWidget):
         self._update_action_buttons()
         self._update_comparator()
         self.view_changed.emit()
+
+    def _page_order(self) -> bool:
+        return self.sort_combo.currentIndex() == 1
 
     def _update_summary_labels(self, listed_count: int | None = None) -> None:
         t = theme.tokens()
@@ -597,11 +867,23 @@ class ResultsPanel(QWidget):
             cell.setToolTip(display_text)
         return cell
 
-    def _update_comparator(self) -> None:
+    def _update_comparator(self, immediate: bool = False) -> None:
         """Show the current row's difference in the comparator (or clear
-        it when nothing is selected)."""
+        it when nothing is selected).
+
+        Held arrow keys and Next-difference walk through rows faster
+        than the pane can be rebuilt -- each one costs a few
+        milliseconds of HTML -- so a change from the table is coalesced
+        on a short timer and only the row actually landed on is drawn.
+        An explicit `select_item` (a difference clicked in a viewer)
+        updates straight away.
+        """
         if self._programmatic or not self.comparator.isVisible():
             return  # mid-rebuild; the caller updates once it settles
+        if not immediate:
+            self._comparator_timer.start()
+            return
+        self._comparator_timer.stop()
         row = self.table.currentRow()
         selected = {index.row() for index in self.table.selectedIndexes()}
         if row not in selected or not 0 <= row < len(self._row_groups):
@@ -684,4 +966,19 @@ class ResultsPanel(QWidget):
                 self._fill_row(row, group)
                 self._update_summary_labels()
                 self._update_action_buttons()
+                self.review_changed.emit()
             self.item_activated.emit(self._visible_items[row])
+
+
+def _page_position(item: DiffItem) -> tuple:
+    """Where a difference sits, Original first: (page, top, left).
+    Insertions have only a caret on the Original side; a row with no
+    Original position at all sorts by its Suspect position, after."""
+    for location, caret, side in (
+        (item.approved_location, item.approved_caret, 0),
+        (item.suspect_location, item.suspect_caret, 1),
+    ):
+        where = location or caret
+        if where is not None:
+            return (side, where.page, where.bbox[1], where.bbox[0])
+    return (2, 0, 0.0, 0.0)

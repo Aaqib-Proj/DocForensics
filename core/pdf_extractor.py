@@ -192,6 +192,7 @@ order, after that page's regular body/table reading order.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import math
 import os
@@ -205,9 +206,14 @@ from typing import Optional
 import fitz  # PyMuPDF -- PDF text extraction and page rasterization for multi-format rendering
 import pdfplumber
 
+from core import fast_tables
 from core.mupdf_page import MuPdfPage
 from core.script_text import SCRIPT_CHARS, SUBSCRIPT, SUPERSCRIPT, join_runs
 from core.section_diff import is_likely_header_line
+
+# pdfplumber's table geometry, minus its quadratic work -- identical
+# results (see core/fast_tables.py).
+fast_tables.install()
 
 logger = logging.getLogger(__name__)
 
@@ -755,18 +761,17 @@ def _mark_script_chars(chars: list[dict]) -> None:
     def band(c: dict) -> int:
         return int((c["top"] + c["bottom"]) / 2 // band_height)
 
-    by_x1: dict[tuple[int, int], list[dict]] = {}
-    by_x0: dict[tuple[int, int], list[dict]] = {}
     # Largest glyph per (band, x bucket): a base touches its script
     # glyph, so only the glyph's own and adjacent buckets matter.
+    bands: dict[int, int] = {}
     area_max_size: dict[tuple[int, int], float] = {}
     for c in upright:
+        b = bands[id(c)] = int((c["top"] + c["bottom"]) / 2 // band_height)
         if c["text"].strip():
-            b = band(c)
-            by_x1.setdefault((round(c["x1"]), b), []).append(c)
-            by_x0.setdefault((round(c["x0"]), b), []).append(c)
             area = (b, int(c["x0"] // _SIZE_BUCKET_WIDTH))
-            area_max_size[area] = max(area_max_size.get(area, 0.0), c["size"])
+            size = c["size"]
+            if size > area_max_size.get(area, 0.0):
+                area_max_size[area] = size
 
     def neighbors(c: dict, left: bool) -> list[dict]:
         index, edge = (by_x1, round(c["x0"])) if left else (by_x0, round(c["x1"]))
@@ -789,21 +794,55 @@ def _mark_script_chars(chars: list[dict]) -> None:
     # these sizes can continue a run.
     attached_sizes: set[float] = set()
 
+    # The largest glyph in the 3x3 block of areas around one area. Every
+    # glyph on the same line in the same bucket shares it, so it is
+    # worked out once per area rather than once per glyph (a 100-page
+    # document has two million glyphs and a few thousand areas).
+    neighborhood_max: dict[tuple[int, int], float] = {}
+
+    def nearby_max_size(c_band: int, bucket: int) -> float:
+        key = (c_band, bucket)
+        found = neighborhood_max.get(key)
+        if found is None:
+            found = max(
+                area_max_size.get((b, x), 0.0)
+                for b in (c_band - 1, c_band, c_band + 1)
+                for x in (bucket - 1, bucket, bucket + 1)
+            )
+            neighborhood_max[key] = found
+        return found
+
+    # Most glyphs (ordinary body text) have no noticeably larger glyph
+    # anywhere near them, so they cannot be raised or lowered. One can
+    # still CONTINUE a run, but only at the size of a glyph that could
+    # attach to a base -- so everything else is left out before sorting.
+    may_attach: dict[int, bool] = {}
+    for c in upright:
+        nearby_max = nearby_max_size(bands[id(c)], int(c["x0"] // _SIZE_BUCKET_WIDTH))
+        may_attach[id(c)] = bool(c["text"].strip()) and c["size"] <= nearby_max * _SCRIPT_MAX_SIZE_RATIO
+    if not any(may_attach.values()):
+        return  # nothing on this page can be a superscript or subscript
+
+    # Glyphs by (rounded edge x, band), for the neighbour search -- built
+    # only for a page that has a candidate (most pages have none).
+    by_x1: dict[tuple[int, int], list[dict]] = {}
+    by_x0: dict[tuple[int, int], list[dict]] = {}
+    for c in upright:
+        if c["text"].strip():
+            b = bands[id(c)]
+            by_x1.setdefault((round(c["x1"]), b), []).append(c)
+            by_x0.setdefault((round(c["x0"]), b), []).append(c)
+    run_sizes = {round(c["size"], 1) for c in upright if may_attach[id(c)]}
+    candidates_in_order = sorted(
+        (c for c in upright if may_attach[id(c)] or round(c["size"], 1) in run_sizes),
+        key=lambda c: c["x0"],
+    )
+
     # Left to right, so a multi-glyph run ("10" raised in "x10") can
     # inherit from the glyph before it.
-    for c in sorted(upright, key=lambda c: c["x0"]):
+    for c in candidates_in_order:
         size = c["size"]
-        c_band = band(c)
-        # Most glyphs (ordinary body text) have no noticeably larger
-        # glyph anywhere near them and can't continue a run: skip the
-        # neighbor search for them entirely.
-        bucket = int(c["x0"] // _SIZE_BUCKET_WIDTH)
-        nearby_max = max(
-            area_max_size.get((b, x), 0.0)
-            for b in (c_band - 1, c_band, c_band + 1)
-            for x in (bucket - 1, bucket, bucket + 1)
-        )
-        can_have_base = bool(c["text"].strip()) and size <= nearby_max * _SCRIPT_MAX_SIZE_RATIO
+        can_have_base = may_attach[id(c)]
         if not can_have_base and round(size, 1) not in attached_sizes:
             continue
         base = None
@@ -986,13 +1025,21 @@ def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] =
             # Filter isolated running page numbers and technical plate slugs in margins
             filtered_raw_words = []
             page_str = str(page_idx)
+            # Words by `top`, so a margin word's line-mates are found by
+            # bisecting rather than by scanning every word on the page
+            # (dense artwork has hundreds of words in its margins). The
+            # exact test is applied to the slice, in page order.
+            by_top = sorted(range(len(canvas_words)), key=lambda k: canvas_words[k]["top"])
+            tops = [canvas_words[k]["top"] for k in by_top]
             for w in canvas_words:
                 rel_top = w["top"] - page_top0
                 rel_bottom = w["bottom"] - page_top0
                 if rel_top < 65.0 or rel_bottom > (ph - 65.0):
+                    lo = bisect.bisect_left(tops, w["top"] - 6.0)
+                    hi = bisect.bisect_right(tops, w["top"] + 6.0)
                     same_line_words = [
-                        ow for ow in canvas_words
-                        if abs(ow["top"] - w["top"]) <= 5.0
+                        canvas_words[k] for k in sorted(by_top[lo:hi])
+                        if abs(canvas_words[k]["top"] - w["top"]) <= 5.0
                     ]
                     line_txt = " ".join(ow["text"] for ow in same_line_words)
                     if any(k in line_txt for k in ["Dimensions:", "Color:", "Pantone"]):
@@ -1009,7 +1056,11 @@ def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] =
             # page.chars, which is what actually carries each
             # character's text matrix.
             upright_words = [w for w in filtered_raw_words if w.get("upright", True)]
-            tables = _detect_page_tables(page)
+            # Tables only decide how the page's upright words are read. A
+            # page without any (a scan, a blank page, artwork) skips the
+            # search -- which reads every vector path on the page, a
+            # million of them on an outlined scan.
+            tables = _detect_page_tables(page) if upright_words else []
             # One RTL decision per page -- stable across renderings.
             page_rtl = _page_is_rtl(filtered_raw_words)
             ordered_words = _order_page_words(upright_words, tables, rtl=page_rtl, page=page)
@@ -1077,7 +1128,10 @@ def _order_page_words(
 
     cell_ids = _assign_words_to_cells(raw_words, tables)
     real_table_idxs = {
-        t_idx for t_idx in range(len(tables)) if _looks_like_real_table(t_idx, cell_ids)
+        t_idx
+        for t_idx in range(len(tables))
+        if _looks_like_real_table(t_idx, cell_ids)
+        and not _cuts_through_words(tables[t_idx], raw_words)
     }
     cell_ids = {w_idx: cid for w_idx, cid in cell_ids.items() if cid[0] in real_table_idxs}
 
@@ -1407,6 +1461,63 @@ def _assign_words_to_cells(
 # than one column at once; its words fall back to ordinary body-text
 # handling instead.
 _MIN_MULTI_COLUMN_ROW_FRACTION = 0.3
+
+
+# A real table's column edges run BETWEEN its columns, so no word ever
+# crosses one. A "table" that `find_tables` infers from stray ruling
+# lines over flowing text slices the lines wherever those rules happen
+# to fall, and its column edges run straight THROUGH words. Reading
+# such a grid cell by cell interleaves the lines: a real case, a
+# leaflet's "Reporting of side effects" paragraph, came out as "This
+# includes any the Yellow Play or possible Card Apple App side Scheme
+# Store." -- three lines read in vertical strips.
+#
+# Measured on the real documents: genuine tables cross 0-5% of their
+# words (ragged cell padding, a stray "=" or a wide heading), the
+# inferred ones 18-61%.
+_MAX_WORD_STRADDLE_FRACTION = 0.15
+# Below this many words the share is noise, so the grid is left to the
+# other checks.
+_MIN_STRADDLE_SAMPLE_WORDS = 4
+# A word has to cross an edge by more than this to count (cell edges
+# often sit exactly on the ink).
+_STRADDLE_TOLERANCE = 0.5
+
+
+def _cuts_through_words(table: dict, raw_words: list[dict]) -> bool:
+    """Whether this table's column edges run through its own words --
+    the signature of a grid inferred from ruling lines over flowing
+    text rather than a real table."""
+    x0, top, x1, bottom = table["bbox"]
+    edges = sorted(
+        {
+            value
+            for row in table["cells"]
+            for cell in row
+            if cell is not None
+            for value in (cell[0], cell[2])
+            if x0 + 1.0 < value < x1 - 1.0
+        }
+    )
+    if not edges:
+        return False
+    inside = [
+        word
+        for word in raw_words
+        if x0 - TABLE_ASSIGN_PAD <= (word["x0"] + word["x1"]) / 2.0 <= x1 + TABLE_ASSIGN_PAD
+        and top - TABLE_ASSIGN_PAD <= (word["top"] + word["bottom"]) / 2.0 <= bottom + TABLE_ASSIGN_PAD
+    ]
+    if len(inside) < _MIN_STRADDLE_SAMPLE_WORDS:
+        return False
+    crossing = sum(
+        1
+        for word in inside
+        if any(
+            word["x0"] < edge - _STRADDLE_TOLERANCE and word["x1"] > edge + _STRADDLE_TOLERANCE
+            for edge in edges
+        )
+    )
+    return crossing / len(inside) >= _MAX_WORD_STRADDLE_FRACTION
 
 
 def _looks_like_real_table(

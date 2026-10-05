@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docforensics-analyzer"
+version = "0.38.0"
+description = "Forensic document diff and comparison analyzer for PDF, DOCX, PPTX, and XLSX"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PySide6>=6.6",
+    "PyMuPDF>=1.23",
+    "pdfplumber>=0.11",
+    "numpy>=1.24",
+    "diff-match-patch>=0.2.0",
+    "python-docx>=1.0",
+    "python-pptx>=0.6.23",
+    "openpyxl>=3.1",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.gui-scripts]
+docforensics = "main:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "ui*", "workers*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.png", "*.ico", "*.svg", "*.css"]

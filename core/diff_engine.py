@@ -132,10 +132,11 @@ from __future__ import annotations
 
 import bisect
 import difflib
+import functools
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from core.pdf_extractor import ComparisonToken, Word
 from core.script_text import SCRIPT_DIGITS
@@ -257,6 +258,7 @@ def diff_documents(
     approved_tokens: list[ComparisonToken],
     suspect_tokens: list[ComparisonToken],
     matches: Optional[TokenMatches] = None,
+    on_found: Optional[Callable[[list[DiffItem]], None]] = None,
 ) -> list[DiffItem]:
     """Diff two token streams and return only the discrepancies.
 
@@ -278,16 +280,36 @@ def diff_documents(
     If ``matches`` is given, every pair of tokens found identical (and
     therefore corresponding to each other) is appended to it -- the UI
     uses this to take the other document to the same text.
+
+    ``on_found`` is called with each batch of differences as the
+    section it came from is compared, so a list can fill as the
+    comparison runs instead of all at once at the end. The batches are
+    PROVISIONAL: the passes that run once the whole document has been
+    compared (pairing a deletion with the matching insertion elsewhere,
+    demoting text that only moved, sorting by severity) can still
+    change or merge them, so the returned list -- not the batches -- is
+    the authoritative result.
     """
+    def _found(items: list[DiffItem]) -> None:
+        """Hand on the differences worth showing while the comparison
+        runs: the spacing artifacts the closing pass drops anyway are
+        left out here too, so the list grows instead of filling up and
+        then shrinking."""
+        if on_found is None:
+            return
+        worth_showing = [item for item in items if not _is_whitespace_artifact(item)]
+        if worth_showing:
+            on_found(worth_showing)
+
     sections_a = _split_sections(approved_tokens)
     sections_b = _split_sections(suspect_tokens)
     if sections_a is not None and sections_b is not None:
         return _diff_by_sections(
-            approved_tokens, suspect_tokens, sections_a, sections_b, matches
+            approved_tokens, suspect_tokens, sections_a, sections_b, matches, on_found=_found
         )
-    return _finalize_items(
-        _diff_runs(approved_tokens, suspect_tokens, matches), approved_tokens, suspect_tokens
-    )
+    whole = _diff_runs(approved_tokens, suspect_tokens, matches)
+    _found(whole)
+    return _finalize_items(whole, approved_tokens, suspect_tokens)
 
 
 def _diff_runs(
@@ -522,6 +544,53 @@ def _diff_replace_span(
     return items
 
 
+def _is_whitespace_artifact(item: DiffItem) -> bool:
+    """Whether a difference is only a word drawn in pieces -- the same
+    letters with a space somewhere inside a word ("spe cifically"), which
+    is how extraction reports a word a PDF happens to draw in two runs.
+    Dropped from the results.
+
+    A space that appears or disappears NEXT TO A DIGIT is a real
+    typesetting difference on a label -- "100 mg" against "100mg",
+    "10 000" against "10000", "\u2265 5%" against "\u22655%" -- and is
+    reported (as a minor spacing difference). Splits between letters and
+    signs ("(N M S )", "Co- codamol") are how extraction reports
+    letter-spaced or wrapped text, and are dropped.
+    """
+    if item.kind != "text_changed":
+        return False
+    approved, suspect = item.approved_text, item.suspect_text
+    bare = re.sub(r"\s+", "", approved)
+    if bare != re.sub(r"\s+", "", suspect):
+        return False
+    gaps_a, gaps_b = _space_positions(approved), _space_positions(suspect)
+    for position in gaps_a ^ gaps_b:
+        if 0 < position < len(bare) and (bare[position - 1].isdigit() or bare[position].isdigit()):
+            return False
+    return True
+
+
+def _is_whitespace_only(approved: str, suspect: str) -> bool:
+    return approved != suspect and re.sub(r"\s+", "", approved) == re.sub(r"\s+", "", suspect)
+
+
+def _space_positions(text: str) -> set[int]:
+    """Where the whitespace runs sit, counted in non-space characters:
+    "ab c" -> {2}."""
+    positions: set[int] = set()
+    count = 0
+    previous_space = False
+    for ch in text.strip():
+        if ch.isspace():
+            if not previous_space:
+                positions.add(count)
+            previous_space = True
+        else:
+            count += 1
+            previous_space = False
+    return positions
+
+
 def _finalize_items(
     items: list[DiffItem],
     approved_tokens: Optional[list[ComparisonToken]] = None,
@@ -530,18 +599,12 @@ def _finalize_items(
     """Shared tail of every diff path: filter identical-text whitespace
     artifacts, reorder-pair demotion, severity sort, and stable index
     renumbering."""
-    items = [
-        item
-        for item in items
-        if not (
-            item.kind == "text_changed"
-            and re.sub(r"\s+", "", item.approved_text) == re.sub(r"\s+", "", item.suspect_text)
-        )
-    ]
+    items = [item for item in items if not _is_whitespace_artifact(item)]
     items = _downgrade_reorder_pairs(items)
     if approved_tokens is not None and suspect_tokens is not None:
         _downgrade_relocated_runs(items, approved_tokens, suspect_tokens)
         items = _deduplicate_reordered_pairs(items)
+        _locate_moved_counterparts(items, approved_tokens, suspect_tokens)
     items.sort(key=lambda item: SEVERITY_ORDER.index(item.severity))
     for new_index, item in enumerate(items):
         item.index = new_index
@@ -597,6 +660,50 @@ def _deduplicate_reordered_pairs(items: list[DiffItem]) -> list[DiffItem]:
                 items_to_drop.add(id(add_it))
 
     return [i for i in items if id(i) not in items_to_drop]
+
+
+def _locate_moved_counterparts(
+    items: list[DiffItem],
+    approved_tokens: list[ComparisonToken],
+    suspect_tokens: list[ComparisonToken],
+) -> None:
+    """Give a one-sided "moved" row its other side: WHERE the passage
+    sits in the other document. Without it the row reads as text that is
+    simply missing on that side, and the reviewer cannot check the claim
+    that it moved rather than disappeared."""
+    used: dict[str, set[int]] = {"approved": set(), "suspect": set()}
+    for item in items:
+        if item.kind != "reordered":
+            continue
+        if item.approved_text and not item.suspect_text:
+            side, text, tokens = "suspect", item.approved_text, suspect_tokens
+        elif item.suspect_text and not item.approved_text:
+            side, text, tokens = "approved", item.suspect_text, approved_tokens
+        else:
+            continue
+        start = _find_token_run(tokens, text.split(), used[side])
+        if start is None:
+            continue
+        run = tokens[start:start + len(text.split())]
+        used[side].add(start)
+        if side == "suspect":
+            item.suspect_text = text
+            item.suspect_location = _location_of(run)
+        else:
+            item.approved_text = text
+            item.approved_location = _location_of(run)
+
+
+def _find_token_run(tokens: list[ComparisonToken], words: list[str], taken: set[int]) -> Optional[int]:
+    if not words:
+        return None
+    n = len(words)
+    for i in range(len(tokens) - n + 1):
+        if i in taken or tokens[i].text != words[0]:
+            continue
+        if all(tokens[i + k].text == words[k] for k in range(1, n)):
+            return i
+    return None
 
 
 def _location_of(tokens: list[ComparisonToken]) -> Optional[Location]:
@@ -1550,6 +1657,7 @@ def _diff_by_sections(
     sections_a: list[_Section],
     sections_b: list[_Section],
     matches: Optional[TokenMatches] = None,
+    on_found: Optional[Callable[[list[DiffItem]], None]] = None,
 ) -> list[DiffItem]:
     """Per-section comparison for documents with detected headers.
 
@@ -1603,7 +1711,10 @@ def _diff_by_sections(
             opcodes = pair_opcodes[a_idx]  # untouched by pass 2
         else:
             opcodes = _opcodes(tokens_a, tokens_b)
-        items.extend(_items_from_opcodes(tokens_a, tokens_b, opcodes, matches))
+        found = _items_from_opcodes(tokens_a, tokens_b, opcodes, matches)
+        items.extend(found)
+        if on_found is not None and found:
+            on_found(found)
         # Sections paired only by content (different headers -- e.g. a
         # figure label read as a header) aren't reported as moved: that
         # would claim a section move the documents don't have.
@@ -1620,6 +1731,7 @@ def _diff_by_sections(
                 )
             )
 
+    before_unmatched = len(items)
     for a_idx in sorted(unmatched_a):
         for run in _runs_without(sections_a[a_idx].tokens, moved_a):
             items.append(
@@ -1647,6 +1759,10 @@ def _diff_by_sections(
                 )
             )
 
+    if on_found is not None and len(items) > before_unmatched:
+        on_found(items[before_unmatched:])
+
+    before_passages = len(items)
     for span_a, span_b in passages:
         items.extend(_diff_runs(span_a, span_b, matches))  # edits inside the moved text
         if not _has_matching_context(span_a, span_b, approved_tokens, suspect_tokens):
@@ -1662,6 +1778,8 @@ def _diff_by_sections(
                 )
             )
 
+    if on_found is not None and len(items) > before_passages:
+        on_found(items[before_passages:])
     return _finalize_items(items, approved_tokens, suspect_tokens)
 
 
@@ -1840,6 +1958,16 @@ def _downgrade_relocated_runs(
             # edit (major/minor/typo), never a relocation.
             if _strip_punct(app_w).replace(" ", "") == _strip_punct(sus_w).replace(" ", ""):
                 continue
+            # Two PASSAGES that are not recognizably the same text are
+            # not one passage relocated, whatever else the documents
+            # contain. Calling them "moved" says nothing true about
+            # either, and buries a real difference in the lowest tier
+            # (and out of the list entirely when "Moved" is unticked):
+            # a real case, "Hold the" against "Fever - Itching one
+            # pre-filled", was reported as moved because every one of
+            # those words appears somewhere in the other document.
+            if not _is_same_text_relocated(item.approved_text, item.suspect_text):
+                continue
             if (
                 " " not in app_w
                 and " " not in sus_w
@@ -1864,26 +1992,75 @@ def _downgrade_relocated_runs(
             ]
         else:
             continue
-        for text, (own_full, own_alnum, own_words), (other_full, other_alnum, other_words) in candidates:
-            word_count = text.count(" ") + 1
-            text_alnum = "".join(ch for ch in text if ch.isalnum()).casefold()
-            if word_count >= _MIN_RELOCATION_RUN_WORDS and (
-                other_full.count(text) >= own_full.count(text) > 0
-                or (
-                    len(text_alnum) >= 12
-                    and other_alnum.count(text_alnum) >= own_alnum.count(text_alnum) > 0
-                )
-            ):
-                item.kind = "reordered"
-                item.severity = "reorder"
+        # A pure deletion/insertion is only "moved" when the passage is
+        # in the other document VERBATIM -- the same words, contiguous, at
+        # least as many copies. Finding its words scattered about is not
+        # finding the passage: a deleted "Patients should not take this
+        # medicine with alcohol." was demoted that way because each of its
+        # words occurs somewhere in the other document.
+        # A replacement is moved only when BOTH of its sides are accounted
+        # for elsewhere; one side found is not enough, or new text written
+        # in place of a passage that also appears elsewhere would hide.
+        if all(
+            _is_relocated(text, own, other, allow_word_bag=item.kind == "text_changed")
+            for text, own, other in candidates
+        ):
+            item.kind = "reordered"
+            item.severity = "reorder"
+
+
+def _is_relocated(text: str, own_side: tuple, other_side: tuple, *, allow_word_bag: bool) -> bool:
+    own_full, own_alnum, own_words = own_side
+    other_full, other_alnum, other_words = other_side
+    word_count = text.count(" ") + 1
+    text_alnum = "".join(ch for ch in text if ch.isalnum()).casefold()
+    if word_count >= _MIN_RELOCATION_RUN_WORDS and (
+        other_full.count(text) >= own_full.count(text) > 0
+        or (
+            len(text_alnum) >= 12
+            and other_alnum.count(text_alnum) >= own_alnum.count(text_alnum) > 0
+        )
+    ):
+        return True
+    # A run stitched together from FRAGMENTS printed elsewhere -- column
+    # interleaving put "help protect the environment." and "from the
+    # prefilled syringe." side by side in one document -- is moved when
+    # every fragment is itself found verbatim, a few whole phrases rather
+    # than scattered words.
+    if _splits_into_verbatim_fragments(text, own_full, other_full):
+        return True
+    # Word-bag test, for the two sides of a replacement only (a column
+    # permutation swapping words between neighbouring lines): every word
+    # of this side occurs at least as often in the other document.
+    if allow_word_bag and not _contains_digit(text):
+        words = {w for w in (_relocation_word(t) for t in text.split()) if len(w) >= 3}
+        return bool(words) and all(other_words[w] >= own_words[w] for w in words)
+    return False
+
+
+_MIN_FRAGMENT_WORDS = 4
+_MAX_FRAGMENTS = 4
+
+
+def _splits_into_verbatim_fragments(text: str, own_full: str, other_full: str) -> bool:
+    words = text.split()
+    if len(words) < 2 * _MIN_FRAGMENT_WORDS:
+        return False
+    start, fragments = 0, 0
+    while start < len(words):
+        end = None
+        for stop in range(len(words), start + _MIN_FRAGMENT_WORDS - 1, -1):
+            piece = " ".join(words[start:stop])
+            if other_full.count(piece) >= own_full.count(piece) > 0:
+                end = stop
                 break
-            # Check constituent words for multi-column permutations (non-numeric text only)
-            if not _contains_digit(text):
-                words = {w for w in (_relocation_word(t) for t in text.split()) if len(w) >= 3}
-                if words and all(other_words[w] >= own_words[w] for w in words):
-                    item.kind = "reordered"
-                    item.severity = "reorder"
-                    break
+        if end is None:
+            return False
+        fragments += 1
+        if fragments > _MAX_FRAGMENTS:
+            return False
+        start = end
+    return True
 
 
 def _relocation_word(text: str) -> str:
@@ -1891,62 +2068,162 @@ def _relocation_word(text: str) -> str:
     return text.strip("•.,()").casefold()
 
 
+# How alike the two sides of a replacement must be before it can count
+# as the same text in a different place. Single words are exempt: one
+# word swapped for another by a column permutation is the case the
+# relocation rule was built for, and is handled above by its own
+# count-based test.
+_RELOCATION_SAME_TEXT_RATIO = 0.5
+
+
+def _is_same_text_relocated(approved: str, suspect: str) -> bool:
+    """Whether a replacement's two sides are the same text, so that
+    finding it elsewhere makes this a relocation rather than a change."""
+    left, right = approved.split(), suspect.split()
+    if not left or not right:
+        return True  # a pure insertion/deletion: judged by the count tests
+    if len(left) == 1 and len(right) == 1:
+        return True
+    return (
+        difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
+        >= _RELOCATION_SAME_TEXT_RATIO
+    )
+
+
 _MAX_SLUG_WORDS = 12
 _MIN_AXIS_NUMBER_SHARE = 0.6
 
+# Chemical-structure atom labels. A token counts only when it is written
+# the way a structure diagram writes it (capitalised, "Cl", "CH3", "OH"),
+# never an English word that happens to use the same letters ("no", "of",
+# "off", "soon").
+_ATOM_TOKENS = {"H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "CL", "BR", "HC", "CH",
+                "H3C", "CH3", "OH", "NH", "NH2", "NN", "HO", "HN", "CN", "NC"}
+_ATOM_FORMULA_RE = re.compile(r"^(?:[CHNOFPS]|Cl|Br)(?:[CHNOFPS]|Cl|Br|\d)*$")
+_ATOM_SYMBOLS = {"H", "C", "N", "O", "F", "P", "S", "Cl", "Br"}
+# English words that the formula pattern above would otherwise accept.
+_ATOM_LOOKALIKE_WORDS = {"NO", "ON", "OF", "OFF", "SO", "SOON", "HOP", "SHOP", "CHOP",
+                         "POSH", "SNOOP", "NOON", "HOOF", "PHONS", "FONS"}
+
+# Words that only occur in plot/forest-plot labelling. One of these must be
+# present before the chart-vocabulary rule applies at all: the softer words
+# in `_CHART_CONTEXT_WORDS` ("severe", "rate", "drug", "change") are plain
+# label prose and on their own say nothing about a chart.
+_CHART_MARKER_WORDS = {"responders", "cmax", "auc", "pk", "ci", "cl", "fold", "postdialysis",
+                       "ad-1", "ad-2", "tmax", "cmin"}
+_CHART_CONTEXT_WORDS = _CHART_MARKER_WORDS | {
+    "response", "rate", "percent", "weeks", "trial", "change", "normal", "severe", "moderate",
+    "mild", "impairment", "reference", "population", "description", "interacting",
+    "inhibitor", "drug", "and", "renal", "hepatic",
+}
+_DEVICE_CALLOUT_WORDS = {"adaptor", "plunger", "syringe", "bottle", "cap", "slow", "blister",
+                         "vial", "needle", "pouch", "tip", "barrel"}
+
+
+def _artwork_word(token: str) -> str:
+    return token.lower().strip("()%:\u2020\u2021\u00a7*/!.,;")
+
+
+def _is_axis_number(token: str) -> bool:
+    return bool(re.match(r"^\d+(\.\d+)?%?$", token.rstrip(".,;:")))
+
 
 def _is_figure_artwork_text(text: str) -> bool:
-    """Identify vector plot/chart axis labels, tick sequences, chemical diagram atom symbols, or margin slugs."""
+    """Whether ``text`` reads like the text inside a figure rather than
+    label prose: plot axis ticks and forest-plot labels, structure-diagram
+    atom symbols, device-diagram callouts, or a production slug.
+
+    This only says what the text LOOKS like. Whether a difference in it
+    may be demoted is decided by `_classify_severity`, which never lets
+    it outrank a changed number and never demotes text that carries
+    label content (`_carries_label_content`).
+    """
     tokens = text.split()
     if not tokens:
         return False
-    # 1. Chemical structure atom labels & molecular formulas: e.g. "O HC 3 N N F...", "F N O.", "FNO."
-    atom_set = {"H", "C", "N", "O", "F", "P", "S", "CL", "BR", "HC", "CH", "H3C", "CH3", "OH", "NH", "NH2"}
-    clean = [t.upper().strip(".,;:()") for t in tokens]
-    if clean and any(t in atom_set or (len(t) >= 2 and all(ch in "HCNOFPS" for ch in t)) for t in clean):
-        if all(t in atom_set or t.isdecimal() or (len(t) >= 2 and all(ch in "HCNOFPS" for ch in t)) for t in clean):
-            return True
-    # 2. Production slug with part numbers: e.g. "5322-2026-02 UPADACITINIB EXTENDED-RELEASE TABLETS 2075864-06", "1202-2025-06 Rivaroxaban For Oral Suspension 2xxxxxx", "2xxxxxx"
+
+    # 1. Structure-diagram atom labels: "O HC 3 N N F", "O O O N NN O H N S Cl O".
+    #    Several tokens, every one an atom label or a bare digit, at least
+    #    one a lone element symbol -- so no English word qualifies.
+    cleaned = [t.strip(".,;:()") for t in tokens]
+    cleaned = [t for t in cleaned if t]
+    if len(cleaned) >= 3 and all(
+        (t in _ATOM_TOKENS or t.isdecimal() or _ATOM_FORMULA_RE.match(t))
+        and t.upper() not in _ATOM_LOOKALIKE_WORDS
+        for t in cleaned
+    ) and any(t in _ATOM_SYMBOLS for t in cleaned):
+        return True
+
+    # 2. Production slug with part numbers: "1202-2025-06 Rivaroxaban For Oral
+    #    Suspension 2xxxxxx", "2xxxxxx".
     if len(tokens) <= _MAX_SLUG_WORDS and (
         any(re.search(r"\d{4,}-\d{4,}-\d+|\d{7}-\d{2}|\d+x{3,}", t, re.I) for t in tokens)
         or (len(tokens) == 1 and re.match(r"^\d+x+$", tokens[0], re.I))
     ):
         return True
-    # 3. Plot axis tick sequences / syringe graduations: e.g. "100 90 80 70 60 50 40 30 20 10 0" or "0.9 0.8 1.1 1 1.4..."
-    def _is_num_or_unit(t: str) -> bool:
-        t_clean = t.rstrip(".,;:")
-        return bool(re.match(r"^\d+(\.\d+)?%?$", t_clean)) or t_clean.lower() in {"ml", "mg", "l", "mcg", "g"}
 
-    num_tokens = [t for t in tokens if _is_num_or_unit(t)]
-    if len(num_tokens) >= 5 and len(num_tokens) >= len(tokens) * _MIN_AXIS_NUMBER_SHARE:
+    # 3. Axis tick runs / syringe graduations: mostly bare numbers. Units do
+    #    not count towards the share -- "20 mg ... 5 ml" is a dose, not an axis.
+    numbers = [t for t in tokens if _is_axis_number(t)]
+    if len(numbers) >= 5 and len(numbers) >= len(tokens) * _MIN_AXIS_NUMBER_SHARE:
         return True
-    digits = [int(t) for t in tokens if t.isdecimal() and len(t) <= 3]
-    if len(digits) >= 5 and len(digits) >= len(tokens) * _MIN_AXIS_NUMBER_SHARE:
-        diffs = [b - a for a, b in zip(digits, digits[1:])]
-        neg_count = sum(1 for d in diffs if d < 0)
-        pos_count = sum(1 for d in diffs if d > 0)
-        if neg_count >= 4 or pos_count >= 4:
+    if len(numbers) >= 8 and len(numbers) >= len(tokens) * 0.4:
+        return True  # a graduation scale with its labels: "Side 1: ... Tip 0.5 1 1.5 ... 5 mL"
+
+    # 4. Forest-plot / chart labelling: needs a word that only charts use,
+    #    and then a high share of chart vocabulary overall. Words are
+    #    matched whole -- "rated" is not "rate".
+    words = [_artwork_word(t) for t in tokens]
+    if len(tokens) >= 4 and any(w in _CHART_MARKER_WORDS for w in words):
+        chart = sum(1 for w, t in zip(words, tokens) if w in _CHART_CONTEXT_WORDS or _is_axis_number(t))
+        if chart / len(tokens) >= 0.5:
             return True
-    # 4. Repeated chart axis label tokens / forest plot text: "Percent Responders Response Rate (%) ...", "PK Fold Change and 90% CI..."
-    chart_keywords = {
-        "responders", "response", "rate", "percent", "weeks", "trial", "ad-1", "ad-2",
-        "fold", "change", "cmax", "auc", "pk", "postdialysis", "ci", "cl", "normal",
-        "severe", "moderate", "mild", "impairment", "reference", "population", "description",
-        "interacting", "inhibitor", "drug"
-    }
-    chart_words = [
-        t.lower().strip("()%:†‡§*/") for t in tokens
-        if any(t.lower().strip("()%:†‡§*/") == k or k in t.lower() for k in chart_keywords)
-        or _is_num_or_unit(t)
-    ]
-    if len(tokens) >= 4 and len(chart_words) / len(tokens) >= 0.4:
+
+    # 5. Device / pack diagram callouts: a few words, all of them part names
+    #    ("SLOW!", "bottle adaptor"), or several part names among a short
+    #    run ("Cap Bottle adaptor Do not remove the bottle adaptor").
+    callouts = [w for w in words if w in _DEVICE_CALLOUT_WORDS]
+    if callouts and len(tokens) <= 3 and len(callouts) == len(tokens):
         return True
-    # 5. Device / package illustration diagram callouts (e.g. "Cap Bottle adaptor", "SLOW!", "bottle adaptor")
-    device_callout_words = {"adaptor", "plunger", "syringe", "bottle", "cap", "slow", "blister", "vial", "needle", "pouch"}
-    callout_matches = sum(1 for t in tokens if t.lower().strip("!.:,") in device_callout_words)
-    if callout_matches >= 1 and (len(tokens) <= 3 or (len(tokens) <= 10 and callout_matches / len(tokens) >= 0.25)):
+    if len(callouts) >= 2 and len(tokens) <= 10 and len(callouts) / len(tokens) >= 0.25:
         return True
     return False
+
+
+# Text that must never be demoted as "artwork", however much it looks like
+# a figure: a dose or strength, a negation or instruction, a storage or
+# batch/expiry statement. Losing one of these from a label is a recall,
+# not a cosmetic difference.
+_DOSE_RE = re.compile(
+    r"\d(?:[\d.,]*\d)?\s*(?:mg|mcg|\u00b5g|\u03bcg|ug|g|kg|ml|mL|l|L|iu|IU|units?|mmol|meq|mEq|%)(?![A-Za-z])",
+)
+_LABEL_CONTENT_WORDS = {
+    "not", "no", "never", "avoid", "do", "don't", "must", "should", "warning", "caution",
+    "keep", "discard", "store", "storage", "children", "child", "pregnancy", "pregnant",
+    "breastfeeding", "contraindicated", "contraindications", "overdose", "fatal", "death",
+    "allergy", "allergic", "batch", "lot", "exp", "expiry", "expires", "mfg", "mfd",
+    "daily", "twice", "once", "dose", "dosage", "tablet", "tablets", "capsule", "capsules",
+    "inject", "injection", "dilute", "shake", "remove", "only", "maximum", "exceed",
+}
+
+
+def _carries_label_content(text: str) -> bool:
+    """Whether ``text`` says something a label is answerable for -- a
+    dose, an instruction, a warning, a batch or expiry -- so that losing
+    or changing it can never be written off as figure artwork."""
+    tokens = text.split()
+    words = {_artwork_word(t) for t in tokens}
+    chart = bool(words & _CHART_MARKER_WORDS)
+    doses = [m.group(0) for m in _DOSE_RE.finditer(text)]
+    if chart:
+        doses = [d for d in doses if not d.endswith("%")]  # "90% CI" is a chart label
+    if doses:
+        # A graduation scale ("0.5 1 1.5 2 ... 5 mL") ends in a unit too;
+        # it is a scale, not a dose, when it is mostly a run of numbers.
+        numbers = sum(1 for t in tokens if _is_axis_number(t))
+        if not (numbers >= 8 and numbers >= len(tokens) * 0.4):
+            return True
+    return any(_artwork_word(t) in _LABEL_CONTENT_WORDS for t in tokens)
 
 
 _HYPHEN_CHARS_CLASS = r"[\-\u2010\u2011\u2012\u2013\u2014\u2212\u00ad]"
@@ -2019,8 +2296,8 @@ def _classify_severity(
         active_text = " ".join(t.text for t in active_slice)
         if not any(c.isalnum() for c in active_text):
             return "minor"  # pure punctuation insertion or deletion (e.g. ';', ')', ').')
-        if _is_figure_artwork_text(active_text):
-            return "minor"  # vector chart/diagram axis labels or atom symbols
+        if _is_figure_artwork_text(active_text) and not _carries_label_content(active_text):
+            return "minor"  # chart/diagram labels or atom symbols with no label content
         # Any word present on one side and missing on the other is
         # always worth a human look; there's no safe auto-downgrade
         # for a word that simply isn't there.
@@ -2029,17 +2306,35 @@ def _classify_severity(
     approved_text = " ".join(t.text for t in approved_slice)
     suspect_text = " ".join(t.text for t in suspect_slice)
 
-    if _is_figure_artwork_text(approved_text) or _is_figure_artwork_text(suspect_text):
+    # The same characters with the spacing moved: never a changed fact
+    # ("100 mg" vs "100mg", "9 8 5" vs "985"), reported as spacing.
+    if _is_whitespace_only(approved_text, suspect_text):
         return "minor"
 
     # Digit-value changes (dosages, strengths, counts, dates...) are
-    # always critical.  But now we only trigger this when the digit
-    # CONTENT actually differs, not merely because digits are present
-    # on both sides -- RTL documents mix digits into nearly every token.
+    # always critical, and this runs FIRST of the content rules: nothing below -- the artwork
+    # rule included -- may outrank a changed number. Only triggers when
+    # the digit CONTENT differs, not merely because digits are present on
+    # both sides -- RTL documents mix digits into nearly every token.
     app_digits = _extract_digit_runs(approved_text)
     sus_digits = _extract_digit_runs(suspect_text)
     if app_digits != sus_digits and (app_digits or sus_digits):
         return "critical"
+    # The same digits with a different decimal/thousands separator
+    # ("5.000" vs "5,000") is a different number in another locale.
+    if _number_forms(approved_text) != _number_forms(suspect_text):
+        return "critical"
+
+    # Figure text on BOTH sides (a chart axis read slightly differently).
+    # One artwork-looking side is not enough: a short label paired with a
+    # whole missing passage must not drag that passage down with it.
+    if (
+        _is_figure_artwork_text(approved_text)
+        and _is_figure_artwork_text(suspect_text)
+        and not _carries_label_content(approved_text)
+        and not _carries_label_content(suspect_text)
+    ):
+        return "minor"
 
     if approved_text.casefold() == suspect_text.casefold():
         return "major"  # case-only change, e.g. "ROPINIROLE" vs "ropinirole"
@@ -2052,8 +2347,14 @@ def _classify_severity(
     if app_stripped == sus_stripped:
         return "minor"  # punctuation-only or spacing-and-punctuation change (e.g. '5, 25,' vs '5,25,')
 
+    if _changes_meaning(approved_text, suspect_text):
+        return "critical"  # "hypertension"/"hypotension", "should"/"shouldn't"
+
     if _looks_like_typo(approved_text, suspect_text):
-        return "typo"  # e.g. "especially" vs "especial y" / "halucinations"
+        return "typo"  # extraction noise: "especially" vs "especial y" / "halucinations"
+
+    if _looks_like_misspelling(approved_text, suspect_text):
+        return "major"  # the same word spelled differently: "contraindicated"/"contrainsdicated"
 
     return "critical"  # genuine wording change
 
@@ -2062,6 +2363,19 @@ def _classify_severity(
 # keep their position: "2⁴" -> ("2⁴",), so "2⁴" vs "24" (or "H₂O" vs
 # "H2O") is a numeric change.
 _DIGIT_RUN_RE = re.compile(r"[\d" + SCRIPT_DIGITS + "]+")
+def _number_forms(text: str) -> tuple[str, ...]:
+    """The separator written between each pair of neighbouring digit
+    groups -- "." in "1.5", "," in "1,5", "" across a word boundary -- so
+    a decimal point turned into a comma ("5.000" vs "5,000", 5 against
+    5000 in another locale) is visible even though the digits are equal.
+    Whitespace is ignored here: a space next to a number is a spacing
+    difference, reported as such (see `_is_whitespace_only`)."""
+    runs = list(_DIGIT_RUN_RE.finditer(text))
+    forms = []
+    for left, right in zip(runs, runs[1:]):
+        between = re.sub(r"\s+", "", text[left.end():right.start()])
+        forms.append(between if len(between) == 1 and not between.isalnum() else "")
+    return tuple(forms)
 
 
 # Difference categories for the results list, derived from the same
@@ -2090,7 +2404,11 @@ def category_of(item: DiffItem) -> str:
     if item.kind == "removed_in_suspect":
         return "removed"
     approved, suspect = item.approved_text, item.suspect_text
-    if _extract_digit_runs(approved) != _extract_digit_runs(suspect):
+    if _is_whitespace_only(approved, suspect):
+        return "punctuation"
+    if _extract_digit_runs(approved) != _extract_digit_runs(suspect) or _number_forms(
+        approved
+    ) != _number_forms(suspect):
         return "number"
     if _is_hyphenation(approved, suspect):
         return "hyphenation"
@@ -2100,7 +2418,9 @@ def category_of(item: DiffItem) -> str:
         r"\s+", "", _strip_punct(suspect)
     ).casefold():
         return "punctuation"
-    if item.severity == "typo":
+    if item.severity == "typo" or (
+        item.severity == "major" and _looks_like_misspelling(approved, suspect)
+    ):
         return "spelling"
     return "wording"
 
@@ -2132,27 +2452,120 @@ def _strip_punct(text: str) -> str:
     return "".join(ch for ch in text if ch.isalnum() or ch.isspace())
 
 
+def _letters(text: str) -> str:
+    return "".join(ch for ch in text if ch.isalpha()).casefold()
+
+
+# Glyph groups a PDF draws as ONE ligature and extraction can lose whole.
+_LIGATURE_GROUPS = ("ffi", "ffl", "ff", "fi", "fl", "ft", "st", "ct")
+_TYPO_MIN_LETTERS = 6
+_TYPO_MAX_LOST_LETTERS = 3
+
+
 def _looks_like_typo(approved_text: str, suspect_text: str) -> bool:
-    """True if two sides look like the same word mangled by a dropped
-    letter or a stray inserted space, rather than a real wording change.
+    """True if the difference has the shape of TEXT-LAYER NOISE rather
+    than an edit: one side is the other with characters LOST, where every
+    lost run is a doubled letter ("illness" -> "il ness",
+    "hallucinations" -> "halucinations") or a ligature glyph
+    ("specifically" -> "speci cally"), possibly with a stray space.
 
-    Deliberately conservative: comparison strips everything except
-    letters (so trailing punctuation like the period in "halucinations."
-    or the comma in "cals," never blocks a match, and a stray inserted
-    space like "il ness" collapses back to "ilness"), and what's left
-    must be purely alphabetic on both sides -- so this never fires on
-    numbers or mixed alphanumeric content. See the digit check in
-    `_classify_severity`, which always runs first and wins regardless
-    of how "similar" a numeric change might look here.
+    Noise only ever loses characters. A letter that is ADDED or REPLACED
+    ("contraindicated" -> "contrainsdicated", "LORATADIN" -> "LORATAZHIN")
+    is a real misspelling and is reported at its own, higher tier (see
+    `_looks_like_misspelling`). Never fires on text containing digits or a
+    slash, or on words shorter than six letters, where one letter is
+    routinely the whole meaning ("mg"/"mcg", "may"/"many").
     """
-    approved_letters = "".join(ch for ch in approved_text if ch.isalpha()).casefold()
-    suspect_letters = "".join(ch for ch in suspect_text if ch.isalpha()).casefold()
-
-    if not approved_letters or not suspect_letters:
+    if _has_digit_or_slash(approved_text) or _has_digit_or_slash(suspect_text):
         return False
-    if abs(len(approved_letters) - len(suspect_letters)) > _TYPO_MAX_LENGTH_DELTA:
+    a, b = _letters(approved_text), _letters(suspect_text)
+    if not a or not b or a == b:
         return False
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    if len(longer) - len(shorter) > _TYPO_MAX_LOST_LETTERS:
+        return False
+    if len(longer) < _TYPO_MIN_LETTERS:
+        # A short word qualifies only for a whole lost ligature glyph
+        # ("first" -> "rst"), which no real edit ever produces.
+        return len(longer) >= 4 and any(
+            longer.startswith(group, i) and longer[:i] + longer[i + len(group):] == shorter
+            for group in _LIGATURE_GROUPS if len(group) >= 2
+            for i in range(len(longer))
+        )
+    return _reducible_by_noise(longer, shorter)
 
-    ratio = difflib.SequenceMatcher(None, approved_letters, suspect_letters).ratio()
-    return ratio >= _TYPO_SIMILARITY_THRESHOLD
 
+@functools.lru_cache(maxsize=4096)
+def _reducible_by_noise(longer: str, shorter: str) -> bool:
+    """Whether ``shorter`` is ``longer`` with only doubled letters and
+    ligature glyphs taken out (tried at every position, so an ambiguous
+    alignment -- "speci|fi|cally" vs "spec|if|ically" -- cannot hide it)."""
+    if longer == shorter:
+        return True
+    if len(longer) <= len(shorter):
+        return False
+    for i in range(len(longer)):
+        if i + 1 < len(longer) and longer[i] == longer[i + 1]:
+            if _reducible_by_noise(longer[:i] + longer[i + 1:], shorter):
+                return True
+        for group in _LIGATURE_GROUPS:
+            if longer.startswith(group, i) and len(longer) - len(group) >= len(shorter):
+                if _reducible_by_noise(longer[:i] + longer[i + len(group):], shorter):
+                    return True
+    return False
+
+
+def _looks_like_misspelling(approved_text: str, suspect_text: str) -> bool:
+    """True if the two sides are recognizably the SAME word(s) spelled
+    differently -- close in length and highly similar letter for letter,
+    with no digits involved and no change of meaning (see
+    `_changes_meaning`). Reported as "major" in the Spelling category: a
+    misspelling on a label is a real defect, just not a changed fact."""
+    if _has_digit_or_slash(approved_text) or _has_digit_or_slash(suspect_text):
+        return False
+    if _changes_meaning(approved_text, suspect_text):
+        return False
+    a, b = _letters(approved_text), _letters(suspect_text)
+    if not a or not b or a == b:
+        return False
+    if abs(len(a) - len(b)) > _TYPO_MAX_LENGTH_DELTA:
+        return False
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= _TYPO_SIMILARITY_THRESHOLD
+
+
+def _has_digit_or_slash(text: str) -> bool:
+    return any(ch.isdigit() or ch == "/" for ch in text)
+
+
+# Prefixes that turn a word into its opposite or into a different
+# condition. A difference that is exactly one of these is never a
+# spelling slip, however similar the letters look.
+_OPPOSITE_PREFIXES = (
+    ("hyper", "hypo"), ("inter", "intra"), ("ante", "anti"), ("pre", "post"),
+    ("sub", "supra"), ("over", "under"), ("in", "ex"), ("endo", "exo"), ("hyper", "normo"),
+)
+_NEGATION_PREFIXES = ("non", "un", "in", "im", "ir", "il", "dis", "anti", "contra")
+_CONTRACTION_RE = re.compile(r"n['\u2019]t\b|\bnot\b|\bno\b|\bnever\b", re.I)
+
+
+def _changes_meaning(approved_text: str, suspect_text: str) -> bool:
+    """Whether a one-word difference is a change of MEANING that merely
+    looks like a spelling slip: a negation added or removed ("should" /
+    "shouldn't", "compatible" / "incompatible"), or a prefix swapped for
+    its opposite ("hypertension" / "hypotension")."""
+    if bool(_CONTRACTION_RE.search(approved_text)) != bool(_CONTRACTION_RE.search(suspect_text)):
+        return True
+    a, b = _letters(approved_text), _letters(suspect_text)
+    if not a or not b or a == b:
+        return False
+    for longer, shorter in ((a, b), (b, a)):
+        for prefix in _NEGATION_PREFIXES:
+            if longer.startswith(prefix) and longer[len(prefix):] == shorter:
+                return True
+    for first, second in _OPPOSITE_PREFIXES:
+        for x, y in ((a, b), (b, a)):
+            if x.startswith(first) and y.startswith(second) and len(x) > len(first) + 2:
+                stem_x, stem_y = x[len(first):], y[len(second):]
+                if stem_x == stem_y or difflib.SequenceMatcher(None, stem_x, stem_y).ratio() >= 0.85:
+                    return True
+    return False

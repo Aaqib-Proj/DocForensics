@@ -25,7 +25,10 @@ import difflib
 import re
 
 # A run of text from one side: (changed, text). `changed` is True when
-# this run is part of what makes the two sides differ.
+# this run is part of what makes the two sides differ. A changed run with
+# EMPTY text is a caret: the point on this side where the other side has
+# characters this one lacks ("Ropinirol|" against "Ropinirole"), so the
+# reviewer sees where without anything unchanged being marked.
 Segment = tuple[bool, str]
 
 _TOKEN_RE = re.compile(r"\s+|\S+")
@@ -46,7 +49,7 @@ def _merge(segments: list[Segment]) -> list[Segment]:
     """Join neighboring runs with the same flag into one."""
     merged: list[Segment] = []
     for changed, text in segments:
-        if not text:
+        if not text and not changed:
             continue
         if merged and merged[-1][0] == changed:
             merged[-1] = (changed, merged[-1][1] + text)
@@ -67,13 +70,9 @@ def _refine_chars(word_a: str, word_b: str) -> tuple[list[Segment], list[Segment
             left.append((False, word_a[i1:i2]))
             right.append((False, word_b[j1:j2]))
         else:
+            # An empty side becomes a caret at this position.
             left.append((True, word_a[i1:i2]))
             right.append((True, word_b[j1:j2]))
-    if word_a != word_b:
-        if not any(c for c, t in left if t):
-            left = [(True, word_a)]
-        if not any(c for c, t in right if t):
-            right = [(True, word_b)]
     return left, right
 
 
@@ -105,7 +104,9 @@ def inline_segments(approved: str, suspect: str) -> tuple[list[Segment], list[Se
             right.append((False, "".join(slice_b)))
         elif tag == "delete":
             left.append((True, "".join(slice_a)))
+            right.append((True, ""))  # caret: deleted from here
         elif tag == "insert":
+            left.append((True, ""))  # caret: inserted here
             right.append((True, "".join(slice_b)))
         elif not "".join(slice_a).strip() and not "".join(slice_b).strip():
             # Whitespace against different whitespace. Marked whole on

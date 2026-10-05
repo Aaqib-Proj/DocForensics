@@ -1450,3 +1450,574 @@ pairing the two paragraphs swap partners, producing the nonsense row
 "Tablet presentation." -> "Oral suspension pack." and two invented
 "moved" rows, while the actual rewrite is never reported. Each
 paragraph must now pair with its own counterpart, in order.
+
+## 33. Rematch one discrepancy against the paragraph it belongs to
+
+The comparison matches the two documents as wholes: every section and
+paragraph competes with every other for a partner, and one chunk that
+wins a partner it should not have leaves the rightful owner to pair
+with whatever is left. The result is a difference that is not one --
+two paragraphs reported as rewritten when the real story is that their
+partners got swapped.
+
+Rematch is the reviewer's answer for the one difference under the
+cursor:
+
+> **Double-click a highlighted difference in either viewer** (or
+> Review > Rematch Selected, Ctrl+Shift+R).
+
+`core/rematch.py` works on exactly the structure the comparison works
+on -- the same sections and paragraphs, the same pairing, the same
+reading order -- and changes one thing only: this chunk no longer
+competes with the rest of the document for its partner.
+
+1. **Find the section or paragraph the clicked text belongs to**
+   (`_split_sections`, the chunking the comparison used).
+2. **Work out where its partner has to be**: between the partners of
+   the nearest paired chunks before and after it. Reading order is the
+   constraint, so a paragraph can never be rematched to one 40 pages
+   away.
+3. **Pick the best partner in that range on its own merits**, with no
+   other chunk competing for it -- which is how a partner taken by a
+   look-alike comes back. The partner it already has is reconsidered
+   too, but only wins if it is far better (`_POSITION_MARGIN`) than
+   anything in the right place.
+4. **Align those two paragraphs and compare only the clicked text**
+   against whatever stands at the SAME PLACE in the partner
+   (`_corresponding_range`). The same words elsewhere in the paragraph
+   are not the counterpart; what is at this position is. The rest of
+   the paragraph already has rows of its own and is left alone.
+
+Which side was double-clicked decides which paragraph is rematched, so
+"where does my Original paragraph really belong?" and "where does this
+Suspect paragraph come from?" are separate questions.
+
+| what the structure says | what the row becomes |
+|---|---|
+| the text matches its counterpart after all | the row is removed, with an explanation |
+| it differs from its counterpart | the REAL differences, just for this text |
+| nothing in that part of the document fits | the row stands, now confirmed |
+
+**Ctrl+Shift+Z undoes the last rematch** (not Ctrl+Z, which belongs to
+the toolbar's text fields), so trying one costs nothing.
+
+### Guards
+
+* **Position beats text.** A paragraph repeated word for word later in
+  the document is a perfect match on text and the wrong answer on
+  position. Tested: when the Suspect repeats a dosage paragraph
+  verbatim at the end while the copy in its own place reads "8 mg", the
+  rematch reports "4 -> 8" rather than declaring the paragraph
+  unchanged.
+* **A row of one or two words is refused**, with an explanation. Every
+  document contains a stray "4", and matching one would turn a dosage
+  change into "no difference". Four words minimum.
+* **A chunk must be 30% alike** to be accepted as the counterpart;
+  below that nothing in that part of the document fits and the row
+  stands.
+
+### Cost
+
+The structure (chunking + pairing) is built once per comparison --
+0.02s on a leaflet, 0.74s on the 100-page pair -- and reused, so the
+first double-click after a comparison pays for it and the rest are
+2-53ms.
+
+Measured over every row of three real pairs: on the pixel leaflet, 9 of
+60 rows change and 26 are confirmed as they stand; on the 100-page
+pair, which the comparison already gets right, 0 of 34 change; on the
+medley report, 7 of 17. (Rows of one or two words are refused: 25, 32
+and 7 of them respectively.)
+
+Checked in `dev_tests/test_extraction_diff_smoke.py` TEST 24 (a false
+difference its own paragraph disproves, an edited paragraph reporting
+just its edit, position winning over an identical copy elsewhere, a
+genuine deletion confirmed, and a one-word row refused) and
+`dev_tests/manual_e2e_compare_check.py` step 22 (a real double-click on
+a page reaching the window, a genuine deletion left untouched, and
+replace/undo of a row).
+
+## 34. "Moved" must never swallow a real difference
+
+Reported by the reviewer, and the reason the previous section's
+default was wrong: a long paragraph gets reported in the Moved
+category although it is present in both documents -- and the actual
+deviations inside it are then never reviewed, because the paragraph
+has already been "accounted for". Concise PDFs move almost every
+paragraph, so this is not a corner case. Worse, two completely
+different paragraphs that share a few lines were being called moved as
+well.
+
+### What was actually happening
+
+`_downgrade_relocated_runs` demotes a difference to "moved" when the
+text it covers exists in the other document -- the rule that stops a
+multi-column leaflet from reporting a relocated block as deleted and
+added. One of its tests asks only whether each WORD occurs in the other
+document often enough. On a leaflet, where the same words recur
+everywhere, that is nearly always true, so it was demoting real
+findings:
+
+| what it said | what it really was |
+|---|---|
+| moved: "Hold the" -> "Fever - Itching one pre-filled" | two unrelated passages: a critical difference |
+| moved: "hand between two fingers" -> "needle or as a multipack" | the same |
+| moved: "CHILDREN Rx Only POM" -> "CHILDREN." | a critical difference |
+
+All three sat in the lowest tier, and the first two were the ONLY
+mention of their text anywhere in the results -- so unticking "Moved"
+removed them from the review entirely.
+
+### The fix
+
+A replacement is only a relocation when its two sides are
+recognizably **the same text** (`_is_same_text_relocated`: at least
+`_RELOCATION_SAME_TEXT_RATIO` = 0.5 alike, with single words left to
+the existing count test). Two passages that merely share a few words
+are a real difference, whatever else the documents contain.
+
+Measured across eight real pairs, exactly three rows change -- the
+three above, each from "moved" back to "critical". Row counts, and
+every other row, are untouched:
+
+| pair | before | after |
+|---|---|---|
+| pixel leaflet | 21 critical, 28 moved | **23 critical**, 26 moved |
+| Matrix | 2 critical, 2 moved | **3 critical**, 1 moved |
+| 100 pages, medley report, d4/d5, rusan foil, supsub, sample 2 | unchanged | unchanged |
+
+Checked across those pairs afterwards: **no moved row hides a
+difference that is reported nowhere else.**
+
+### And "Moved" is listed again by default
+
+Section 33 hid the category by default. That was wrong for exactly the
+reason above: a moved row can be the only place a passage is mentioned,
+so hiding it takes that passage off the review. Every category is
+listed again; one click still hides it, and "Ignore minor and below"
+still covers it.
+
+What the category means now, and what it does NOT mean:
+
+* it means the same text is in both documents, in a different place;
+* it never means the wording inside it went unchecked. A paragraph
+  that moved AND changed reports the change as its own row, at its own
+  severity -- verified in TEST 25 with a dosage edit inside a moved
+  paragraph, which comes back as a critical "4 -> 8" row.
+
+Checked in `dev_tests/test_extraction_diff_smoke.py` TEST 25: unrelated
+passages are not a relocation, a near-identical passage still is, a
+difference between unrelated passages survives the relocation pass, and
+a dosage change inside a moved paragraph is still reported.
+
+## 35. Ruling lines drawn over a paragraph are not a table
+
+Section 34 ended on an honest loose end: a few differences on the
+medley report read as "moved" because the APPROVED file's own text came
+out scrambled --
+
+    ... This includes any the Yellow Play or possible Card Apple App
+    side Scheme Store. ...
+
+Three consecutive lines of one paragraph, read in vertical strips.
+
+### Cause
+
+`find_tables` found eight "tables" on that page. One of them, over the
+"Reporting of side effects" paragraph, was a grid inferred from the
+proof sheet's box art -- rules drawn across flowing text. Its columns
+cut the lines into pieces ("Sche", "Apple Ap", "p Stor"), and a table
+is read cell by cell, so the paragraph's three lines came back
+interleaved strip by strip.
+
+`_looks_like_real_table` already rejected decorative grids whose rows
+populate only one column; this grid passes that test, because a line of
+flowing text sliced into five pieces does populate five columns.
+
+### The fix
+
+A real table's column edges run BETWEEN its columns, so no word ever
+crosses one. A grid inferred from ruling lines over flowing text has
+edges running straight THROUGH words. `_cuts_through_words` rejects a
+grid when more than `_MAX_WORD_STRADDLE_FRACTION` (15%) of the words
+inside it straddle one of its column edges.
+
+Measured on the real documents, the two cases do not overlap:
+
+| | words straddling a column edge |
+|---|---|
+| genuine tables (sample 2's dosage tables, the medley report's own ruled tables on pages 1 and 9) | 0-5% |
+| the inferred grids on the scrambled page | 18%, 20%, 32%, 50%, 61%, 100% |
+
+### Result
+
+That page now reads as written: "... This includes any possible side
+effects not listed in this leaflet. You can also report side effects
+directly via the Yellow Card Scheme at: www.mhra.gov.uk/yellowcard or
+search for MHRA Yellow card in the Google Play or Apple App Store ..."
+
+And the comparison of that pair stops reporting the scramble:
+
+| | before | after |
+|---|---|---|
+| rows | 17 | **11** |
+| words flagged | 3,373 | **39** |
+| "moved" rows | 7 | **0** |
+
+What remains is real: five pieces of artwork text the suspect adds
+("120 mm FRONT", "SAME SIZE ARTWORK, SIZE : 120 x 725 mm ..."), one
+"information" -> "informationent." and five hyphenation differences
+("Cocodamol." -> "Co- codamol.").
+
+Every other real pair -- the 100-page prescribing information, the
+pixel leaflet, the Rusan foil, Matrix, the superscript pair, `_d4`/`_d5`
+and sample 2 DOCX/PDF -- comes back byte for byte unchanged.
+
+Checked in `dev_tests/test_extraction_diff_smoke.py` TEST 26: a PDF
+whose three-line paragraph is crossed by three vertical rules must
+still read line by line (without the fix it reads "This includes any
+leaflet. You can Yellow Card Scheme today. possible side effects ..."),
+a grid whose edges run through words is rejected, and a grid whose
+edges run between its columns is kept.
+
+## 36. Letter-by-letter comparison
+
+The comparator marked which words differ. For a flagged string a
+proofer needs the next question answered too: exactly WHICH character,
+and what kind of change is it? The pane now shows that, under
+**Letter by letter** (the "Letters" tick box in its header):
+
+    ORG  d d / m m / y y
+    SUS  0 6 / 0 1 / 2 5
+
+    'd' U+0064 LATIN SMALL LETTER D  ->  '0' U+0030 DIGIT ZERO  -- letter changed to a digit
+    'd' U+0064 LATIN SMALL LETTER D  ->  '6' U+0036 DIGIT SIX   -- letter changed to a digit
+    'm' U+006D LATIN SMALL LETTER M  ->  '0' U+0030 DIGIT ZERO  -- letter changed to a digit
+
+The two texts are lined up character under character
+(`core.char_compare.align_characters`), so the differences sit in the
+same columns and a character present on one side only leaves its column
+empty. Every differing character is then named by its code point and
+its Unicode name, and the change is CLASSIFIED -- because the
+classification is usually the finding:
+
+| what the characters are | what it is called |
+|---|---|
+| 'E' U+0045 -> 'e' U+0065 | upper to lower case |
+| '2' -> '3' | digit changed |
+| 'd' -> '0' | letter changed to a digit |
+| 'e' U+00E9 -> 'e' U+0065 | accent changed |
+| 'a' U+0061 -> 'a' U+0430 | look-alike letter: cyrillic instead of latin |
+| space U+0020 -> no-break space U+00A0 | space changed to no-break space |
+
+The look-alike row is the one a reviewer cannot catch by reading:
+"paracetamol" with a Cyrillic "a" is identical on the page and a
+different string in the file. Invisible characters are named rather
+than printed blank, so a non-breaking space that became an ordinary one
+-- which will reflow the line -- is visible as itself.
+
+Long strings are not lined up in full (over `_MAX_ALIGNED_CHARS` = 90
+characters the alignment is unreadable anyway); the characters that
+differ are still listed, the first `_MAX_LISTED_CHARS` = 6 of them with
+a count of the rest. A difference that exists on one side only says so
+instead of pretending to align.
+
+`core/char_compare.py` is pure text in, text out -- no Qt, no colors --
+so the classification is testable on its own.
+
+Checked in `dev_tests/test_extraction_diff_smoke.py` TEST 27 (alignment
+including a character present on one side only, naming by code point
+and Unicode name, invisible characters named, each kind of change
+classified correctly, the Cyrillic look-alike caught, and the summary
+leading with the most serious kind) and
+`dev_tests/manual_e2e_compare_check.py` step 23 (the pane showing the
+code points for a real date change, the look-alike case, a one-sided
+difference, and the tick box switching the view off).
+
+## 37. The window fits the screen, and differences appear as they are found
+
+Two things the reviewer could not see.
+
+### The bottom of the window was off the screen
+
+Three separate causes, all fixed:
+
+* **The window could be taller than the desktop.** A geometry saved on
+  a bigger monitor, or the 1440x960 default on a smaller one, left the
+  bottom of the window under the taskbar -- which is where the
+  Deviations dock lives. `MainWindow._fit_to_screen` now clamps the
+  window to the usable area of its screen, at startup and after
+  restoring a saved geometry.
+* **The window could not be made narrow.** The deviation list's filter
+  chips and view options were one long unwrapping row each, so the
+  panel's minimum width was about 2,000px and the window could not be
+  shrunk below it. Both rows now wrap (`ui/flow_layout.py`), and the
+  panel's minimum width is **328px** instead of 2,015. Each row sits in
+  a `FlowRow`, which keeps itself exactly as tall as its wrapped lines
+  -- as a bare sub-layout it was handed the spare vertical space, 64px
+  per row, straight out of the comparator below it.
+* **The comparator was taller than the dock.** With the
+  letter-by-letter block added it needed more room than the dock gave
+  it, so the bottom was simply cut off. Its content now sits in a
+  scroll area, its text views ask for their minimum height rather than
+  QTextBrowser's 190px default, the letters block shares the pane's
+  height with the two texts, and the dock opens at 420px.
+
+Together: the comparator went from 234px of a 420px dock to 307px, and
+the whole stack -- both texts and the letter-by-letter block -- is on
+screen without scrolling.
+
+### Differences now appear while the comparison runs
+
+The list used to fill in one jump when the whole comparison finished.
+`diff_documents(..., on_found=...)` now hands out each section's
+differences as that section is compared; `DiffWorker` batches them on a
+120ms timer (a signal per difference costs more than the comparison
+does) and `ResultsPanel.append_results` adds them, with the status bar
+counting up.
+
+Two things make this honest rather than just busy:
+
+* **What is shown is what remains.** The passes that run once the whole
+  document has been compared can still merge or re-rank rows, so the
+  batches are provisional and `set_results` replaces them at the end.
+  To stop rows appearing and then being taken away, the spacing
+  artifacts that the closing pass drops are left out of the stream too
+  (`_is_whitespace_artifact`). On the 100-page pair that took the
+  stream from 135 rows settling to 34 -- a visible collapse -- down to
+  35 settling to 34.
+* **The results do not depend on anyone listening.** With and without a
+  listener, `diff_documents` returns the same list.
+
+Honest about the gain: on the pairs here the rows take 0.1-0.2s to
+produce (the time before them is splitting and pairing, 0.12-0.59s),
+so this buys a tenth of a second or two on a comparison and is mostly
+about the list filling rather than jumping. The wait you actually feel
+on a long document is extraction, which runs in the background from the
+moment a file is opened (section 21).
+
+Checked in `dev_tests/test_extraction_diff_smoke.py` TEST 28
+(differences arriving in several batches, the streamed set matching the
+final set, spacing artifacts left out of both, and the result being the
+same with no listener).
+
+## 38. The deviation list stopped stuttering
+
+Section 37 made differences appear as they are found, and the list
+stuttered the whole way through. Two causes, both measured.
+
+### Every batch rebuilt the whole table
+
+`append_results` called `_refresh_table`, which clears the table and
+fills every row again. Arriving in batches, that is the first fill
+repeated once per batch -- quadratic work for no reason:
+
+| differences | streaming, before | after |
+|---|---|---|
+| 100 (4 batches) | 45 ms | **22 ms** |
+| 500 (20 batches) | 411 ms | **104 ms** |
+| 1500 (60 batches) | **2,611 ms** | **320 ms** |
+
+The new rows are now appended to the table instead (`setRowCount` plus
+`_fill_row` for the new ones only), so the cost per batch is flat at
+about 5ms however long the list already is, rather than climbing to
+43ms. Grouping identical rows still rebuilds, because a new difference
+can join an existing group.
+
+The highlights on the documents are no longer redrawn per batch
+either: `append_results` does not emit `view_changed`, so the hundreds
+of overlay items are drawn once when the comparison finishes, as they
+were before.
+
+### Moving through the list rebuilt the comparator every step
+
+Each selection change rebuilds the comparator pane -- two texts and,
+since section 36, the letter-by-letter alignment -- which costs about
+10ms of HTML. Holding an arrow key or Next-difference walks rows faster
+than that, so the pane fell behind the selection.
+
+A change coming from the table is now coalesced on a 30ms timer: only
+the row actually landed on is drawn. A difference clicked in a viewer
+(`select_item`) still updates immediately.
+
+### Where it stands
+
+Measured on a list of 1,500 differences:
+
+| action | cost |
+|---|---|
+| a batch of new differences arriving | ~6 ms |
+| scrolling (per step) | 3 ms |
+| selecting a row | 9 ms |
+| filtering by text | 42 ms |
+| toggling a category chip | 84 ms |
+| accepting the selection | 113 ms |
+
+The last two are full rebuilds of the table. At the few hundred rows a
+normal document produces they are 30ms; at 1,500 they are a visible
+hitch, and would be the next thing to make incremental if it matters.
+
+## 39. Nothing a reviewer must see is filed as minor (MVP-38)
+
+A risk audit (`AUDIT.md`) reproduced the ways a real deviation could be
+hidden -- rated `minor`/`typo`/`moved`, sorted to the bottom, and removed
+from view by "Ignore minor and below" -- or never compared at all. All
+of them are fixed; each fix is locked in by a test that fails on the old
+code (smoke TESTs 29-32, GUI step 24).
+
+### Severity
+
+* **The chart-artwork rule no longer outranks a changed number.** It ran
+  before the digit rule and joined the two sides with `or`, so one short
+  artwork-looking side (`4:26 pm, Sep 05, 2023`) demoted a whole missing
+  document body to `minor`. The digit rule now runs first; a replacement
+  is figure text only when BOTH sides are; and text carrying label
+  content -- a dose (`20 mg`), an instruction or negation, storage,
+  batch or expiry -- is never demoted (`_carries_label_content`).
+* **The rule itself is narrower.** Chart vocabulary is matched as whole
+  words and needs a word only charts use (`Cmax`, `AUC`, `PK`, `CI`,
+  `fold`...); units no longer count towards an "axis"; atom symbols
+  must be written as a structure diagram writes them, so `no`, `of`,
+  `off` are words again; device callouts must be part names. 11 of 22
+  ordinary label lines used to qualify; none do now, and every real
+  chart sample in `test_sample2_layout_diff` still does.
+* **`typo` is the shape of text-layer noise only:** one side is the
+  other with letters LOST, each lost run a doubled letter
+  (`il ness`) or a ligature glyph (`speci cally`, `rst`). A letter added
+  or replaced is a real misspelling, now `major` (category Spelling).
+  On the real test pairs the planted errors (`contrainsdicated`,
+  `ЛОРАТАЖИН`, `MATRX`) were all hidden as `typo`.
+* **Meaning changes are critical:** a negation added or removed
+  (`should`/`shouldn't`, `compatible`/`incompatible`) or a prefix
+  swapped for its opposite (`hypertension`/`hypotension`), and anything
+  with digits or a slash (`mg/kg` -> `mg/g`).
+* **A decimal separator change is a number change** (`5.000` vs
+  `5,000`), compared as the separator between digit groups so list
+  spacing (`2.3, 5.1` vs `2.3,5.1`) is not.
+* **Spacing next to a digit is reported** (`100 mg` vs `100mg`, as
+  minor spacing) instead of being dropped; a word drawn in pieces
+  (`spe cifically`) is still dropped.
+
+### "Moved"
+
+* A deletion or insertion is only "moved" when the passage is in the
+  other document **verbatim** (or as a few verbatim fragments, for
+  column interleaving) -- never because its words occur somewhere. A
+  deleted `Patients should not take this medicine with alcohol.` was
+  "moved"; on the Matrix pair an added `S Rx Only POM` (0 copies in the
+  original, 2 in the suspect) was too.
+* A replacement is moved only when **both** its sides are found elsewhere.
+* A moved row now shows **both positions** instead of an empty side.
+
+### Extraction
+
+* **Word boundaries on small type.** The fast glyph source drops most
+  space characters (304 of 5,138 on one 6.3pt page), and a 2pt gap
+  tolerance swallows a 1.5pt word space, so whole lines came out as one
+  token (`patientswhohavenothealedafter4to8weeksoftreatment,`). A
+  font-relative tolerance splits justified words into letters instead,
+  so MuPDF's own word boxes are used to ADD breaks only
+  (`MuPdfPage.extract_words`). On that leaflet: 9,250 words instead of
+  6,665; every other real pair is unchanged. Cost: +20% extraction time
+  on that dense page; right-to-left words are left as they were.
+* **PowerPoint:** grouped shapes (nested too) are read -- a slide built
+  from grouped boxes extracted nothing -- and so are speaker notes.
+* **Word (approximate layout, no Word/LibreOffice):** headers, footers,
+  footnotes, endnotes and text boxes are read.
+* **Excel:** a formula cell with no cached value is compared by its
+  formula instead of disappearing.
+
+### What could not be compared (`core/coverage_check.py`)
+
+A red banner above the list -- and the report -- names pages with no
+extractable text, words the PDF's font cannot decode, and a side that
+yielded a fraction of the other's words. The last also opens a dialog:
+a suspect that extracted 9 words against 6,653 was reported as
+"2 differences". Blank pages alone only get the banner, so the dialog
+stays rare enough to be read.
+
+### The review is kept and can be exported
+
+* Decisions and "viewed" marks given while rows were still streaming
+  in are no longer wiped when the comparison finishes.
+* The review is saved as it changes (`core/review_store.py`), keyed by
+  the SHA-256 of both files, and restored when the same two files are
+  compared again. A changed file is a different comparison.
+* **File > Export Report... (Ctrl+E)** writes HTML or CSV: both files'
+  names, sizes and SHA-256, the build, the reviewer, what could not be
+  compared, every difference with severity, category, pages, decision,
+  reviewer and time, and a log of every rematch -- including rows a
+  rematch removed, which otherwise left no trace.
+* The list can be sorted by **page order** as well as severity.
+* The "Ignore minor and below" tooltip now says what it really hides.
+
+### The test suites
+
+The smoke suite had 7 long-standing failures; it now passes in full.
+Four were stale expectations rather than defects -- a move reported
+once with both positions instead of as two half-rows (2), and a
+two-column fixture whose one-token "columns" were really a label/value
+table, read row-major by design. The colon-header case was a genuine
+contradiction between two tests; the code's behaviour (no section break
+at `Manufactured by:` in a numbered document) is kept, and the smoke
+test now checks what matters -- that a manufacturing-site change inside
+such a block is still critical when the block also moves.
+
+## 40. Faster extraction, identical output
+
+Extraction CPU over the 19 real PDFs in the regression corpus went from
+**153.8s to 58.5s** (2.6x), and every extracted word is bit-for-bit the
+same -- text, page and full-precision coordinates -- as are the
+comparison results on all 10 real pairs. Through the app's own parallel
+path (7 worker processes, both documents at once):
+
+| pair | before | after |
+|---|---|---|
+| medley report | 9.6-11.4s | **4.1-4.7s** |
+| ESMOLOC leaflet (rotated, 6.3pt) | 20.1-23.4s | **9.7-10.6s** |
+| 100-page | 5.7-5.9s | 5.4-5.7s |
+
+("Before" undoes only the two largest changes, so it understates the
+old times.) The 100-page pair is limited by the machine's spare cores,
+not by extraction work.
+
+What changed, and why each is exact:
+
+* **Table geometry** (`core/fast_tables.py`, installed over
+  pdfplumber's): `edges_to_intersections` sorted every horizontal edge
+  once per vertical edge; `intersections_to_cells` rebuilt sets of edge
+  boxes on every comparison and rescanned all remaining points for each
+  point. Now: one sort and a bisected slice (pdfplumber's own test then
+  applied verbatim), sets built once per point, points grouped by row
+  and column. Same intersections, same edge objects in the same order,
+  same cells -- checked on 302 real pages and 1,200 random grids. 12.1s
+  -> 0.9s on the corpus.
+* **Vector paths** are read with `get_cdrawings()` (plain tuples)
+  instead of `get_drawings()` (a Python Point per coordinate -- 3.3
+  million on one outlined scan), and only segments a consumer can use
+  are kept: the table finder takes horizontal/vertical edges only, the
+  gutter-rule check near-horizontal lines of 30pt+. A page with no
+  upright words skips table detection altogether. The outlined scan:
+  43s -> 8.5s CPU.
+* **Rotated pages**: each glyph used to be rotated through three
+  PyMuPDF objects (~60us). The span is now transformed in one numpy
+  step in MuPDF's own single precision -- bit-identical on 512,283 real
+  and random transforms. Glyph reading on the ESMOLOC leaflet: 8.5s ->
+  1.4s. (numpy is now a declared dependency.)
+* **Superscript/subscript detection**: the "largest glyph nearby" is
+  cached per line and bucket instead of recomputed for each of ~2
+  million glyphs, and the neighbour index is built only on a page that
+  has a candidate (387 of 103,818 glyphs on the 100-page PDF).
+* **Small things**: a fast path for the ~99% of glyphs that are not
+  ligatures (written with the general formula's exact float
+  expressions); MuPDF word boxes kept as tuples and indexed on a grid;
+  the margin page-number filter finds a word's line-mates by bisection
+  instead of scanning every word on the page.
+
+Left alone: what remains on an outlined scan is MuPDF's own C
+interpretation of a million paths, and skipping table detection on
+pages with only a few words could change results.
+
+Checked in smoke TEST 33 (fast table geometry against pdfplumber's on
+random grids, rotated coordinates against PyMuPDF's, a rotated page
+reading in order).

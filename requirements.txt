@@ -1,6 +1,9 @@
 PySide6>=6.6
 PyMuPDF>=1.23
 pdfplumber>=0.11
+# Rotated pages are transformed in bulk in MuPDF's single precision
+# (core/mupdf_page.py).
+numpy>=1.24
 diff-match-patch>=0.2.0
 
 # Multi-format document support (core/document_extractor.py).

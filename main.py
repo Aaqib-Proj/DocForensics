@@ -186,11 +186,12 @@ import multiprocessing
 import os
 import sys
 
-from PySide6.QtCore import QSettings, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThreadPool, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
+    QFileDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -206,6 +207,9 @@ from PySide6.QtWidgets import (
 from core import word_pool
 from core.diff_engine import DiffItem
 from core.office_convert import available_engine
+from core.rematch import RematchContext, rematch_item
+from core.report import ReportInput, write_report
+from core.review_store import ReviewStore
 from core.token_map import APPROVED, CONTEXT, SUSPECT, TokenMap
 from ui import theme
 from ui.document_panel import DocumentPanel
@@ -218,7 +222,12 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 APP_NAME = "DocForensics Analyzer"
-APP_VERSION = "MVP-31"
+APP_VERSION = "MVP-38"
+
+# Height the Deviations dock opens at. Tall enough for the comparator's
+# whole stack -- the two texts AND the letter-by-letter block -- so the
+# bottom of it is not left below the fold on first use.
+_DOCK_HEIGHT = 420
 
 _SHORTCUTS = [
     ("Open Original / Suspect", "Ctrl+O / Ctrl+Shift+O"),
@@ -226,6 +235,8 @@ _SHORTCUTS = [
     ("Compare", "F5"),
     ("Next / previous difference", "F8 / Shift+F8"),
     ("Accept / Reject / Reset selected", "A / R / U (in the list)"),
+    ("Rematch one difference", "Double-click it in a viewer, or Ctrl+Shift+R"),
+    ("Undo the last rematch", "Ctrl+Shift+Z"),
     ("Zoom in / out (last used viewer)", "Ctrl++ / Ctrl+\u2212"),
     ("Fit width (last used viewer)", "Ctrl+0"),
     ("Zoom with the trackpad or wheel", "Pinch / Ctrl+Wheel"),
@@ -255,6 +266,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1440, 960)
+        self._fit_to_screen()
         self.settings = QSettings("DocForensics", "Analyzer")
         theme.apply(self.settings.value("theme", theme.SYSTEM, str))
 
@@ -263,7 +275,27 @@ class MainWindow(QMainWindow):
         self._diff_results: list[DiffItem] = []  # stored for overlay drawing
         self._crop_data: dict[str, dict[int, tuple[float, float]]] = {}  # crop regions
         self._token_map: TokenMap | None = None  # word alignment of the last comparison
+        # The chunking and pairing a rematch works on: the same
+        # structure the comparison used, built on the first rematch
+        # after a comparison and reused after that.
+        self._rematch_context: RematchContext | None = None
         self._syncing_views = False  # guard against lock-sync feedback loops
+        # The review of the current pair of files, kept on disk (see
+        # core/review_store.py) so closing the window loses nothing.
+        self._review_key = ""
+        # DOCFORENSICS_REVIEW_DIR moves it (tests use a throwaway folder).
+        self._review_store = ReviewStore(
+            os.environ.get("DOCFORENSICS_REVIEW_DIR")
+            or os.path.join(
+                QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+                or os.path.expanduser("~"),
+                "reviews",
+            )
+        )
+        self._review_save_timer = QTimer(self)
+        self._review_save_timer.setSingleShot(True)
+        self._review_save_timer.setInterval(400)
+        self._review_save_timer.timeout.connect(self._save_review)
 
         # Two hidden Word instances start now and stay open, so a Word
         # document is laid out without waiting for Word to start, and
@@ -297,6 +329,9 @@ class MainWindow(QMainWindow):
             panel.point_clicked.connect(
                 lambda page, x, y, p=panel: self._on_viewer_clicked(p, page, x, y)
             )
+            panel.point_double_clicked.connect(
+                lambda page, x, y, p=panel: self._on_viewer_double_clicked(p, page, x, y)
+            )
             # Enable Compare only once both documents are actually loaded;
             # a Word document is laid out in the background first.
             panel.loaded.connect(self._on_document_loaded)
@@ -316,6 +351,7 @@ class MainWindow(QMainWindow):
         self.results_panel.item_activated.connect(self.on_result_activated)
         self.results_panel.view_changed.connect(self._redraw_overlays)
         self.results_panel.view_changed.connect(self._update_review_actions)
+        self.results_panel.review_changed.connect(self._review_save_timer.start)
         self.results_panel.table.itemSelectionChanged.connect(self._update_review_actions)
         self.results_dock = QDockWidget("Deviations", self)
         self.results_dock.setObjectName("deviations")
@@ -325,7 +361,7 @@ class MainWindow(QMainWindow):
         self.results_dock.setAllowedAreas(Qt.DockWidgetArea.BottomDockWidgetArea)
         self.results_dock.setFloating(False)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
-        self.resizeDocks([self.results_dock], [340], Qt.Orientation.Vertical)
+        self.resizeDocks([self.results_dock], [_DOCK_HEIGHT], Qt.Orientation.Vertical)
 
         self._build_actions()
         self._build_menus()
@@ -381,6 +417,12 @@ class MainWindow(QMainWindow):
         )
         self.compare_action = self._action("&Compare", self.on_compare_clicked, "F5")
         self.crop_action = self._action("Crop &Header/Footer...", self.on_crop_clicked, "Ctrl+H")
+        self.export_action = self._action(
+            "&Export Report...", self._export_report, "Ctrl+E",
+            tip="Save every difference with its review decision, both files' SHA-256 "
+            "and anything that could not be compared, as HTML or CSV.",
+        )
+        self.export_action.setEnabled(False)
         self.exit_action = self._action("E&xit", self.close, "Alt+F4")
 
         self.next_action = self._action(
@@ -398,6 +440,17 @@ class MainWindow(QMainWindow):
         )
         self.reset_action = self._action("Rese&t Selected", lambda: self.results_panel.decide_selected(None))
         self.find_action = self._action("&Find in List", self._focus_search, "Ctrl+F")
+        self.rematch_action = self._action(
+            "Re&match Selected", self._rematch_selected, "Ctrl+Shift+R",
+            tip="Compare the selected difference again against the paragraph it belongs "
+                "to, with no other paragraph competing for it (or double-click it in a viewer).",
+        )
+        self.undo_rematch_action = self._action(
+            # Not Ctrl+Z: that belongs to the text fields in the toolbar.
+            "&Undo Rematch", self._undo_rematch, "Ctrl+Shift+Z",
+            tip="Put the last rematched difference back as it was.",
+        )
+        self.undo_rematch_action.setEnabled(False)
 
         self.lock_checkbox = self._action(
             "&Lock Views", self._on_lock_toggled, "Ctrl+L", checkable=True,
@@ -457,6 +510,7 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction(self.compare_action)
         file_menu.addAction(self.crop_action)
+        file_menu.addAction(self.export_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -476,6 +530,8 @@ class MainWindow(QMainWindow):
         review_menu.addActions([self.next_action, self.prev_action])
         review_menu.addSeparator()
         review_menu.addActions([self.accept_action, self.reject_action, self.reset_action])
+        review_menu.addSeparator()
+        review_menu.addActions([self.rematch_action, self.undo_rematch_action])
         review_menu.addSeparator()
         review_menu.addAction(self.find_action)
 
@@ -540,6 +596,31 @@ class MainWindow(QMainWindow):
         self.busy_bar.hide()
         bar.addPermanentWidget(self.busy_bar)
 
+    def _fit_to_screen(self) -> None:
+        """Keep the window inside the usable area of its screen.
+
+        A geometry saved on a bigger monitor -- or a default size
+        taller than this one -- otherwise leaves the bottom of the
+        window underneath the taskbar, which is exactly where the
+        Deviations dock and its comparator live.
+        """
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame, geometry = self.frameGeometry(), self.geometry()
+        chrome_w = frame.width() - geometry.width()
+        chrome_h = frame.height() - geometry.height()
+        width = min(geometry.width(), available.width() - chrome_w)
+        height = min(geometry.height(), available.height() - chrome_h)
+        if width != geometry.width() or height != geometry.height():
+            self.resize(max(width, 640), max(height, 480))
+        frame = self.frameGeometry()
+        x = min(max(frame.x(), available.x()), max(available.right() - frame.width() + 1, available.x()))
+        y = min(max(frame.y(), available.y()), max(available.bottom() - frame.height() + 1, available.y()))
+        if (x, y) != (frame.x(), frame.y()):
+            self.move(x + (self.geometry().x() - frame.x()), y + (self.geometry().y() - frame.y()))
+
     def _restore_layout(self) -> None:
         try:
             geometry = self.settings.value("geometry")
@@ -547,6 +628,7 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(geometry)
         except Exception:
             pass
+        self._fit_to_screen()
 
         try:
             state = self.settings.value("window_state")
@@ -571,7 +653,7 @@ class MainWindow(QMainWindow):
         self.results_dock.setFloating(False)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.results_dock)
         self.results_dock.show()
-        self.resizeDocks([self.results_dock], [340], Qt.Orientation.Vertical)
+        self.resizeDocks([self.results_dock], [_DOCK_HEIGHT], Qt.Orientation.Vertical)
         deviations = self.results_panel.splitter
         deviations.setSizes([deviations.width() * 3 // 5 or 1, deviations.width() * 2 // 5 or 1])
         splitter = self.centralWidget()
@@ -600,6 +682,8 @@ class MainWindow(QMainWindow):
         self.toggle_deviations_action.setText(f"&Deviation List ({total})" if total else "&Deviation List")
         has_rows = self.results_panel.rowCount() > 0
         has_selection = bool(self.results_panel.table.selectedIndexes())
+        self.rematch_action.setEnabled(has_selection and self._token_map is not None)
+        self.undo_rematch_action.setEnabled(self.results_panel.can_undo_rematch())
         for action in (self.next_action, self.prev_action):
             action.setEnabled(has_rows)
         for action in (self.accept_action, self.reject_action, self.reset_action):
@@ -639,12 +723,14 @@ class MainWindow(QMainWindow):
 
     def _on_document_loaded(self, path: str) -> None:
         self._token_map = None
+        self._rematch_context = None
         self._update_window_title()
         self._update_compare_enabled()
         self._start_extraction(path)
 
     def _on_document_loading(self, path: str) -> None:
         self._token_map = None
+        self._rematch_context = None
         self._update_compare_enabled()
         self._refresh_busy()
         if self._active_worker is None:
@@ -769,9 +855,14 @@ class MainWindow(QMainWindow):
 
         self.compare_button.setEnabled(False)
         self.status_label.setText("Comparing...")
+        self._flush_review()
+        self._review_key = ""
+        self.export_action.setEnabled(False)
         self.results_panel.clear_results()
+        self.results_panel.set_warnings([])
         self.results_panel.set_token_map(None)
         self._token_map = None
+        self._rematch_context = None
         self.original_panel.clear_highlight()
         self.suspect_panel.clear_highlight()
         # Stop blinking and clear previous overlays
@@ -788,6 +879,7 @@ class MainWindow(QMainWindow):
             suspect_extraction=self.extraction_cache.extraction_for(suspect_path),
             crop_data=self._crop_data if self._crop_data else None,
         )
+        worker.signals.found.connect(self.on_differences_found)
         worker.signals.finished.connect(self.on_diff_finished)
         worker.signals.failed.connect(self.on_diff_failed)
         worker.signals.progress.connect(self.status_label.setText)
@@ -795,21 +887,115 @@ class MainWindow(QMainWindow):
         self._refresh_busy()
         self.threadpool.start(worker)
 
+    def _show_coverage_warning(self, warnings: list[str]) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Not everything could be compared")
+        box.setText(
+            "The comparison could not read all of the content. Differences in "
+            "the parts below were NOT checked:"
+        )
+        box.setInformativeText("\n\n".join(f"\u2022 {w}" for w in warnings))
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()  # window-modal but non-blocking
+
+    # ------------------------------------------------------------------
+    # Keeping and exporting the review
+    # ------------------------------------------------------------------
+
+    def _save_review(self) -> None:
+        if not self._review_key:
+            return
+        try:
+            self._review_store.save(self._review_key, self.results_panel.review_state())
+        except OSError:
+            logger.exception("Could not save the review")
+            self.status_label.setText("Could not save the review to disk -- export a report to keep it.")
+
+    def _flush_review(self) -> None:
+        if self._review_save_timer.isActive():
+            self._review_save_timer.stop()
+            self._save_review()
+
+    def _export_report(self) -> None:
+        approved, suspect = self.original_panel.file_path, self.suspect_panel.file_path
+        if not (approved and suspect) or not self.export_action.isEnabled():
+            self.status_label.setText("Compare the documents first.")
+            return
+        stem = f"{os.path.splitext(os.path.basename(suspect))[0]} - comparison report"
+        start_dir = DocumentPanel.last_dir or os.path.dirname(suspect)
+        path, chosen = QFileDialog.getSaveFileName(
+            self,
+            "Export Report",
+            os.path.join(start_dir, stem + ".html"),
+            "HTML report (*.html);;CSV spreadsheet (*.csv)",
+        )
+        if not path:
+            return
+        if chosen.startswith("CSV") and not path.lower().endswith(".csv"):
+            path += ".csv"
+        elif not path.lower().endswith((".html", ".htm", ".csv")):
+            path += ".html"
+        panel = self.results_panel
+        try:
+            write_report(
+                path,
+                ReportInput(
+                    approved_path=approved,
+                    suspect_path=suspect,
+                    items=panel.all_items(),
+                    decision_of=panel.decision,
+                    category_of=panel.category,
+                    reviewer=panel.reviewer,
+                    app_version=APP_VERSION,
+                    warnings=panel.warnings(),
+                    rematch_log=panel.rematch_log(),
+                ),
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}:\n{exc}")
+            return
+        self.status_label.setText(f"Report saved: {path}")
+
+    def on_differences_found(self, found: list) -> None:
+        """Differences arriving while the comparison is still running:
+        show them straight away instead of waiting for the whole set."""
+        if self._active_worker is None:
+            return  # the comparison already finished or was cancelled
+        self.results_panel.append_results(found)
+        total = len(self.results_panel.all_items())
+        noun = "difference" if total == 1 else "differences"
+        self.status_label.setText(f"Comparing... {total} {noun} so far.")
+
     def on_diff_finished(self, result: ComparisonResult) -> None:
         results = result.items
         self._active_worker = None
         self._diff_results = results
         self._draw_crop_overlays_on_panels()
         self._token_map = result.token_map
+        self._rematch_context = None  # rebuilt lazily for these documents
         self.results_panel.set_token_map(result.token_map)
         self._update_compare_enabled()
         self._blink_visible = True
         self._refresh_busy()
-        self.results_panel.set_results(results)
+        # keep_review: rows shown while the comparison ran may already
+        # have been accepted, rejected or viewed.
+        self.results_panel.set_results(results, keep_review=True)
+        self.results_panel.set_warnings(result.warnings)
+        self._review_key = result.review_key
+        restored = (
+            self.results_panel.restore_review(self._review_store.load(self._review_key))
+            if self._review_key else 0
+        )
+        self.export_action.setEnabled(True)
         if results:
             noun = "difference" if len(results) == 1 else "differences"
             critical = sum(1 for d in results if d.severity == "critical")
-            self.status_label.setText(f"{len(results)} {noun} found \u00b7 {critical} critical.")
+            self.status_label.setText(
+                f"{len(results)} {noun} found \u00b7 {critical} critical."
+                + (f" Restored {restored} earlier decision(s) for these files." if restored else "")
+                + (" Parts of the documents could not be read -- see the warning." if result.warnings else "")
+            )
             
             self.show_highlights_checkbox.setEnabled(True)
             if self.show_highlights_checkbox.isChecked():
@@ -822,10 +1008,15 @@ class MainWindow(QMainWindow):
                 self.original_panel.set_overlays_visible(False)
                 self.suspect_panel.set_overlays_visible(False)
         else:
-            self.status_label.setText("No differences found.")
+            self.status_label.setText(
+                "No differences found in the text that could be read -- see the warning."
+                if result.warnings else "No differences found."
+            )
             self.show_highlights_checkbox.setEnabled(False)
             self.blink_checkbox.setEnabled(False)
             self._blink_timer.stop()
+        if result.serious_warning:
+            self._show_coverage_warning(result.warnings)
 
     def _redraw_overlays(self) -> None:
         """Highlight on the documents exactly the differences the list
@@ -1121,6 +1312,86 @@ class MainWindow(QMainWindow):
             message += "; its flagged difference is selected below"
         self.status_label.setText(message + ".")
 
+    def _on_viewer_double_clicked(
+        self, panel: DocumentPanel, page: int, x: float, y: float
+    ) -> None:
+        """Double-click on a highlighted difference: rematch just that
+        one against the paragraph it belongs to in the other document
+        (core/rematch.py)."""
+        self._active_panel = panel
+        item = panel.item_at(page, x, y)
+        if item is None:
+            self.status_label.setText(
+                "Double-click a highlighted difference to compare it again against the "
+                "paragraph it belongs to."
+            )
+            return
+        self._rematch(item, self._side(panel))
+
+    def _rematch_selected(self) -> None:
+        """Rematch the difference selected in the list, searching from
+        whichever side the last used viewer shows."""
+        items = self.results_panel.selected_items()
+        if len(items) != 1:
+            self.status_label.setText("Select one difference to rematch.")
+            return
+        self._rematch(items[0], self._side(self._active_panel))
+
+    def _rematch(self, item: DiffItem, side: str) -> None:
+        """Re-compare one difference on its own (see core/rematch.py)
+        and put the result in its place."""
+        if self._token_map is None:
+            self.status_label.setText("Compare the documents first.")
+            return
+        self.status_label.setText("Rematching this difference\u2026")
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            approved_tokens = self._token_map.tokens(APPROVED)
+            suspect_tokens = self._token_map.tokens(SUSPECT)
+            if self._rematch_context is None:
+                # The sections/paragraphs and their pairing -- the same
+                # structure the comparison itself used.
+                self._rematch_context = RematchContext(approved_tokens, suspect_tokens)
+            result = rematch_item(
+                item,
+                approved_tokens,
+                suspect_tokens,
+                side=side,
+                context=self._rematch_context,
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not result.found:
+            self.results_panel.select_item(item)
+            self.status_label.setText(result.message)
+            return
+
+        replacements = self.results_panel.replace_item(item, result.items, reason=result.message)
+        self._diff_results = self.results_panel.all_items()
+        self._redraw_overlays()
+        shown = bool(replacements) and self.results_panel.select_item(replacements[0])
+        if replacements and not shown:
+            self.status_label.setText(
+                result.message + " (the new row is hidden by the filters above the list.)"
+            )
+        else:
+            self.status_label.setText(result.message)
+        if replacements:
+            self.on_result_activated(replacements[0])
+        self._update_review_actions()
+
+    def _undo_rematch(self) -> None:
+        item = self.results_panel.undo_rematch()
+        if item is None:
+            self.status_label.setText("Nothing to undo.")
+            return
+        self._diff_results = self.results_panel.all_items()
+        self._redraw_overlays()
+        self.results_panel.select_item(item)
+        self.status_label.setText("Rematch undone -- the difference is back as it was.")
+        self._update_review_actions()
+
     def _activate_from_viewer(self, item: DiffItem, panel: DocumentPanel) -> None:
         shown = self.results_panel.select_item(item)
         self.on_result_activated(item, source=panel)
@@ -1134,6 +1405,7 @@ class MainWindow(QMainWindow):
         return "Original" if panel is self.original_panel else "Suspect"
 
     def closeEvent(self, event) -> None:  # noqa: N802 -- Qt override
+        self._flush_review()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("window_state", self.saveState())
         self.settings.setValue("deviation_splitter", self.results_panel.splitter.saveState())
@@ -1158,7 +1430,19 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("DocForensics")
+
+    # Set application icon
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    icon_path = os.path.join(base_dir, "assets", "icon.ico")
+    if not os.path.exists(icon_path):
+        icon_path = os.path.join(base_dir, "assets", "icon.png")
+    if os.path.exists(icon_path):
+        app_icon = QIcon(icon_path)
+        app.setWindowIcon(app_icon)
+
     window = MainWindow()
+    if os.path.exists(icon_path):
+        window.setWindowIcon(app_icon)
     window.show()
     sys.exit(app.exec())
 

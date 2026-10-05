@@ -17,7 +17,7 @@ import fitz
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QGestureEvent, QMessageBox, QPinchGesture
+from PySide6.QtWidgets import QFileDialog, QApplication, QGestureEvent, QMessageBox, QPinchGesture
 
 from main import MainWindow
 
@@ -103,6 +103,10 @@ def make_three_page(path, page1_height, page2_height, page3_text):
 
 def main():
     tmp = tempfile.mkdtemp()
+    # Reviews are kept per pair of files, by content. This suite builds
+    # byte-identical PDFs every run, so it must not share the real store
+    # (or its own previous run's): each run starts from no decisions.
+    os.environ["DOCFORENSICS_REVIEW_DIR"] = os.path.join(tmp, "reviews")
     approved_path = os.path.join(tmp, "approved.pdf")
     suspect_path = os.path.join(tmp, "suspect.pdf")
     make_pdf(approved_path, APPROVED_TEXT, 550)
@@ -645,14 +649,27 @@ def main():
 
     # --- 21. The comparator pane: what changed inside the selected row ---
     comparator = rp.comparator
+    comparator.context_checkbox.setChecked(False)
     rp.select_item(rp._visible_items[0])
     app.processEvents()
-    original_text = comparator.original_view.toPlainText()
-    suspect_text = comparator.suspect_view.toPlainText()
-    # The difference itself is one word; the words around it come from
-    # the document through the comparison's token map.
+    # "‸" is the caret marking where the other side has a letter
+    # this side lacks ("colo‸r" against "colo[u]r").
+    original_text = comparator.original_view.toPlainText().replace("‸", "")
+    suspect_text = comparator.suspect_view.toPlainText().replace("‸", "")
     spelled_out = "colour" in original_text and "color" in suspect_text
-    in_context = "tablet" in original_text and "tablet" in suspect_text
+    # With "Context" off the pane shows the difference by itself; with
+    # it on, the surrounding words come from the comparison's own token
+    # map. (The box defaults to off, so the bare difference is what a
+    # reviewer sees first.)
+    bare = "tablet" not in original_text
+    comparator.context_checkbox.setChecked(True)
+    app.processEvents()
+    in_context = (
+        "tablet" in comparator.original_view.toPlainText()
+        and "tablet" in comparator.suspect_view.toPlainText()
+    )
+    comparator.context_checkbox.setChecked(False)
+    app.processEvents()
     # Only the letter that differs is marked (a tinted run in the HTML).
     marks = comparator.original_view.toHtml().count("background-color")
     summary = comparator.summary_label.text()
@@ -672,10 +689,227 @@ def main():
     win.comparator_action.setChecked(True)
     back = rp.comparator_visible() and "colour" in comparator.original_view.toPlainText()
 
-    print("21. Comparator spells out the selected difference (in context, marked, both ways):",
-          "PASS" if spelled_out and in_context and marks == 1 and summary == "colour   →   color"
+    print("21. Comparator spells out the selected difference (bare, in context, marked, both ways):",
+          "PASS" if spelled_out and bare and in_context and marks == 1
+          and summary == "colour   →   color"
           and decision_shown and pages_shown and from_viewer and hidden and back else "FAIL",
-          f"(marks {marks}, summary {summary!r})")
+          f"(bare {bare}, context {in_context}, marks {marks}, summary {summary!r})")
+
+    # --- 22. Double-click a difference in a viewer to rematch it ---
+    # A warning paragraph the suspect really does drop: double-clicking
+    # it searches the whole Suspect and confirms the deletion instead of
+    # re-pointing it at something that merely shares a few words.
+    warning = ("Keep this medicine out of the sight and reach of children at all times "
+               "during the whole of the treatment period.")
+    dose = "The recommended starting dose is one tablet taken three times every day."
+    store = "Store below 25 C in a dry place away from direct sunlight and moisture."
+    gone_a = os.path.join(tmp, "rematch_a.pdf")
+    gone_b = os.path.join(tmp, "rematch_b.pdf")
+    make_pdf(gone_a, warning + "\n\n" + dose + "\n\n" + store, 420)
+    make_pdf(gone_b, dose + "\n\n" + store, 420)
+    win.original_panel.render_pdf(gone_a)
+    win.suspect_panel.render_pdf(gone_b)
+    win.original_panel.file_path = gone_a
+    win.suspect_panel.file_path = gone_b
+    rp.group_checkbox.setChecked(False)
+    rp._chips["moved"].setChecked(True)  # show every row for this check
+    win.on_compare_clicked()
+    deadline = time.time() + 20
+    while win._active_worker is not None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+
+    rows_before = len(rp.all_items())
+    target = next(
+        (d for d in rp.all_items()
+         if len((d.approved_text or d.suspect_text).split()) >= 4
+         and (d.approved_location or d.suspect_location)),
+        None,
+    )
+    confirmed = False
+    message = ""
+    if target is not None:
+        panel = win.original_panel if target.approved_location else win.suspect_panel
+        loc = target.approved_location or target.suspect_location
+        # The center of ONE highlighted line: the union box of a
+        # multi-line paragraph has its center in the gap between lines,
+        # where nothing is highlighted.
+        x0, top, x1, bottom = (loc.boxes or [loc.bbox])[0]
+        win._on_viewer_double_clicked(panel, loc.page, (x0 + x1) / 2, (top + bottom) / 2)
+        app.processEvents()
+        message = win.status_label.text()
+        # Genuinely deleted: the row must survive the search untouched.
+        confirmed = ("genuine" in message
+                     and any(d is target for d in rp.all_items())
+                     and len(rp.all_items()) == rows_before)
+
+    # Replacing a row and undoing it (what a rematch that DOES find a
+    # counterpart goes through).
+    from core.diff_engine import DiffItem
+    replacement = DiffItem(
+        index=0, kind="reordered", severity="reorder",
+        approved_text=target.approved_text, suspect_text=target.approved_text,
+        approved_location=target.approved_location, suspect_location=None,
+    )
+    rp.replace_item(target, [replacement])
+    app.processEvents()
+    replaced = (any(d is replacement for d in rp.all_items())
+                and not any(d is target for d in rp.all_items()))
+    win._undo_rematch()
+    app.processEvents()
+    undone = (any(d is target for d in rp.all_items())
+              and not any(d is replacement for d in rp.all_items())
+              and len(rp.all_items()) == rows_before
+              and not rp.can_undo_rematch())
+
+    # The gesture itself must reach the window, not just the handler.
+    seen = []
+    win.original_panel.point_double_clicked.connect(lambda *a: seen.append(a))
+    view = win.original_panel.view
+    center = view.viewport().rect().center()
+    QTest.mouseDClick(view.viewport(), Qt.MouseButton.LeftButton,
+                      Qt.KeyboardModifier.NoModifier, center)
+    app.processEvents()
+    clicked_ok = bool(seen)
+
+    print("22. Double-clicking a difference in a viewer rematches just that one:",
+          "PASS" if confirmed and replaced and undone and clicked_ok else "FAIL",
+          f"({message[:60]!r}, replaced {replaced}, undo {undone}, gesture {clicked_ok})")
+
+    # --- 23. The comparator's letter-by-letter view ---
+    from core.diff_engine import DiffItem as _DiffItem, Location as _Location
+
+    def _loc(page):
+        box = (10.0, 10.0, 90.0, 20.0)
+        return _Location(page=page, bbox=box, boxes=[box], boxes_by_page={page: [box]})
+
+    comparator.show_item(
+        _DiffItem(0, "text_changed", "critical", "dd/mm/yy", "06/01/25", _loc(1), _loc(1))
+    )
+    app.processEvents()
+    letters = comparator.letters_view.toPlainText()
+    date_ok = (comparator.letters_view.isVisible()
+               and "U+0064" in letters and "LATIN SMALL LETTER D" in letters
+               and "U+0030" in letters and "DIGIT ZERO" in letters
+               and "letter changed to a digit" in letters)
+
+    # A Cyrillic look-alike: identical on the page, different in the file.
+    comparator.show_item(
+        _DiffItem(0, "text_changed", "critical", "paracetamol", "parаcetamol",
+                  _loc(1), _loc(1))
+    )
+    app.processEvents()
+    lookalike = comparator.letters_view.toPlainText()
+    lookalike_ok = "CYRILLIC SMALL LETTER A" in lookalike and "look-alike" in lookalike
+
+    # One-sided differences have nothing to line up, and the view says so.
+    comparator.show_item(
+        _DiffItem(0, "removed_in_suspect", "critical", "Keep out of reach", "", _loc(1), None)
+    )
+    app.processEvents()
+    one_sided_ok = "nothing to line up" in comparator.letters_view.toPlainText()
+
+    # And it can be switched off.
+    comparator.letters_checkbox.setChecked(False)
+    app.processEvents()
+    hidden_ok = not comparator.letters_view.isVisible()
+    comparator.letters_checkbox.setChecked(True)
+    app.processEvents()
+
+    print("23. Comparator compares the selected difference letter by letter:",
+          "PASS" if date_ok and lookalike_ok and one_sided_ok and hidden_ok else "FAIL",
+          f"(date {date_ok}, look-alike {lookalike_ok}, one-sided {one_sided_ok}, toggle {hidden_ok})")
+    # --- 24. The review survives: streaming, a re-compare, the report ---
+    def compare_and_wait():
+        win.on_compare_clicked()
+        deadline = time.time() + 20
+        while win._active_worker is not None and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
+        app.processEvents()
+
+    rev_a = os.path.join(tmp, "review_a.pdf")
+    rev_b = os.path.join(tmp, "review_b.pdf")
+    make_pdf(rev_a, "Take 5 mg daily with food. Store below 25 C. Keep out of reach of children.", 400)
+    make_pdf(rev_b, "Take 10 mg daily with food. Store below 30 C. Keep out of sight of children.", 400)
+    win.original_panel.render_pdf(rev_a)
+    win.suspect_panel.render_pdf(rev_b)
+    win.original_panel.file_path = rev_a
+    win.suspect_panel.file_path = rev_b
+    win.reviewer_edit.setText("QA Reviewer")
+
+    # A decision taken while rows are still streaming in survives the
+    # authoritative list arriving at the end.
+    win.on_compare_clicked()
+    early = None
+    deadline = time.time() + 20
+    while win._active_worker is not None and time.time() < deadline:
+        app.processEvents()
+        if early is None and rp.all_items():
+            early = rp.all_items()[0]
+            rp.decide([early], REJECTED)
+        time.sleep(0.01)
+    app.processEvents()
+    kept_streaming = early is None or (early in rp.all_items() and rp.decision(early) is not None)
+
+    first = rp.all_items()[0]
+    rp.decide([first], ACCEPTED)
+    win._flush_review()
+    decided_text = (first.approved_text, first.suspect_text)
+
+    # Same two files compared again: the decision comes back.
+    compare_and_wait()
+    again = next((d for d in rp.all_items() if (d.approved_text, d.suspect_text) == decided_text), None)
+    restored = again is not None and rp.decision(again) is not None and rp.decision(again).status == ACCEPTED
+
+    # Page order walks the Original top to bottom.
+    rp.sort_combo.setCurrentIndex(1)
+    app.processEvents()
+    tops = [d.approved_location.bbox[1] for d in rp._visible_items if d.approved_location is not None]
+    page_ordered = tops == sorted(tops)
+    rp.sort_combo.setCurrentIndex(0)
+
+    # The report: both SHA-256s, the decision, the reviewer.
+    from core.review_store import file_digest
+    report_path = os.path.join(tmp, "report.html")
+    original_dialog = QFileDialog.getSaveFileName
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (report_path, "HTML report (*.html)"))
+    try:
+        win._export_report()
+    finally:
+        QFileDialog.getSaveFileName = original_dialog
+    report = open(report_path, encoding="utf-8").read() if os.path.exists(report_path) else ""
+    reported = (file_digest(rev_a) in report and file_digest(rev_b) in report
+                and "QA Reviewer" in report and "accepted" in report)
+
+    # A near-empty suspect: the red banner says so, and the dialog asks
+    # for acknowledgement.
+    empty_b = os.path.join(tmp, "stamp_only.pdf")
+    doc24 = fitz.open()
+    doc24.new_page(width=400, height=300).insert_text((36, 40), "By Packaging Development at 4:26 pm", fontsize=9, fontname="helv")
+    doc24.save(empty_b)
+    doc24.close()
+    long_a = os.path.join(tmp, "long_a.pdf")
+    doc24 = fitz.open()
+    doc24.new_page(width=600, height=800).insert_textbox(
+        fitz.Rect(36, 36, 564, 764), " ".join(f"word{i}" for i in range(260)), fontsize=9, fontname="helv"
+    )
+    doc24.save(long_a)
+    doc24.close()
+    win.original_panel.render_pdf(long_a)
+    win.suspect_panel.render_pdf(empty_b)
+    win.original_panel.file_path = long_a
+    win.suspect_panel.file_path = empty_b
+    compare_and_wait()
+    banner = rp.coverage_banner.isVisible() and "yielded only" in rp.coverage_banner.text()
+    warned = [w for w in app.topLevelWidgets() if isinstance(w, QMessageBox) and w.isVisible()]
+    for box in warned:
+        box.close()
+
+    print("24. The review survives streaming and a re-compare, sorts by page, exports, and warns:",
+          "PASS" if kept_streaming and restored and page_ordered and reported and banner and warned else "FAIL",
+          f"(streaming {kept_streaming}, restored {restored}, page order {page_ordered}, "
+          f"report {reported}, banner {banner}, dialog {bool(warned)})")
     print("dialogs:", dialogs or "none")
 
 

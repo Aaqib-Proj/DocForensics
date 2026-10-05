@@ -285,6 +285,7 @@ class _ZoomableGraphicsView(QGraphicsView):
 
     zoom_requested = Signal(float, QPointF)  # relative multiplier (>1 zooms in), scene anchor
     clicked = Signal(QPointF)  # scene position of a left click that wasn't a drag
+    double_clicked = Signal(QPointF)  # scene position of a left double-click
     interacted = Signal()  # any mouse/wheel use of this view
     file_dropped = Signal(str)  # a single supported document dropped onto the view
     files_dropped = Signal(list)  # multiple supported documents dropped onto the view
@@ -371,6 +372,14 @@ class _ZoomableGraphicsView(QGraphicsView):
             self.interacted.emit()
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.interacted.emit()
+            self.double_clicked.emit(QPointF(self.mapToScene(event.position().toPoint())))
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
         super().mouseReleaseEvent(event)
         press, self._press_pos = self._press_pos, None
@@ -398,6 +407,8 @@ class DocumentPanel(QWidget):
         interacted: The user clicked, scrolled or zoomed in this panel.
         point_clicked: A click (not a drag) on a page, as
             (page, x, y) in PDF points.
+        point_double_clicked: A double-click on a page, same
+            coordinates -- main.py rematches the difference there.
         loaded: Emitted with the file path once a document has rendered
             successfully, so main.py knows when it's safe to enable
             the Compare button.
@@ -407,6 +418,9 @@ class DocumentPanel(QWidget):
     zoom_changed = Signal(float)
     interacted = Signal()
     point_clicked = Signal(int, float, float)
+    # A double-click on a page, as (page, x, y) in PDF points: the
+    # reviewer asking for whatever is there to be rematched.
+    point_double_clicked = Signal(int, float, float)
     loaded = Signal(str)
     # Emitted with (merged_path, should_compare) when multiple files are merged and loaded
     merge_completed = Signal(str, bool)
@@ -555,6 +569,7 @@ class DocumentPanel(QWidget):
         self.view.zoom_requested.connect(self._on_view_zoom_requested)
         self.view.interacted.connect(self.interacted)
         self.view.clicked.connect(self._on_view_clicked)
+        self.view.double_clicked.connect(self._on_view_double_clicked)
         self.view.file_dropped.connect(self.load_document)
         self.view.files_dropped.connect(lambda paths: self.on_merge_clicked(initial_files=paths))
 
@@ -1632,6 +1647,11 @@ class DocumentPanel(QWidget):
         point = self.pdf_point(scene_pos)
         if point is not None:
             self.point_clicked.emit(*point)
+
+    def _on_view_double_clicked(self, scene_pos: QPointF) -> None:
+        point = self.pdf_point(scene_pos)
+        if point is not None:
+            self.point_double_clicked.emit(*point)
 
     # ------------------------------------------------------------------
     # Scroll sync plumbing

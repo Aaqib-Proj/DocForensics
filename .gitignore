@@ -34,7 +34,8 @@ ENV/
 .vscode/
 .idea/
 
-# OS files
-.DS_Store
-Thumbs.db
-Desktop.ini
+# Packaging & Distribution
+build/
+dist/
+*.egg-info/
+*.spec.bak
