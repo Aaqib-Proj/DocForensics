@@ -88,6 +88,43 @@ class TokenMap:
                     pages.setdefault(word.page, []).append((i, word.bbox))
             self._by_page[side] = pages
 
+    # ------------------------------------------------------------------
+    # Re-pairing (a reviewer's area rematch, core/rematch.rematch_areas)
+    # ------------------------------------------------------------------
+
+    def partners(self) -> dict[str, list[int]]:
+        """Per side, each token's partner index in the other document,
+        or -1. Read-only: change it with `rebind`."""
+        return self._partner
+
+    def snapshot(self) -> dict[str, list[int]]:
+        return {side: list(partners) for side, partners in self._partner.items()}
+
+    def restore(self, snapshot: dict[str, list[int]]) -> None:
+        self._partner = {side: list(partners) for side, partners in snapshot.items()}
+        self._run_length = {side: self._run_lengths(side) for side in self._tokens}
+
+    def rebind(
+        self,
+        approved_indices: list[int],
+        suspect_indices: list[int],
+        pairs: list[tuple[int, int]],
+    ) -> None:
+        """Make ``pairs`` (approved index, suspect index) the only
+        partners of the given tokens: whatever they were paired with
+        before -- inside or outside the given tokens -- is let go."""
+        for side, indices in ((APPROVED, approved_indices), (SUSPECT, suspect_indices)):
+            mine, theirs = self._partner[side], self._partner[other_side(side)]
+            for index in indices:
+                partner = mine[index]
+                if partner >= 0 and theirs[partner] == index:
+                    theirs[partner] = -1
+                mine[index] = -1
+        for i, j in pairs:
+            self._partner[APPROVED][i] = j
+            self._partner[SUSPECT][j] = i
+        self._run_length = {side: self._run_lengths(side) for side in self._tokens}
+
     def _run_lengths(self, side: str) -> list[int]:
         """For each word, the length of the in-sequence matched run it
         belongs to (0 if unmatched)."""

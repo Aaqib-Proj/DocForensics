@@ -37,6 +37,7 @@ hiddenimports = [
     "core.inline_diff",
     "core.mupdf_page",
     "core.office_convert",
+    "core.page_furniture",
     "core.pdf_extractor",
     "core.pdf_merge",
     "core.rematch",

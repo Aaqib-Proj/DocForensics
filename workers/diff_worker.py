@@ -28,6 +28,7 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from core.coverage_check import coverage_is_serious, coverage_warnings
 from core.diff_engine import DiffItem, diff_documents
+from core.page_furniture import drop_repeated_furniture
 from core.review_store import comparison_key
 from core.document_extractor import extract_document_tokens
 from core.token_map import TokenMap
@@ -53,6 +54,8 @@ class ComparisonResult:
     serious_warning: bool = False
     # Identity of this exact pair of files, for keeping the review.
     review_key: str = ""
+    # Running headers/footers whose repeats were left out (first kept).
+    furniture: list[str] = field(default_factory=list)
 
 
 class DiffWorkerSignals(QObject):
@@ -124,7 +127,7 @@ class DiffWorker(QRunnable):
 
             # Apply header/footer crops if set
             if self.crop_data:
-                self._progress("Applying header/footer crops...")
+                self._progress("Applying margin crops...")
                 before_a = len(approved_tokens)
                 before_s = len(suspect_tokens)
                 approved_tokens = self._apply_crop_to_tokens(approved_tokens, self.approved_path)
@@ -133,6 +136,13 @@ class DiffWorker(QRunnable):
                     "Crop filter: approved %d->%d tokens, suspect %d->%d tokens",
                     before_a, len(approved_tokens), before_s, len(suspect_tokens),
                 )
+
+            # Running headers/footers repeated on every page: compare the
+            # first occurrence, drop the repeats (core/page_furniture.py).
+            approved_tokens, furniture_a, suspect_tokens, furniture_b = (
+                *drop_repeated_furniture(approved_tokens, suspect_tokens),
+                *drop_repeated_furniture(suspect_tokens, approved_tokens),
+            )
 
             self._progress("Comparing text...")
             matches: list = []
@@ -153,6 +163,7 @@ class DiffWorker(QRunnable):
                 warnings=warnings,
                 serious_warning=coverage_is_serious(approved_tokens, suspect_tokens),
                 review_key=review_key,
+                furniture=[f"Original: {f}" for f in furniture_a] + [f"Suspect: {f}" for f in furniture_b],
             )
         except Exception as exc:  # noqa: BLE001 -- surface any failure to the UI
             logger.exception("DiffWorker failed")
@@ -206,10 +217,10 @@ class DiffWorker(QRunnable):
                 del pending[future]
 
     def _apply_crop_to_tokens(self, tokens: list, path: str) -> list:
-        """Filter out tokens whose source words fall inside cropped header/footer regions.
+        """Filter out tokens whose source words fall inside cropped margin regions.
 
         A token is excluded if all of its source words (or its bounding box center)
-        fall inside the cropped header or footer region for that page.
+        fall inside the cropped header, footer, or side margin regions for that page.
         """
         page_crops = self.crop_data.get(path, {})
         if not page_crops:
@@ -224,24 +235,37 @@ class DiffWorker(QRunnable):
             if crop is None:
                 filtered.append(t)
                 continue
-            header_bottom, footer_top = crop
+
+            header_bottom = float(crop[0])
+            footer_top = float(crop[1])
+            left_bound = float(crop[2]) if len(crop) >= 4 else 0.0
+            right_bound = float(crop[3]) if len(crop) >= 4 else float("inf")
+
             source_words = getattr(t, "source_words", None)
             if source_words:
                 all_cropped = True
                 for w in source_words:
+                    x_center = (w.x0 + w.x1) / 2.0
                     y_center = (w.top + w.bottom) / 2.0
-                    if header_bottom <= y_center <= footer_top:
+                    if (header_bottom <= y_center <= footer_top) and (left_bound <= x_center <= right_bound):
                         all_cropped = False
                         break
                 if all_cropped:
                     continue
             elif hasattr(t, "bbox") and t.bbox:
                 x0, top, x1, bottom = t.bbox
+                x_center = (x0 + x1) / 2.0
                 y_center = (top + bottom) / 2.0
-                if y_center < header_bottom or y_center > footer_top:
+                if (
+                    y_center < header_bottom
+                    or y_center > footer_top
+                    or x_center < left_bound
+                    or x_center > right_bound
+                ):
                     continue
             filtered.append(t)
         return filtered
+
 
     def _tokens(self, path: str, extraction: Future | None) -> list:
         if extraction is None:

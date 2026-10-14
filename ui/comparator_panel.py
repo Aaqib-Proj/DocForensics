@@ -290,6 +290,23 @@ class ComparatorPanel(QWidget):
         self._status = ""
         self._restyle()
 
+    def _select_occurrence(self, index: int) -> None:
+        """Make occurrence ``index`` of the current set the shown one and
+        take the documents to it (a click in the occurrence lists)."""
+        if self._items and 0 <= index < len(self._items):
+            self._occurrence_idx = index
+            self._item = self._items[index]
+            self._restyle()
+            self.occurrence_selected.emit(self._item)
+
+    def _on_anchor(self, url) -> None:
+        target = url.toString()
+        if target.startswith("occ:"):
+            try:
+                self._select_occurrence(int(target[4:]))
+            except ValueError:
+                pass
+
     def _prev_occurrence(self) -> None:
         if self._items and self._occurrence_idx > 0:
             self._occurrence_idx -= 1
@@ -315,6 +332,9 @@ class ComparatorPanel(QWidget):
         view = _CompactTextView()
         view.setFrameShape(QFrame.Shape.NoFrame)
         view.setOpenExternalLinks(False)
+        # Occurrence links ("occ:N") are handled here, never followed.
+        view.setOpenLinks(False)
+        view.anchorClicked.connect(self._on_anchor)
         view.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
         view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -407,12 +427,18 @@ class ComparatorPanel(QWidget):
         self.status_label.setVisible(bool(notes))
 
         approved_segments, suspect_segments = inline_segments(item.approved_text, item.suspect_text)
-        self.original_view.setHtml(
-            self._side_html(item, APPROVED, approved_segments, t.danger, item.approved_location)
-        )
-        self.suspect_view.setHtml(
-            self._side_html(item, SUSPECT, suspect_segments, t.success, item.suspect_location)
-        )
+        if len(self._items) > 1 and self._show_context:
+            # Every occurrence, each in its own surroundings: the same
+            # change can read differently in different sentences.
+            self.original_view.setHtml(self._occurrences_html(APPROVED, approved_segments, t.danger))
+            self.suspect_view.setHtml(self._occurrences_html(SUSPECT, suspect_segments, t.success))
+        else:
+            self.original_view.setHtml(
+                self._side_html(item, APPROVED, approved_segments, t.danger, item.approved_location)
+            )
+            self.suspect_view.setHtml(
+                self._side_html(item, SUSPECT, suspect_segments, t.success, item.suspect_location)
+            )
         self.summary_label.setText(self._summary(item))
         self._show_letter_comparison(item)
 
@@ -425,7 +451,10 @@ class ComparatorPanel(QWidget):
         self.letters_view.setVisible(show)
         if not show:
             return
-        self.letters_view.setHtml(self._letters_html(item))
+        html = self._letters_html(item)
+        if len(self._items) > 1:
+            html += self._occurrence_list_html()
+        self.letters_view.setHtml(html)
 
     def _letters_html(self, item: DiffItem) -> str:
         t = theme.tokens()
@@ -507,6 +536,53 @@ class ComparatorPanel(QWidget):
             f"<div style=\"font-family: Consolas, 'Courier New', monospace; "
             f"font-size: 11px; margin-top: 6px\">" + "".join(lines) + "</div>"
         )
+
+    def _occurrence_link(self, index: int, label: str) -> str:
+        """A numbered link to occurrence ``index``; the shown one stands out."""
+        t = theme.tokens()
+        current = index == self._occurrence_idx
+        weight = "700" if current else "400"
+        marker = "\u25b6 " if current else ""
+        return (
+            f"<a href='occ:{index}' style='color: {t.accent}; font-weight: {weight};"
+            f" text-decoration: none'>{marker}#{index + 1}</a>"
+            f"<span style='color: {t.muted}'> \u00b7 {_escape(label)}</span>"
+        )
+
+    def _occurrences_html(self, side: str, segments: list[Segment], mark_color: str) -> str:
+        """Every occurrence of the shown set on one side, each with the
+        document's own words around it."""
+        if not segments:
+            item = self._items[0]
+            return self._html([], "", "", mark_color, muted_message=_MISSING_SIDE.get(item.kind, "\u2014"))
+        blocks = []
+        for index, item in enumerate(self._items):
+            location = item.approved_location if side == APPROVED else item.suspect_location
+            caret = item.approved_caret if side == APPROVED else item.suspect_caret
+            before, after = self._context(item, side, location)
+            page = _page_label(location, caret)
+            blocks.append(
+                f"<div style='margin-top: 4px'>{self._occurrence_link(index, page)}</div>"
+                + self._html(segments, before, after, mark_color)
+            )
+        return "".join(blocks)
+
+    def _occurrence_list_html(self) -> str:
+        """Where each occurrence of the shown set is. Their letters are the
+        same -- that is what makes them one set -- so the comparison above
+        is shown once."""
+        t = theme.tokens()
+        lines = [
+            f"<div style='color: {t.muted}; margin-top: 8px'>Identical, letter for letter, "
+            f"in all {len(self._items)} occurrences:</div>"
+        ]
+        for index, item in enumerate(self._items):
+            where = (
+                f"Original {_page_label(item.approved_location, item.approved_caret)}"
+                f"  \u00b7  Suspect {_page_label(item.suspect_location, item.suspect_caret)}"
+            )
+            lines.append(f"<div style='margin-top: 2px'>{self._occurrence_link(index, where)}</div>")
+        return "<div style='font-size: 11px'>" + "".join(lines) + "</div>"
 
     def _pages_text(self, item: DiffItem) -> str:
         def page_of(location: Location | None, caret: Location | None) -> str:
@@ -598,3 +674,13 @@ class ComparatorPanel(QWidget):
         if not right:
             return f"Deleted on suspect:   {left}"
         return f"{left}   →   {right}"
+
+
+def _page_label(location: Location | None, caret: Location | None) -> str:
+    """"page 3", "pages 3\u20134", or "\u2014" when there is no position."""
+    if location is not None:
+        pages = sorted(location.boxes_by_page) or [location.page]
+        return f"pages {pages[0]}\u2013{pages[-1]}" if len(pages) > 1 else f"page {pages[0]}"
+    if caret is not None:
+        return f"page {caret.page}"
+    return "\u2014"

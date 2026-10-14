@@ -1,24 +1,19 @@
-"""Crop Header/Footer dialog (ui/crop_dialog.py).
+"""crop_dialog.py -- Visual Header, Footer, and Side Crop Exclusion Dialog.
 
-A fast, responsive modal dialog for visually defining header and footer
-exclusion zones on Original and Suspect documents.
-
-Key features:
-  - Instant open (lazy on-demand page rendering, no upfront freeze)
-  - Simultaneous Header and Footer exclusion zones
-  - Interactive dotted lines with draggable handles (SizeVerCursor)
-  - Viewport-scaled proximity detection for effortless grabbing at any zoom
-  - Numeric spinbox controls with point-level precision
-  - Quick "Apply to All Pages" / "Apply to This Page"
-  - Document switcher (Original vs Suspect) with PDF & Word (.docx) support
-  - Fast page navigation and zooming
+Allows reviewers to define header, footer, left, and right margins to exclude from comparison:
+- Ultra-fast opening via metadata caching
+- Drag-and-drop interactive dotted lines with SizeVerCursor and SizeHorCursor
+- Exclusion bands with semi-transparent overlay
+- Numeric point spinboxes with Clear buttons
+- Single-page vs All-pages application
+- Seamless document switching between Original and Suspect
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import fitz  # PyMuPDF
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -26,6 +21,7 @@ from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
+    QFrame,
     QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsPixmapItem,
@@ -35,7 +31,6 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -44,7 +39,6 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger(__name__)
 
-# Must match document_panel.py's RENDER_DPI_SCALE so coordinates align
 RENDER_DPI_SCALE = 200 / 72
 
 # Crop styling tokens
@@ -53,6 +47,12 @@ _HEADER_PEN.setCosmetic(True)
 
 _FOOTER_PEN = QPen(QColor(244, 67, 54, 240), 2, Qt.PenStyle.DashLine)
 _FOOTER_PEN.setCosmetic(True)
+
+_LEFT_PEN = QPen(QColor(244, 67, 54, 240), 2, Qt.PenStyle.DashLine)
+_LEFT_PEN.setCosmetic(True)
+
+_RIGHT_PEN = QPen(QColor(244, 67, 54, 240), 2, Qt.PenStyle.DashLine)
+_RIGHT_PEN.setCosmetic(True)
 
 _CROP_OVERLAY_BRUSH = QBrush(QColor(220, 40, 40, 65))
 _HANDLE_BG_BRUSH = QBrush(QColor(198, 40, 40, 230))
@@ -158,9 +158,9 @@ _CLEAR_BTN_STYLE = """
         background-color: #424242;
         color: #ef9a9a;
         border: 1px solid #616161;
-        border-radius: 5px;
-        padding: 6px 14px;
-        font-size: 12px;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 11px;
     }
     QPushButton:hover {
         background-color: #c62828;
@@ -186,9 +186,9 @@ _DONE_BTN_STYLE = """
 
 
 class _CropGraphicsView(QGraphicsView):
-    """View with interactive line-dragging for header and footer crops."""
+    """View with interactive line-dragging for header, footer, and side crops."""
 
-    line_dragged = Signal(str, float)  # ('header' or 'footer', y_pt)
+    line_dragged = Signal(str, float)  # ('header'|'footer'|'left'|'right', val_pt)
     drag_finished = Signal()
     zoom_requested = Signal(float)
     page_nav_requested = Signal(int)  # +1 or -1
@@ -200,19 +200,29 @@ class _CropGraphicsView(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
-        self._dragging_target: str | None = None  # 'header', 'footer', or None
+        self._dragging_target: str | None = None  # 'header', 'footer', 'left', 'right', or None
         self._page_w_px: float = 0.0
         self._page_h_px: float = 0.0
         self._header_y_px: float = 0.0
         self._footer_y_px: float = 0.0
+        self._left_x_px: float = 0.0
+        self._right_x_px: float = 0.0
 
     def set_bounds(
-        self, page_w_px: float, page_h_px: float, header_y_px: float, footer_y_px: float
+        self,
+        page_w_px: float,
+        page_h_px: float,
+        header_y_px: float,
+        footer_y_px: float,
+        left_x_px: float,
+        right_x_px: float,
     ) -> None:
         self._page_w_px = page_w_px
         self._page_h_px = page_h_px
         self._header_y_px = header_y_px
         self._footer_y_px = footer_y_px
+        self._left_x_px = left_x_px
+        self._right_x_px = right_x_px
 
     def _is_near_header(self, view_pos) -> bool:
         if self._page_h_px <= 0:
@@ -226,30 +236,88 @@ class _CropGraphicsView(QGraphicsView):
         footer_view_y = self.mapFromScene(0, self._footer_y_px).y()
         return abs(view_pos.y() - footer_view_y) <= 14
 
+    def _is_near_left(self, view_pos) -> bool:
+        if self._page_w_px <= 0:
+            return False
+        left_view_x = self.mapFromScene(self._left_x_px, 0).x()
+        return abs(view_pos.x() - left_view_x) <= 14
+
+    def _is_near_right(self, view_pos) -> bool:
+        if self._page_w_px <= 0:
+            return False
+        right_view_x = self.mapFromScene(self._right_x_px, 0).x()
+        return abs(view_pos.x() - right_view_x) <= 14
+
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._page_h_px > 0:
+        if event.button() == Qt.MouseButton.LeftButton and self._page_h_px > 0 and self._page_w_px > 0:
             view_pos = event.pos()
             scene_pos = self.mapToScene(view_pos)
 
             # 1. Exact line proximity (within 14 screen pixels)
-            if self._is_near_header(view_pos):
-                self._dragging_target = "header"
-                event.accept()
-                return
-            if self._is_near_footer(view_pos):
-                self._dragging_target = "footer"
+            d_h = abs(view_pos.y() - self.mapFromScene(0, self._header_y_px).y())
+            d_f = abs(view_pos.y() - self.mapFromScene(0, self._footer_y_px).y())
+            d_l = abs(view_pos.x() - self.mapFromScene(self._left_x_px, 0).x())
+            d_r = abs(view_pos.x() - self.mapFromScene(self._right_x_px, 0).x())
+
+            candidates = [("header", d_h), ("footer", d_f), ("left", d_l), ("right", d_r)]
+            candidates.sort(key=lambda c: c[1])
+            best_target, best_dist = candidates[0]
+            if best_dist <= 14:
+                self._dragging_target = best_target
                 event.accept()
                 return
 
-            # 2. Click in header / footer territory to snap line
-            if 0 <= scene_pos.x() <= self._page_w_px:
-                if scene_pos.y() < self._page_h_px * 0.4:
+            # 2. Click in margin territory to snap line
+            if 0 <= scene_pos.x() <= self._page_w_px and 0 <= scene_pos.y() <= self._page_h_px:
+                margin_left_dist = scene_pos.x()
+                margin_right_dist = self._page_w_px - scene_pos.x()
+                margin_top_dist = scene_pos.y()
+                margin_bot_dist = self._page_h_px - scene_pos.y()
+
+                # Inside existing crop exclusion zones
+                if scene_pos.x() <= self._left_x_px:
+                    self._dragging_target = "left"
+                    self.line_dragged.emit("left", max(0.0, scene_pos.x() / RENDER_DPI_SCALE))
+                    event.accept()
+                    return
+                if scene_pos.x() >= self._right_x_px:
+                    self._dragging_target = "right"
+                    self.line_dragged.emit("right", min(self._page_w_px / RENDER_DPI_SCALE, scene_pos.x() / RENDER_DPI_SCALE))
+                    event.accept()
+                    return
+                if scene_pos.y() <= self._header_y_px:
+                    self._dragging_target = "header"
+                    self.line_dragged.emit("header", max(0.0, scene_pos.y() / RENDER_DPI_SCALE))
+                    event.accept()
+                    return
+                if scene_pos.y() >= self._footer_y_px:
+                    self._dragging_target = "footer"
+                    self.line_dragged.emit("footer", min(self._page_h_px / RENDER_DPI_SCALE, scene_pos.y() / RENDER_DPI_SCALE))
+                    event.accept()
+                    return
+
+                # If near outer edges when crop line is currently at 0 or edge
+                min_edge = min(margin_left_dist, margin_right_dist, margin_top_dist, margin_bot_dist)
+                if min_edge == margin_left_dist and margin_left_dist <= self._page_w_px * 0.2:
+                    self._dragging_target = "left"
+                    new_pt = max(0.0, min(scene_pos.x() / RENDER_DPI_SCALE, (self._right_x_px / RENDER_DPI_SCALE) - 10))
+                    self.line_dragged.emit("left", new_pt)
+                    event.accept()
+                    return
+                elif min_edge == margin_right_dist and margin_right_dist <= self._page_w_px * 0.2:
+                    self._dragging_target = "right"
+                    page_w_pt = self._page_w_px / RENDER_DPI_SCALE
+                    new_pt = max((self._left_x_px / RENDER_DPI_SCALE) + 10, min(scene_pos.x() / RENDER_DPI_SCALE, page_w_pt))
+                    self.line_dragged.emit("right", new_pt)
+                    event.accept()
+                    return
+                elif min_edge == margin_top_dist and margin_top_dist <= self._page_h_px * 0.2:
                     self._dragging_target = "header"
                     new_pt = max(0.0, min(scene_pos.y() / RENDER_DPI_SCALE, (self._footer_y_px / RENDER_DPI_SCALE) - 10))
                     self.line_dragged.emit("header", new_pt)
                     event.accept()
                     return
-                elif scene_pos.y() > self._page_h_px * 0.6:
+                elif min_edge == margin_bot_dist and margin_bot_dist <= self._page_h_px * 0.2:
                     self._dragging_target = "footer"
                     page_h_pt = self._page_h_px / RENDER_DPI_SCALE
                     new_pt = max((self._header_y_px / RENDER_DPI_SCALE) + 10, min(scene_pos.y() / RENDER_DPI_SCALE, page_h_pt))
@@ -264,25 +332,40 @@ class _CropGraphicsView(QGraphicsView):
         scene_pos = self.mapToScene(view_pos)
 
         if self._dragging_target:
-            page_h_pt = self._page_h_px / RENDER_DPI_SCALE
-            y_pt = scene_pos.y() / RENDER_DPI_SCALE
+            if self._dragging_target in ("header", "footer"):
+                page_h_pt = self._page_h_px / RENDER_DPI_SCALE
+                y_pt = scene_pos.y() / RENDER_DPI_SCALE
+                if self._dragging_target == "header":
+                    footer_pt = self._footer_y_px / RENDER_DPI_SCALE
+                    clamped_pt = max(0.0, min(y_pt, footer_pt - 10.0))
+                    self.line_dragged.emit("header", clamped_pt)
+                elif self._dragging_target == "footer":
+                    header_pt = self._header_y_px / RENDER_DPI_SCALE
+                    clamped_pt = max(header_pt + 10.0, min(y_pt, page_h_pt))
+                    self.line_dragged.emit("footer", clamped_pt)
+                self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
 
-            if self._dragging_target == "header":
-                footer_pt = self._footer_y_px / RENDER_DPI_SCALE
-                clamped_pt = max(0.0, min(y_pt, footer_pt - 10.0))
-                self.line_dragged.emit("header", clamped_pt)
-            elif self._dragging_target == "footer":
-                header_pt = self._header_y_px / RENDER_DPI_SCALE
-                clamped_pt = max(header_pt + 10.0, min(y_pt, page_h_pt))
-                self.line_dragged.emit("footer", clamped_pt)
+            elif self._dragging_target in ("left", "right"):
+                page_w_pt = self._page_w_px / RENDER_DPI_SCALE
+                x_pt = scene_pos.x() / RENDER_DPI_SCALE
+                if self._dragging_target == "left":
+                    right_pt = self._right_x_px / RENDER_DPI_SCALE
+                    clamped_pt = max(0.0, min(x_pt, right_pt - 10.0))
+                    self.line_dragged.emit("left", clamped_pt)
+                elif self._dragging_target == "right":
+                    left_pt = self._left_x_px / RENDER_DPI_SCALE
+                    clamped_pt = max(left_pt + 10.0, min(x_pt, page_w_pt))
+                    self.line_dragged.emit("right", clamped_pt)
+                self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
 
-            self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
             event.accept()
             return
 
         # Hover cursor
         if self._is_near_header(view_pos) or self._is_near_footer(view_pos):
             self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+        elif self._is_near_left(view_pos) or self._is_near_right(view_pos):
+            self.setCursor(QCursor(Qt.CursorShape.SizeHorCursor))
         else:
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
@@ -300,35 +383,29 @@ class _CropGraphicsView(QGraphicsView):
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             delta = event.angleDelta().y()
-            if delta:
-                self.zoom_requested.emit(1.0 + (delta / 120.0) * 0.15)
-                event.accept()
-                return
-        else:
-            delta = event.angleDelta().y()
-            if abs(delta) >= 60:
-                self.page_nav_requested.emit(-1 if delta > 0 else 1)
-                event.accept()
-                return
-
+            if delta > 0:
+                self.zoom_requested.emit(1.15)
+            elif delta < 0:
+                self.zoom_requested.emit(1 / 1.15)
+            event.accept()
+            return
         super().wheelEvent(event)
 
 
 class CropDialog(QDialog):
-    """High-performance modal dialog for cropping header/footer regions."""
+    """Interactive dialog to preview, adjust, and apply Header, Footer, and Side margin crops."""
 
     def __init__(
         self,
         original_path: str | None,
         suspect_path: str | None,
-        existing_crops: dict | None = None,
+        existing_crops: dict[str, dict[int, tuple]] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Crop Header / Footer")
+        self.setWindowTitle("Crop Margins (Header / Footer / Sides)")
         self.setStyleSheet(_DIALOG_STYLE)
-        self.setMinimumSize(950, 720)
-
+        self.setMinimumSize(980, 720)
         if parent:
             self.resize(min(1280, parent.width() - 20), min(900, parent.height() - 20))
         else:
@@ -336,63 +413,60 @@ class CropDialog(QDialog):
 
         self._original_path = original_path
         self._suspect_path = suspect_path
-        self._active_doc: str = "original"
 
-        # Crop data: {doc_path: {page_num(1-indexed): (header_bottom_pt, footer_top_pt)}}
-        self._crop_data: dict[str, dict[int, tuple[float, float]]] = {}
-        if existing_crops:
-            self._crop_data = {k: dict(v) for k, v in existing_crops.items()}
-
-        # Fast document metadata & cache: path -> dict
-        # {actual_path, page_count, heights_pt, widths_pt}
+        # Cache of parsed document metadata: {path: {'actual_path': str, 'page_count': int, 'heights_pt': list[float], 'widths_pt': list[float]}}
         self._doc_meta: dict[str, dict] = {}
+        # Rendered pixmaps cache: {(path, page_num): QPixmap}
         self._page_cache: dict[tuple[str, int], QPixmap] = {}
 
+        # Pre-load metadata for both documents (instant, does not render pixels)
+        if self._original_path:
+            self._load_doc_metadata(self._original_path)
+        if self._suspect_path:
+            self._load_doc_metadata(self._suspect_path)
+
+        # Active document: 'original' or 'suspect'
+        self._active_doc: str = "original" if (self._original_path and self._original_path in self._doc_meta) else "suspect"
         self._current_page: int = 1
         self._zoom_factor: float = 1.0
 
-        # Fast init: load document metadata in ~2ms (zero upfront page rendering)
-        if original_path:
-            self._load_doc_metadata(original_path)
-        if suspect_path:
-            self._load_doc_metadata(suspect_path)
+        # State storage: {path: {page_num: (header_pt, footer_pt, left_pt, right_pt)}}
+        self._crop_data: dict[str, dict[int, tuple[float, float, float, float]]] = {}
+        if existing_crops:
+            for path, pages in existing_crops.items():
+                self._crop_data[path] = {}
+                meta = self._doc_meta.get(path)
+                for p, crop in pages.items():
+                    p_w = meta["widths_pt"][p - 1] if meta and p <= len(meta["widths_pt"]) else 800.0
+                    h = float(crop[0])
+                    f = float(crop[1])
+                    l = float(crop[2]) if len(crop) >= 4 else 0.0
+                    r = float(crop[3]) if len(crop) >= 4 else p_w
+                    self._crop_data[path][p] = (h, f, l, r)
 
-        # Build UI layout
         self._build_ui()
-
-        # Switch to first available document
-        if original_path and original_path in self._doc_meta:
-            self._switch_to("original")
-        elif suspect_path and suspect_path in self._doc_meta:
-            self._switch_to("suspect")
-
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
+        self._render_current_page()
         self._fit_page()
 
     # ------------------------------------------------------------------
-    # Document Metadata & Lazy Rendering
+    # Document Metadata & Rendering
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _resolve_pdf_path(path: str) -> str | None:
-        """Resolve a document path to a readable PDF path."""
-        if not path or not os.path.exists(path):
+    def _resolve_pdf_path(self, path: str) -> str | None:
+        if not path:
             return None
-        if path.lower().endswith(".pdf"):
+        if os.path.isfile(path) and path.lower().endswith(".pdf"):
             return path
-        # Word / Office document: check cached conversion
         try:
-            from core.office_convert import cached_pdf_path
-            converted = cached_pdf_path(path)
-            if os.path.exists(converted):
+            from core.document_extractor import _ensure_pdf_available
+            converted = _ensure_pdf_available(path)
+            if converted and os.path.isfile(converted):
                 return converted
         except Exception:
             pass
         return None
 
     def _load_doc_metadata(self, path: str) -> None:
-        """Extract page count and dimensions in ~2ms without rendering pixels."""
         actual_path = self._resolve_pdf_path(path)
         if not actual_path:
             logger.info("CropDialog: Cannot resolve readable PDF for %s", path)
@@ -423,7 +497,6 @@ class CropDialog(QDialog):
             logger.error("CropDialog: Failed loading metadata for %s: %s", path, exc)
 
     def _get_page_pixmap(self, path: str, page_num: int) -> QPixmap | None:
-        """Fetch pixmap from cache or render on demand in ~15ms."""
         key = (path, page_num)
         if key in self._page_cache:
             return self._page_cache[key]
@@ -453,19 +526,19 @@ class CropDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
         layout.setContentsMargins(14, 10, 14, 10)
 
-        # 1. Top Document Switcher Bar
+        # 1. Top Document Switcher & Navigation & Zoom Bar
         top_bar = QHBoxLayout()
-        top_bar.setSpacing(10)
+        top_bar.setSpacing(8)
 
         self._orig_btn = QPushButton("Original")
-        self._orig_btn.setFixedWidth(160)
+        self._orig_btn.setFixedWidth(150)
         self._orig_btn.clicked.connect(lambda: self._switch_to("original"))
 
         self._susp_btn = QPushButton("Suspect")
-        self._susp_btn.setFixedWidth(160)
+        self._susp_btn.setFixedWidth(150)
         self._susp_btn.clicked.connect(lambda: self._switch_to("suspect"))
 
         if not self._original_path or self._original_path not in self._doc_meta:
@@ -482,21 +555,9 @@ class CropDialog(QDialog):
 
         top_bar.addWidget(self._orig_btn)
         top_bar.addWidget(self._susp_btn)
-        top_bar.addSpacing(16)
+        top_bar.addSpacing(12)
 
-        self._tip_label = QLabel(
-            "💡 <b>Drag the red dotted lines</b> on the page to adjust Header and Footer, then click <b>Apply to All Pages</b>."
-        )
-        self._tip_label.setStyleSheet("color: #90caf9; font-size: 12px;")
-        top_bar.addWidget(self._tip_label, stretch=1)
-
-        layout.addLayout(top_bar)
-
-        # 2. Control Toolbar (Navigation, Crop Spinboxes, Zoom)
-        ctrl_bar = QHBoxLayout()
-        ctrl_bar.setSpacing(8)
-
-        # Navigation
+        # Page Navigation
         self._prev_btn = QPushButton("‹ Prev")
         self._prev_btn.setFixedWidth(65)
         self._prev_btn.clicked.connect(self._go_prev)
@@ -509,56 +570,14 @@ class CropDialog(QDialog):
         self._next_btn.setFixedWidth(65)
         self._next_btn.clicked.connect(self._go_next)
 
-        ctrl_bar.addWidget(self._prev_btn)
-        ctrl_bar.addWidget(self._page_label)
-        ctrl_bar.addWidget(self._next_btn)
-        ctrl_bar.addSpacing(16)
-
-        # Header Crop Spinbox
-        h_label = QLabel("<b>Header Crop:</b>")
-        h_label.setStyleSheet("color: #ff8a80;")
-        self._header_spin = QDoubleSpinBox()
-        self._header_spin.setRange(0.0, 1000.0)
-        self._header_spin.setDecimals(1)
-        self._header_spin.setSingleStep(5.0)
-        self._header_spin.setSuffix(" pt")
-        self._header_spin.setFixedWidth(95)
-        self._header_spin.valueChanged.connect(self._on_header_spin_changed)
-
-        self._clear_h_btn = QPushButton("Clear")
-        self._clear_h_btn.setFixedWidth(50)
-        self._clear_h_btn.setStyleSheet(_CLEAR_BTN_STYLE)
-        self._clear_h_btn.clicked.connect(self._clear_header)
-
-        ctrl_bar.addWidget(h_label)
-        ctrl_bar.addWidget(self._header_spin)
-        ctrl_bar.addWidget(self._clear_h_btn)
-        ctrl_bar.addSpacing(14)
-
-        # Footer Crop Spinbox
-        f_label = QLabel("<b>Footer Crop:</b>")
-        f_label.setStyleSheet("color: #ff8a80;")
-        self._footer_spin = QDoubleSpinBox()
-        self._footer_spin.setRange(0.0, 1000.0)
-        self._footer_spin.setDecimals(1)
-        self._footer_spin.setSingleStep(5.0)
-        self._footer_spin.setSuffix(" pt")
-        self._footer_spin.setFixedWidth(95)
-        self._footer_spin.valueChanged.connect(self._on_footer_spin_changed)
-
-        self._clear_f_btn = QPushButton("Clear")
-        self._clear_f_btn.setFixedWidth(50)
-        self._clear_f_btn.setStyleSheet(_CLEAR_BTN_STYLE)
-        self._clear_f_btn.clicked.connect(self._clear_footer)
-
-        ctrl_bar.addWidget(f_label)
-        ctrl_bar.addWidget(self._footer_spin)
-        ctrl_bar.addWidget(self._clear_f_btn)
-        ctrl_bar.addStretch()
+        top_bar.addWidget(self._prev_btn)
+        top_bar.addWidget(self._page_label)
+        top_bar.addWidget(self._next_btn)
+        top_bar.addStretch()
 
         # Zoom controls
         zoom_out = QPushButton("−")
-        zoom_out.setFixedWidth(32)
+        zoom_out.setFixedWidth(30)
         zoom_out.clicked.connect(lambda: self._set_zoom(self._zoom_factor / 1.2))
 
         self._zoom_label = QLabel("100%")
@@ -566,7 +585,7 @@ class CropDialog(QDialog):
         self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         zoom_in = QPushButton("+")
-        zoom_in.setFixedWidth(32)
+        zoom_in.setFixedWidth(30)
         zoom_in.clicked.connect(lambda: self._set_zoom(self._zoom_factor * 1.2))
 
         fit_w_btn = QPushButton("Fit Width")
@@ -577,13 +596,114 @@ class CropDialog(QDialog):
         fit_p_btn.setFixedWidth(75)
         fit_p_btn.clicked.connect(self._fit_page)
 
-        ctrl_bar.addWidget(zoom_out)
-        ctrl_bar.addWidget(self._zoom_label)
-        ctrl_bar.addWidget(zoom_in)
-        ctrl_bar.addWidget(fit_w_btn)
-        ctrl_bar.addWidget(fit_p_btn)
+        top_bar.addWidget(zoom_out)
+        top_bar.addWidget(self._zoom_label)
+        top_bar.addWidget(zoom_in)
+        top_bar.addWidget(fit_w_btn)
+        top_bar.addWidget(fit_p_btn)
 
-        layout.addLayout(ctrl_bar)
+        layout.addLayout(top_bar)
+
+        # 2. Margins Control Bar (Header, Footer, Left, Right)
+        margins_bar = QHBoxLayout()
+        margins_bar.setSpacing(6)
+
+        # Header Crop Spinbox
+        h_label = QLabel("<b>Header:</b>")
+        h_label.setStyleSheet("color: #ff8a80;")
+        self._header_spin = QDoubleSpinBox()
+        self._header_spin.setRange(0.0, 5000.0)
+        self._header_spin.setDecimals(1)
+        self._header_spin.setSingleStep(5.0)
+        self._header_spin.setSuffix(" pt")
+        self._header_spin.setFixedWidth(82)
+        self._header_spin.valueChanged.connect(self._on_header_spin_changed)
+
+        self._clear_h_btn = QPushButton("✕")
+        self._clear_h_btn.setToolTip("Reset Header crop to 0 pt")
+        self._clear_h_btn.setFixedWidth(28)
+        self._clear_h_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_h_btn.clicked.connect(self._clear_header)
+
+        margins_bar.addWidget(h_label)
+        margins_bar.addWidget(self._header_spin)
+        margins_bar.addWidget(self._clear_h_btn)
+        margins_bar.addSpacing(10)
+
+        # Footer Crop Spinbox
+        f_label = QLabel("<b>Footer:</b>")
+        f_label.setStyleSheet("color: #ff8a80;")
+        self._footer_spin = QDoubleSpinBox()
+        self._footer_spin.setRange(0.0, 5000.0)
+        self._footer_spin.setDecimals(1)
+        self._footer_spin.setSingleStep(5.0)
+        self._footer_spin.setSuffix(" pt")
+        self._footer_spin.setFixedWidth(82)
+        self._footer_spin.valueChanged.connect(self._on_footer_spin_changed)
+
+        self._clear_f_btn = QPushButton("✕")
+        self._clear_f_btn.setToolTip("Reset Footer crop to 0 pt")
+        self._clear_f_btn.setFixedWidth(28)
+        self._clear_f_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_f_btn.clicked.connect(self._clear_footer)
+
+        margins_bar.addWidget(f_label)
+        margins_bar.addWidget(self._footer_spin)
+        margins_bar.addWidget(self._clear_f_btn)
+        margins_bar.addSpacing(10)
+
+        # Left Crop Spinbox
+        l_label = QLabel("<b>Left:</b>")
+        l_label.setStyleSheet("color: #ff8a80;")
+        self._left_spin = QDoubleSpinBox()
+        self._left_spin.setRange(0.0, 5000.0)
+        self._left_spin.setDecimals(1)
+        self._left_spin.setSingleStep(5.0)
+        self._left_spin.setSuffix(" pt")
+        self._left_spin.setFixedWidth(82)
+        self._left_spin.valueChanged.connect(self._on_left_spin_changed)
+
+        self._clear_l_btn = QPushButton("✕")
+        self._clear_l_btn.setToolTip("Reset Left side crop to 0 pt")
+        self._clear_l_btn.setFixedWidth(28)
+        self._clear_l_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_l_btn.clicked.connect(self._clear_left)
+
+        margins_bar.addWidget(l_label)
+        margins_bar.addWidget(self._left_spin)
+        margins_bar.addWidget(self._clear_l_btn)
+        margins_bar.addSpacing(10)
+
+        # Right Crop Spinbox
+        r_label = QLabel("<b>Right:</b>")
+        r_label.setStyleSheet("color: #ff8a80;")
+        self._right_spin = QDoubleSpinBox()
+        self._right_spin.setRange(0.0, 5000.0)
+        self._right_spin.setDecimals(1)
+        self._right_spin.setSingleStep(5.0)
+        self._right_spin.setSuffix(" pt")
+        self._right_spin.setFixedWidth(82)
+        self._right_spin.valueChanged.connect(self._on_right_spin_changed)
+
+        self._clear_r_btn = QPushButton("✕")
+        self._clear_r_btn.setToolTip("Reset Right side crop to 0 pt")
+        self._clear_r_btn.setFixedWidth(28)
+        self._clear_r_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_r_btn.clicked.connect(self._clear_right)
+
+        margins_bar.addWidget(r_label)
+        margins_bar.addWidget(self._right_spin)
+        margins_bar.addWidget(self._clear_r_btn)
+        margins_bar.addSpacing(14)
+
+        # Dynamic Tip & Info label
+        self._tip_label = QLabel(
+            "💡 <b>Drag the red dotted lines</b> (or use spinboxes) to set Header, Footer, and Side crops."
+        )
+        self._tip_label.setStyleSheet("color: #90caf9; font-size: 12px;")
+        margins_bar.addWidget(self._tip_label, stretch=1)
+
+        layout.addLayout(margins_bar)
 
         # 3. Viewer Scene & Canvas
         self._scene = QGraphicsScene(self)
@@ -601,19 +721,26 @@ class CropDialog(QDialog):
 
         self._apply_all_btn = QPushButton("✓ Apply to All Pages")
         self._apply_all_btn.setStyleSheet(_APPLY_ALL_BTN_STYLE)
-        self._apply_all_btn.setToolTip("Apply this Header and Footer crop to all pages in this document.")
+        self._apply_all_btn.setToolTip("Apply these margin crops (Header, Footer, Left, Right) to all pages in this document.")
         self._apply_all_btn.clicked.connect(self._apply_to_all_pages)
 
         self._apply_page_btn = QPushButton("Apply to This Page Only")
         self._apply_page_btn.clicked.connect(self._apply_to_current_page)
 
-        self._clear_all_btn = QPushButton("Clear All Crops")
+        self._clear_page_btn = QPushButton("Clear This Page")
+        self._clear_page_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_page_btn.setToolTip("Clear all 4 margin crops on the current page.")
+        self._clear_page_btn.clicked.connect(self._clear_current_page)
+
+        self._clear_all_btn = QPushButton("Clear All Pages")
         self._clear_all_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_all_btn.setToolTip("Clear all margin crops across all pages of this document.")
         self._clear_all_btn.clicked.connect(self._clear_all_crops)
 
         action_bar.addWidget(self._apply_all_btn)
         action_bar.addWidget(self._apply_page_btn)
-        action_bar.addSpacing(12)
+        action_bar.addSpacing(8)
+        action_bar.addWidget(self._clear_page_btn)
         action_bar.addWidget(self._clear_all_btn)
         action_bar.addStretch()
 
@@ -641,6 +768,14 @@ class CropDialog(QDialog):
         self._footer_line: QGraphicsLineItem | None = None
         self._footer_badge: QGraphicsRectItem | None = None
         self._footer_badge_text: QGraphicsSimpleTextItem | None = None
+        self._left_rect: QGraphicsRectItem | None = None
+        self._left_line: QGraphicsLineItem | None = None
+        self._left_badge: QGraphicsRectItem | None = None
+        self._left_badge_text: QGraphicsSimpleTextItem | None = None
+        self._right_rect: QGraphicsRectItem | None = None
+        self._right_line: QGraphicsLineItem | None = None
+        self._right_badge: QGraphicsRectItem | None = None
+        self._right_badge_text: QGraphicsSimpleTextItem | None = None
 
         self._block_spin_signals = False
 
@@ -670,7 +805,7 @@ class CropDialog(QDialog):
         self._render_current_page()
 
     def _render_current_page(self) -> None:
-        """Display current page with active header and footer dotted lines."""
+        """Display current page with active header, footer, left, and right dotted lines."""
         path = self._current_path()
         meta = self._doc_meta.get(path or "")
         if not meta:
@@ -708,23 +843,33 @@ class CropDialog(QDialog):
         # Scene bounding rect with margin
         self._scene.setSceneRect(-30, -30, page_w_px + 60, page_h_px + 60)
 
-        # Get existing crop for this page (or default 0.0, page_h_pt)
+        # Get existing crop for this page (or default 0.0, page_h_pt, 0.0, page_w_pt)
         page_crops = self._crop_data.get(path, {})
-        header_pt, footer_pt = page_crops.get(self._current_page, (0.0, page_h_pt))
-        header_pt = max(0.0, min(header_pt, page_h_pt))
-        footer_pt = max(0.0, min(footer_pt, page_h_pt))
+        cur_crop = page_crops.get(self._current_page, (0.0, page_h_pt, 0.0, page_w_pt))
+        header_pt = max(0.0, min(float(cur_crop[0]), page_h_pt))
+        footer_pt = max(0.0, min(float(cur_crop[1]), page_h_pt))
+        left_pt = max(0.0, min(float(cur_crop[2]) if len(cur_crop) >= 4 else 0.0, page_w_pt))
+        right_pt = max(0.0, min(float(cur_crop[3]) if len(cur_crop) >= 4 else page_w_pt, page_w_pt))
 
         # Update spinboxes
         self._block_spin_signals = True
         self._header_spin.setMaximum(page_h_pt)
         self._header_spin.setValue(header_pt)
+
         self._footer_spin.setMaximum(page_h_pt)
         footer_from_bot = max(0.0, page_h_pt - footer_pt)
         self._footer_spin.setValue(footer_from_bot)
+
+        self._left_spin.setMaximum(page_w_pt)
+        self._left_spin.setValue(left_pt)
+
+        self._right_spin.setMaximum(page_w_pt)
+        right_from_edge = max(0.0, page_w_pt - right_pt)
+        self._right_spin.setValue(right_from_edge)
         self._block_spin_signals = False
 
         # Build interactive graphic items
-        self._build_overlay_items(page_w_px, page_h_px, header_pt, footer_pt, page_h_pt)
+        self._build_overlay_items(page_w_px, page_h_px, header_pt, footer_pt, left_pt, right_pt, page_h_pt, page_w_pt)
 
     def _build_overlay_items(
         self,
@@ -732,13 +877,18 @@ class CropDialog(QDialog):
         page_h_px: float,
         header_pt: float,
         footer_pt: float,
+        left_pt: float,
+        right_pt: float,
         page_h_pt: float,
+        page_w_pt: float,
     ) -> None:
-        """Create both Header and Footer dotted lines and translucent bands."""
+        """Create Header, Footer, and Side dotted lines and translucent bands."""
         h_y_px = header_pt * RENDER_DPI_SCALE
         f_y_px = footer_pt * RENDER_DPI_SCALE
+        l_x_px = left_pt * RENDER_DPI_SCALE
+        r_x_px = right_pt * RENDER_DPI_SCALE
 
-        # 1. Header Exclusion Rect
+        # 1. Header Exclusion Rect & Line
         self._header_rect = self._scene.addRect(
             QRectF(0, 0, page_w_px, h_y_px),
             Qt.PenStyle.NoPen,
@@ -746,18 +896,16 @@ class CropDialog(QDialog):
         )
         self._header_rect.setZValue(10)
 
-        # 2. Header Dotted Line
         self._header_line = self._scene.addLine(0, h_y_px, page_w_px, h_y_px, _HEADER_PEN)
         self._header_line.setZValue(12)
 
-        # 3. Header Handle Badge
         self._header_badge, self._header_badge_text = self._create_badge(
             text=f"Header: {header_pt:.0f} pt  ↕ drag",
-            y_px=h_y_px,
-            is_header=True,
+            x_px=24.0,
+            y_px=max(0.0, h_y_px - 22.0),
         )
 
-        # 4. Footer Exclusion Rect
+        # 2. Footer Exclusion Rect & Line
         self._footer_rect = self._scene.addRect(
             QRectF(0, f_y_px, page_w_px, page_h_px - f_y_px),
             Qt.PenStyle.NoPen,
@@ -765,30 +913,67 @@ class CropDialog(QDialog):
         )
         self._footer_rect.setZValue(10)
 
-        # 5. Footer Dotted Line
         self._footer_line = self._scene.addLine(0, f_y_px, page_w_px, f_y_px, _FOOTER_PEN)
         self._footer_line.setZValue(12)
 
-        # 6. Footer Handle Badge
         footer_from_bot = max(0.0, page_h_pt - footer_pt)
         self._footer_badge, self._footer_badge_text = self._create_badge(
             text=f"Footer: {footer_from_bot:.0f} pt  ↕ drag",
-            y_px=f_y_px,
-            is_header=False,
+            x_px=24.0,
+            y_px=min(page_h_px - 22.0, f_y_px),
+        )
+
+        # 3. Left Side Exclusion Rect & Line
+        self._left_rect = self._scene.addRect(
+            QRectF(0, 0, l_x_px, page_h_px),
+            Qt.PenStyle.NoPen,
+            _CROP_OVERLAY_BRUSH,
+        )
+        self._left_rect.setZValue(10)
+
+        self._left_line = self._scene.addLine(l_x_px, 0, l_x_px, page_h_px, _LEFT_PEN)
+        self._left_line.setZValue(12)
+
+        left_badge_x = max(0.0, l_x_px - 145.0) if l_x_px > 145.0 else l_x_px + 4.0
+        left_badge_y = min(page_h_px - 26.0, max(28.0, page_h_px * 0.35))
+        self._left_badge, self._left_badge_text = self._create_badge(
+            text=f"Left: {left_pt:.0f} pt  ↔ drag",
+            x_px=left_badge_x,
+            y_px=left_badge_y,
+            width=145.0,
+        )
+
+        # 4. Right Side Exclusion Rect & Line
+        self._right_rect = self._scene.addRect(
+            QRectF(r_x_px, 0, page_w_px - r_x_px, page_h_px),
+            Qt.PenStyle.NoPen,
+            _CROP_OVERLAY_BRUSH,
+        )
+        self._right_rect.setZValue(10)
+
+        self._right_line = self._scene.addLine(r_x_px, 0, r_x_px, page_h_px, _RIGHT_PEN)
+        self._right_line.setZValue(12)
+
+        right_from_edge = max(0.0, page_w_pt - right_pt)
+        right_badge_x = min(page_w_px - 145.0, r_x_px - 149.0) if r_x_px >= 149.0 else r_x_px + 4.0
+        right_badge_y = min(page_h_px - 26.0, max(28.0, page_h_px * 0.55))
+        self._right_badge, self._right_badge_text = self._create_badge(
+            text=f"Right: {right_from_edge:.0f} pt  ↔ drag",
+            x_px=right_badge_x,
+            y_px=right_badge_y,
+            width=145.0,
         )
 
         # Update view bounds for mouse dragging
-        self._view.set_bounds(page_w_px, page_h_px, h_y_px, f_y_px)
+        self._view.set_bounds(page_w_px, page_h_px, h_y_px, f_y_px, l_x_px, r_x_px)
 
     def _create_badge(
-        self, text: str, y_px: float, is_header: bool
+        self, text: str, x_px: float, y_px: float, width: float = 160.0
     ) -> tuple[QGraphicsRectItem, QGraphicsSimpleTextItem]:
-        badge_w, badge_h = 160.0, 22.0
-        badge_x = 24.0
-        badge_y = y_px - badge_h if is_header else y_px
+        badge_w, badge_h = width, 22.0
 
         rect_item = self._scene.addRect(
-            QRectF(badge_x, badge_y, badge_w, badge_h),
+            QRectF(x_px, y_px, badge_w, badge_h),
             _HANDLE_BORDER_PEN,
             _HANDLE_BG_BRUSH,
         )
@@ -798,7 +983,7 @@ class CropDialog(QDialog):
         font = QFont("Segoe UI", 8, QFont.Weight.Bold)
         text_item.setFont(font)
         text_item.setBrush(QBrush(QColor(255, 255, 255)))
-        text_item.setPos(badge_x + 8, badge_y + 3)
+        text_item.setPos(x_px + 8, y_px + 3)
         text_item.setZValue(16)
 
         return rect_item, text_item
@@ -814,15 +999,20 @@ class CropDialog(QDialog):
             return
 
         page_h_pt = meta["heights_pt"][self._current_page - 1]
-        page_w_px = meta["widths_pt"][self._current_page - 1] * RENDER_DPI_SCALE
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
+        page_w_px = page_w_pt * RENDER_DPI_SCALE
         page_h_px = page_h_pt * RENDER_DPI_SCALE
 
         page_crops = self._crop_data.setdefault(path, {})
-        cur_header_pt, cur_footer_pt = page_crops.get(self._current_page, (0.0, page_h_pt))
+        cur_crop = page_crops.get(self._current_page, (0.0, page_h_pt, 0.0, page_w_pt))
+        cur_header_pt = cur_crop[0]
+        cur_footer_pt = cur_crop[1]
+        cur_left_pt = cur_crop[2] if len(cur_crop) >= 4 else 0.0
+        cur_right_pt = cur_crop[3] if len(cur_crop) >= 4 else page_w_pt
 
         if which == "header":
             header_pt = max(0.0, min(val_pt, cur_footer_pt - 5.0))
-            page_crops[self._current_page] = (header_pt, cur_footer_pt)
+            page_crops[self._current_page] = (header_pt, cur_footer_pt, cur_left_pt, cur_right_pt)
 
             h_y_px = header_pt * RENDER_DPI_SCALE
             if self._header_rect:
@@ -842,7 +1032,7 @@ class CropDialog(QDialog):
 
         elif which == "footer":
             footer_pt = max(cur_header_pt + 5.0, min(val_pt, page_h_pt))
-            page_crops[self._current_page] = (cur_header_pt, footer_pt)
+            page_crops[self._current_page] = (cur_header_pt, footer_pt, cur_left_pt, cur_right_pt)
 
             f_y_px = footer_pt * RENDER_DPI_SCALE
             if self._footer_rect:
@@ -862,9 +1052,60 @@ class CropDialog(QDialog):
             self._footer_spin.setValue(footer_from_bot)
             self._block_spin_signals = False
 
+        elif which == "left":
+            left_pt = max(0.0, min(val_pt, cur_right_pt - 5.0))
+            page_crops[self._current_page] = (cur_header_pt, cur_footer_pt, left_pt, cur_right_pt)
+
+            l_x_px = left_pt * RENDER_DPI_SCALE
+            if self._left_rect:
+                self._left_rect.setRect(0, 0, l_x_px, page_h_px)
+            if self._left_line:
+                self._left_line.setLine(l_x_px, 0, l_x_px, page_h_px)
+            if self._left_badge and self._left_badge_text:
+                badge_w, badge_h = 145.0, 22.0
+                bx = max(0.0, l_x_px - badge_w) if l_x_px > badge_w else l_x_px + 4.0
+                by = min(page_h_px - 26.0, max(28.0, page_h_px * 0.35))
+                self._left_badge.setRect(bx, by, badge_w, badge_h)
+                self._left_badge_text.setPos(bx + 8, by + 3)
+                self._left_badge_text.setText(f"Left: {left_pt:.0f} pt  ↔ drag")
+
+            self._block_spin_signals = True
+            self._left_spin.setValue(left_pt)
+            self._block_spin_signals = False
+
+        elif which == "right":
+            right_pt = max(cur_left_pt + 5.0, min(val_pt, page_w_pt))
+            page_crops[self._current_page] = (cur_header_pt, cur_footer_pt, cur_left_pt, right_pt)
+
+            r_x_px = right_pt * RENDER_DPI_SCALE
+            if self._right_rect:
+                self._right_rect.setRect(r_x_px, 0, page_w_px - r_x_px, page_h_px)
+            if self._right_line:
+                self._right_line.setLine(r_x_px, 0, r_x_px, page_h_px)
+            if self._right_badge and self._right_badge_text:
+                badge_w, badge_h = 145.0, 22.0
+                bx = min(page_w_px - badge_w, r_x_px - (badge_w + 4.0)) if r_x_px >= (badge_w + 4.0) else r_x_px + 4.0
+                by = min(page_h_px - 26.0, max(28.0, page_h_px * 0.55))
+                self._right_badge.setRect(bx, by, badge_w, badge_h)
+                self._right_badge_text.setPos(bx + 8, by + 3)
+                right_from_edge = max(0.0, page_w_pt - right_pt)
+                self._right_badge_text.setText(f"Right: {right_from_edge:.0f} pt  ↔ drag")
+
+            self._block_spin_signals = True
+            right_from_edge = max(0.0, page_w_pt - right_pt)
+            self._right_spin.setValue(right_from_edge)
+            self._block_spin_signals = False
+
         # Update view bounds
-        h_pt, f_pt = page_crops[self._current_page]
-        self._view.set_bounds(page_w_px, page_h_px, h_pt * RENDER_DPI_SCALE, f_pt * RENDER_DPI_SCALE)
+        h_pt, f_pt, l_pt, r_pt = page_crops[self._current_page]
+        self._view.set_bounds(
+            page_w_px,
+            page_h_px,
+            h_pt * RENDER_DPI_SCALE,
+            f_pt * RENDER_DPI_SCALE,
+            l_pt * RENDER_DPI_SCALE,
+            r_pt * RENDER_DPI_SCALE,
+        )
 
     def _on_drag_finished(self) -> None:
         path = self._current_path()
@@ -874,11 +1115,18 @@ class CropDialog(QDialog):
         if not meta:
             return
         page_h_pt = meta["heights_pt"][self._current_page - 1]
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
         page_crops = self._crop_data.get(path, {})
-        h_pt, f_pt = page_crops.get(self._current_page, (0.0, page_h_pt))
+        cur_crop = page_crops.get(self._current_page, (0.0, page_h_pt, 0.0, page_w_pt))
+        h_pt = cur_crop[0]
+        f_pt = cur_crop[1]
+        l_pt = cur_crop[2] if len(cur_crop) >= 4 else 0.0
+        r_pt = cur_crop[3] if len(cur_crop) >= 4 else page_w_pt
         f_from_bot = max(0.0, page_h_pt - f_pt)
+        r_from_edge = max(0.0, page_w_pt - r_pt)
         self._tip_label.setText(
-            f"Page {self._current_page}: Header <b>{h_pt:.0f} pt</b>, Footer <b>{f_from_bot:.0f} pt</b>. "
+            f"Page {self._current_page}: Top <b>{h_pt:.0f} pt</b>, Bottom <b>{f_from_bot:.0f} pt</b>, "
+            f"Left <b>{l_pt:.0f} pt</b>, Right <b>{r_from_edge:.0f} pt</b>. "
             f"Click <b>Apply to All Pages</b> to set across all pages."
         )
 
@@ -902,6 +1150,22 @@ class CropDialog(QDialog):
         footer_pt = max(0.0, page_h_pt - val_from_bottom)
         self._on_line_dragged("footer", footer_pt)
 
+    def _on_left_spin_changed(self, val_from_left: float) -> None:
+        if self._block_spin_signals:
+            return
+        self._on_line_dragged("left", val_from_left)
+
+    def _on_right_spin_changed(self, val_from_right: float) -> None:
+        if self._block_spin_signals:
+            return
+        path = self._current_path()
+        meta = self._doc_meta.get(path or "")
+        if not meta:
+            return
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
+        right_pt = max(0.0, page_w_pt - val_from_right)
+        self._on_line_dragged("right", right_pt)
+
     def _clear_header(self) -> None:
         self._on_line_dragged("header", 0.0)
 
@@ -913,42 +1177,74 @@ class CropDialog(QDialog):
         page_h_pt = meta["heights_pt"][self._current_page - 1]
         self._on_line_dragged("footer", page_h_pt)
 
+    def _clear_left(self) -> None:
+        self._on_line_dragged("left", 0.0)
+
+    def _clear_right(self) -> None:
+        path = self._current_path()
+        meta = self._doc_meta.get(path or "")
+        if not meta:
+            return
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
+        self._on_line_dragged("right", page_w_pt)
+
+    def _clear_current_page(self) -> None:
+        path = self._current_path()
+        meta = self._doc_meta.get(path or "")
+        if not meta:
+            return
+        page_h_pt = meta["heights_pt"][self._current_page - 1]
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
+        page_crops = self._crop_data.setdefault(path, {})
+        page_crops[self._current_page] = (0.0, page_h_pt, 0.0, page_w_pt)
+        self._render_current_page()
+        self._tip_label.setText(f"Cleared all margin crops for page {self._current_page}.")
+
     # ------------------------------------------------------------------
     # Apply Actions
     # ------------------------------------------------------------------
 
     def _apply_to_all_pages(self) -> None:
-        """Apply current header & footer margins to ALL pages of this document."""
+        """Apply current header, footer, and side margins to ALL pages of this document."""
         path = self._current_path()
         meta = self._doc_meta.get(path or "")
         if not meta:
             return
 
         page_h_pt = meta["heights_pt"][self._current_page - 1]
+        page_w_pt = meta["widths_pt"][self._current_page - 1]
         page_crops = self._crop_data.setdefault(path, {})
-        cur_header_pt, cur_footer_pt = page_crops.get(self._current_page, (0.0, page_h_pt))
+        cur_crop = page_crops.get(self._current_page, (0.0, page_h_pt, 0.0, page_w_pt))
+        cur_header_pt = cur_crop[0]
+        cur_footer_pt = cur_crop[1]
+        cur_left_pt = cur_crop[2] if len(cur_crop) >= 4 else 0.0
+        cur_right_pt = cur_crop[3] if len(cur_crop) >= 4 else page_w_pt
+
         footer_margin_pt = max(0.0, page_h_pt - cur_footer_pt)
+        right_margin_pt = max(0.0, page_w_pt - cur_right_pt)
 
         total_pages = meta["page_count"]
         for p in range(1, total_pages + 1):
             p_height = meta["heights_pt"][p - 1]
+            p_width = meta["widths_pt"][p - 1]
             p_footer_pt = max(0.0, p_height - footer_margin_pt)
-            page_crops[p] = (cur_header_pt, p_footer_pt)
+            p_right_pt = max(0.0, p_width - right_margin_pt)
+            page_crops[p] = (cur_header_pt, p_footer_pt, cur_left_pt, p_right_pt)
 
         self._tip_label.setText(
             f"✅ <b>Applied to all {total_pages} pages:</b> Header {cur_header_pt:.0f} pt, "
-            f"Footer {footer_margin_pt:.0f} pt from bottom."
+            f"Footer {footer_margin_pt:.0f} pt, Left {cur_left_pt:.0f} pt, Right {right_margin_pt:.0f} pt."
         )
 
     def _apply_to_current_page(self) -> None:
-        self._tip_label.setText(f"✅ Saved crop for page {self._current_page}.")
+        self._tip_label.setText(f"✅ Saved crops for page {self._current_page}.")
 
     def _clear_all_crops(self) -> None:
         path = self._current_path()
         if path and path in self._crop_data:
             self._crop_data[path] = {}
         self._render_current_page()
-        self._tip_label.setText("Crops cleared for this document.")
+        self._tip_label.setText("All crops cleared for this document.")
 
     # ------------------------------------------------------------------
     # Navigation & Zoom
@@ -1005,17 +1301,22 @@ class CropDialog(QDialog):
     # Public API
     # ------------------------------------------------------------------
 
-    def get_crop_data(self) -> dict[str, dict[int, tuple[float, float]]]:
+    def get_crop_data(self) -> dict[str, dict[int, tuple[float, float, float, float]]]:
         """Return clean crop data for both documents."""
-        result: dict[str, dict[int, tuple[float, float]]] = {}
+        result: dict[str, dict[int, tuple[float, float, float, float]]] = {}
         for path, pages in self._crop_data.items():
             meta = self._doc_meta.get(path)
             clean_pages = {}
-            for p, (h, f) in pages.items():
+            for p, crop in pages.items():
                 p_h = meta["heights_pt"][p - 1] if meta and p <= len(meta["heights_pt"]) else 800.0
+                p_w = meta["widths_pt"][p - 1] if meta and p <= len(meta["widths_pt"]) else 600.0
+                h = float(crop[0])
+                f = float(crop[1])
+                l = float(crop[2]) if len(crop) >= 4 else 0.0
+                r = float(crop[3]) if len(crop) >= 4 else p_w
                 # Keep only meaningful crops
-                if h > 0.0 or f < p_h:
-                    clean_pages[p] = (h, f)
+                if h > 0.0 or f < p_h or l > 0.0 or r < p_w:
+                    clean_pages[p] = (h, f, l, r)
             if clean_pages:
                 result[path] = clean_pages
         return result

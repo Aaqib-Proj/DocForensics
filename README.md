@@ -2021,3 +2021,342 @@ pages with only a few words could change results.
 Checked in smoke TEST 33 (fast table geometry against pdfplumber's on
 random grids, rotated coordinates against PyMuPDF's, a rotated page
 reading in order).
+
+## 41. Dense outserts: columns merged, hundreds of false "moved" rows
+
+An FPL compared with its printed outsert (Pioglitazone HCl, two 1,950pt
+sheets, five 6pt columns each) gave 1,289 rows, **512 of them "moved"**:
+most were identical text, the rest wrong pairings ("Hold the" against
+"Fever - Itching..." on another pair). Cause: the two documents were
+read in different orders, because whole columns were merged into one
+band and read line by line across all of them -- body text interleaved
+with the tables beside it, every interruption a "moved" fragment.
+
+Two defects in `_detect_column_bands`, both now fixed:
+
+* **A few full-width lines vetoed real gutters.** Gutters that no line
+  crosses are preferred (exact edges), and if they gave 2+ columns the
+  tolerant search -- which allows a few crossing lines -- never ran. The
+  outsert's artwork-information block crosses the gutters of the middle
+  columns only, so those three columns became one 1,000pt band. A gutter
+  the tolerant search finds strictly INSIDE a clean-gutter band now
+  splits it (`_split_bands_at_interior_gutters`); clean gutters keep
+  their exact edges.
+* **Gutters were measured too narrow.** Widths were counted in whole-point
+  buckets with each edge rounded outward, losing up to ~2.5pt: the FPL's
+  real 8.1-8.5pt gutters read as 6pt against a 6.4pt minimum. The run is
+  now also measured exactly, between the fractional text edges bounding
+  it.
+
+And two "moved" rules in the engine:
+
+* **A replacement is never relabelled "moved"** (`healthcare` -> `health`
+  had been, because document-wide word counts balanced in a label where
+  "doctor" became "healthcare provider" throughout). Moves come from the
+  moved-text pass, which reports the edits inside them separately.
+* **A "Reordered Section" row needs titles that name the same section**
+  (0.75 alike, number ignored): "5.2 Pancreatitis" -> "5.1 Pancreatitis"
+  is a move; "2.1 Recommendations for All Patients" -> "2.1 Important
+  Dosage and Administration Information" (0.41) is a retitling, already
+  reported as an edit.
+
+Result: the FPL pair 1,289 -> 925 rows, **moved 512 -> 75** (47 identical
+body passages, 11 identical table rows, 12 passages whose inner edits
+are reported separately, 5 renumbered sections). The remaining rows are
+genuine revisions between the two labels ("hydrochloride" -> "HCl",
+"doctor" -> "healthcare provider", "(N=2633)" -> "(N=2,633)"...). The
+pixel-leaflet pair, hit by the same column merge, went 60 -> 24 rows,
+moved 27 -> 0; every critical row it lost was a wrong pairing. All other
+real pairs: row-for-row identical. Smoke TEST 34 rebuilds the outsert's
+geometry and fails on the old code.
+
+## 42. Merged outserts against a Word draft: Highlights, running heads, sheet order
+
+A merged Front/Back outsert compared with its 34-page Word draft paired
+Highlights text with the Medication Guide ("Nonsteroidal
+anti-inflammatory drugs (NSAIDS):" against "Talk to your doctor about
+other ways...", "the developing fetus (5.1, 8.1)" against "an unborn
+baby."), and listed the Word page header/footer 31 times. Four causes:
+
+* **Two-column blocks inside one page column** (`_sub_column_segments`).
+  The Highlights box (and the Contents list below it) is set as two
+  narrow columns inside the sheet's first column, with a 4.9pt gutter --
+  below what a page or a heading-sized zone accepts -- so both columns
+  were read line by line together. A block is now recognised only on
+  overwhelming evidence: 25+ consecutive lines with the same strip empty
+  in every one (at least 4pt and 2.5x the word spacing), text on both
+  sides in 60% of them, and two sub-columns of comparable width measured
+  on the lines that reach the gutter. Each strip is followed separately,
+  so a barcode strip's margin beside the gutter does not hide it. A
+  horizontal rule across the gutter ends one block and starts the next:
+  the Highlights finish ("Revised: 03/2026") before the Contents begin.
+  A column with no such block is processed exactly as before.
+* **Running headers/footers** (`core/page_furniture.py`). A short line
+  (at most 12 words) that is the first or last line on at least 80% of a
+  document's pages (and 3+ pages), numbers ignored ("Page 17 of 34"), is
+  compared ONCE -- its repeats are left out, so a changed header is still
+  reported. Not when the other document repeats the same line too (the
+  copies line up), not for long body lines, never for 1-2 page
+  documents. The status bar names what was compared once.
+* **Sheet order when merging** (`natural_sort_key`). Files were added in
+  name order, which puts "... Back.pdf" before "... Front.pdf", so the
+  back of the sheet came first and every section on it read as moved.
+  Front/Back, Recto/Verso and Outside/Inside now default to reading order
+  (the list can still be reordered by hand).
+* **A moved passage whose other copy differs only in punctuation** (a
+  heading's dash rule of a different length) now shows both positions
+  instead of an empty side.
+
+Results against the previous build (corpus, `snap.py`):
+
+| pair | rows | moved |
+|---|---|---|
+| Amlo merged outsert (Back first) vs Word draft | 260 -> 128 | 83 -> 20 |
+| same, merged Front first | 254 -> 120 | 86 -> 14 |
+| Pioglitazone FPL vs outsert | 925 -> 908 | 75 -> 50 |
+| all 10 other real pairs | row-for-row identical | |
+
+Reading-order agreement (shared unique 8-word anchors in the same order):
+Amlo 99.7% -> 99.9% (order breaks 43 -> 30), FPL 97.2% -> 98.2%. Smoke
+TEST 35 covers the block detection, rule cuts, the furniture rules and
+the sheet order.
+
+## 43. "Identical": repeated differences, once each, every occurrence in view
+
+A new chip at the end of the Show row, **Identical N** (N = how many
+differences occur more than once). Off by default. Ticked, the list
+holds only the repeated differences -- same text, same change -- each
+set as ONE row with its count (e.g. `Olmesartan` -> `olmesartan` x11).
+It works on its own: with no category chip ticked it lists every
+repeated difference; with some ticked, only the repeated ones in those
+categories. It combines with the other filters, and counts what is
+actually listed:
+a set whose other copies are hidden (accepted, with "Hide reviewed") is
+no longer listed as repeated. One Accept/Reject on the row decides every
+copy, as with "Group identical" (which still groups everything,
+single differences included).
+
+In the comparator, for a repeated set:
+
+* **Context** lists every occurrence in its own surrounding words, both
+  sides, numbered with its page (`#1 - page 1`, `#2 - page 1`); the one
+  shown in the documents is marked.
+* **Letters** gives the letter-by-letter comparison once -- the copies
+  are identical letter for letter, which is what makes them a set -- then
+  where every occurrence is (Original page / Suspect page).
+* Clicking a number in either list takes both documents to that
+  occurrence (as the occurrence stepper does).
+
+Checked in GUI step 25.
+
+**Select All / Unselect All** opens the Show row. With every category
+ticked it reads "Unselect All" and unticks every chip, Identical too (the
+list empties); otherwise it reads "Select All" and ticks every category.
+Identical is left as it was on Select All, because it narrows the list to
+repeated differences rather than adding rows. One table refresh either
+way, however many chips change. Checked in GUI step 26.
+
+## 44. Rematch: short differences, and pairing two passages by hand
+
+**Short differences are rematched, not refused.** Rematch used to turn
+away anything under four words ("Too short to rematch on its own"), and
+most real differences are one to three words. A row's own coordinates
+already say exactly which words it is, so a short row is now rematched
+like a long one -- through its PARAGRAPH, never as a bare word (a stray
+"4" elsewhere still cannot stand in for a dosage change). Inside the
+partner paragraph the text is found by the words around it: up to six
+words just before and just after it, compared without case or
+punctuation (those do not move a sentence), located nearest to where the
+alignment put it. A placement far from there is accepted only on the
+full surroundings on both sides, and only if there is one. (Only a row
+with no coordinates is still refused when short: that one would have to
+be found by searching for its text.)
+
+What a short rematch can answer:
+
+* **the difference stands** -- the same change again, or nothing in the
+  other document reads closer to this text than what it is paired with.
+  The row, and any decision on it, is left untouched;
+* **no difference after all** -- the surrounding words find the same
+  text (a sentence reworded before it, e.g. `edema,` paired with the
+  wrong "edema");
+* **a closer counterpart** -- e.g. `Table 7.` paired with `Table 8:`
+  becomes `7.` -> `7:`. A short row is re-paired only with text clearly
+  more alike than before; a removed/added one only with text that reads
+  alike.
+
+Whenever a rematch re-pairs a row, the other document's text that the
+old row had paired it with -- and the new pairing does not use -- is
+listed as removed/added, never silently dropped. A "section in a
+different order" row is not rematched: it reports order, which matching
+the text cannot undo.
+
+On the FPL outsert (690 short rows) a rematch now leaves 668 standing,
+re-pairs 11, removes 1; on the merged Amlo leaflet (98) 72 stand, 1 is
+re-paired. The case and punctuation changes in both stand.
+
+**Rematch Areas** -- the manual version, for when the reviewer knows
+what corresponds to what (the toolbar's *Rematch Areas*, Review menu,
+Ctrl+Shift+A):
+
+1. Click **Rematch Areas**, then drag a box around the text in the
+   Original and around its counterpart in the Suspect. The two are
+   compared as soon as both are drawn. (Shift+drag draws a box at any
+   time without the button; Ctrl+drag / Ctrl+Shift+drag adds another
+   box -- a passage running into the next column or page; Esc clears.)
+2. The words inside the two boxes are compared with each other and
+   nothing else (`core/rematch.rematch_areas`). Every row with text in
+   either box is replaced by that comparison's rows.
+3. Text outside the boxes that was paired with text inside them -- by a
+   row reaching out of a box, or word for word -- has lost its partner
+   and is listed as removed/added; the status line says how many words.
+   Each such row carries its insertion point in the other document --
+   right after the partner of the nearest still-paired word before it
+   (or before the one after it) -- so selecting it marks one spot there.
+   (Without one the viewer mirrored the row's own boxes onto the other
+   document at the same coordinates: dashed boxes over unrelated text,
+   e.g. across the SPL's table of contents.) The same goes for text a
+   single-row rematch leaves unpaired.
+4. The word pairing follows (clicking text in one viewer finds the new
+   partner in the other), and **Undo Rematch** (Ctrl+Shift+Z) puts the
+   rows and the pairing back. Every rematch is in the report's log.
+
+Drawn around paragraphs the comparison already paired correctly, Rematch
+Areas gives back exactly the rows it had (checked on the Amlo leaflet's
+busiest paragraphs). Checked in smoke TEST 24 and GUI step 27.
+
+## 45. A Word draft against an SPL: what was compared that should not have been
+
+`draft-lab-text-tpl-word - final.docx` (68 pages, laid out by Word)
+against `SPL-comment.pdf` (34 pages, printed from a browser) listed 629
+rows, 268 critical. Now 288 rows, 85 critical, every one checked. About
+170 of the rest are minor and genuine: the SPL really prints its
+cross-references as `( 5.4)` and `≥126` where the draft has `(5.4)` and
+`≥ 126` ("Ignore minor and below" hides them). The rest is real content:
+`lithum`, `Adolsecents`, `INDIA`, `6,173`/`6173`, `mg/m2`, header text the
+SPL clips (`Placeb`, `hyd (N=150`), and the SPL's product-data pages.
+
+What was fixed, each one general rather than for this file:
+
+* **Text outside the page.** The browser printed its header ("These
+  highlights do not include ... Page 4 of 34", the date, a `file://` path)
+  ABOVE each page's crop box -- invisible, but read and compared on all 34
+  pages; and because "Page N of 34" then repeated in the SPL, the draft's
+  own "Page N of 68" footer was not recognised as a running footer either.
+  A word now counts as on the page only when its centre is inside the
+  visible area (`core/pdf_extractor.py`, the canvas filter).
+* **Wingdings bullets.** U+F06C (Wingdings "l", a round bullet, as a
+  private-use code) is normalised to `•` like the other bullet codes.
+* **Words broken at their own hyphen.** "placebo-" at the end of a line and
+  "treated" on the next were always read "placebotreated", so either side
+  could show `placebo-treated` against `placebotreated` -- 46 rows. Neither
+  Word nor a browser hyphenates on its own. Now the words printed whole on
+  one line, in either document, decide: if the word appears there with the
+  hyphen and never without, the stitched word keeps it
+  (`diff_engine._harmonize_line_break_hyphens`, decided afresh for every
+  comparison). "age- and sex-matched" is no longer stitched into `ageand`.
+* **Subscripts set a space's width away.** The SPL sets `C<sub>max</sub>`
+  and `D<sub>2</sub>` 1.9pt after the base letter; the detector allowed
+  1.5pt, so `max` and `2` were words of their own and `C max` against
+  `Cₘₐₓ` was a CRITICAL rewording. A script glyph may now sit up to 0.3em
+  from its base (size and baseline tests unchanged), so it is a spacing
+  difference.
+* **Table rows whose cells have different numbers of lines.** Borderless
+  tables were read line by line, and a header like `20 / mg/day` beside a
+  vertically centred `Placebo` reads differently in every layout ("20 40 80
+  120 160 Placebo mg/day ..." vs "20 Placebo 40 mg/day ..."). Such a row is
+  now read cell by cell ("Placebo 20 mg/day 40 mg/day ...") when a word
+  straddles two lines (overlapping each by a quarter of its height, which
+  ordinary lines never do), or when a line continues the cells of the line
+  above one for one with nothing under the label column ("-1.9 / (n=672)").
+  Only for text of one size in at least three columns; everything else is
+  read line by line exactly as before (`_read_lines`).
+* **Dash rules.** `-------- DOSAGE AND ADMINISTRATION --------` (Word) and
+  `-----DOSAGE AND ADMINISTRATION-----` (outsert) carry no text; the rules
+  are left out of the comparison and taken off the heading words.
+* **One spacing difference, one row.** `(5.2)] .` against `( 5.2) ].` was
+  split character by character into an inserted `(` and two changed
+  fragments; spans that differ only in spacing are now one row.
+
+Elsewhere in the corpus only false rows went: 46 -> 19 on the sample 2
+DOCX/PDF pair (hyphens and dash rules), 128 -> 103 on the merged Amlo
+leaflet, 908 -> 894 on the FPL outsert. On the FPL every critical row's
+words are still reported (only two underscore rules are gone). One table
+there (its Sulfonylurea/Insulin headers) is now read cell by cell in the
+outsert but not in the FPL, whose cells sit on one line grid with nothing
+straddling: those headers differed before and still do. Checked in smoke
+TEST 36.
+
+## 46. Tables, round two: the same table read the same way, however it is drawn
+
+After section 45 the SPL comparison still had tables misread on one side
+(screenshots: Table 15, Table 19, Table 24, the adverse-reactions table
+continued over a page break, the dosage-forms table continued on the next
+page). Each was a different layout of the same table. All now read word for
+word alike on both sides:
+
+* **Tables taken for columns of text.** A table continued at the top of a
+  page, with no heading above it, was split into "columns" and read one
+  column top to bottom, then the next: every label, then every number. A
+  zone of three or more bands is now a table when most bands are too narrow
+  for running text (< 50pt) or hold only a few words a line (< 4 on
+  average); it is read line by line with table rows read cell by cell. A
+  column of bulleted items ("• ritonavir | • carbamazepine | • rifampin") is
+  a list, read column by column as before.
+* **Ruled grids with a row per line.** The SPL draws "+0.10" and "(n=103)"
+  in separate grid rows of one record; the Word draft has one row of
+  two-line cells. A grid row with no label whose cells all sit under filled
+  cells of the labelled row above is now read as the second line of those
+  cells, as the borderless table is.
+* **Headers stacked in columns** ("Lurasidone / hydrochloride tablets" over
+  each dose, "Sildenafil / tablets / 20 mg / (n = 69)", "First / Event")
+  read column by column when the lines line up one for one and none of them
+  starts in the row-label column (a first cell over a value column is not a
+  label). Inside a grid cell drawn around a whole header, likewise.
+* **Row labels wrapped onto a line of their own** belong to the row they sit
+  closer to: "Pain in" / "Limb" (0.5pt apart, rows 2.8pt apart) is one label;
+  "Extrapyramidal" over "Disorder** 6 6 11 ..." starts the next row's label.
+  Only at exactly the label's indent, so a group heading ("Nervous System
+  Disorders") is never absorbed.
+
+Results: SPL-comment against the Word draft 288 -> 266 rows (critical 85 ->
+73); SBS-R against its Word draft 110 -> 92 (critical 58 -> 40); the FPL
+outsert's Sulfonylurea/Insulin/Metformin table headers, left different in
+section 45, now agree (894 -> 888). Every other pair is unchanged, and every
+row that disappeared is a table misreading (checked: no critical difference's
+words stopped being reported). Still different: the efficacy tables (Table
+35 of the SPL), where the SPL stacks three treatment groups in one row
+beside a centred study number and the draft gives each group its own row.
+Checked in smoke TEST 37.
+
+## 47. Find bar: search each document's text
+
+Each viewer (Original and Suspect) has its own Find bar under its page and
+zoom controls. Type a word or a sentence: after a short pause every match is
+tinted green, and the view goes to the first match at or below what is on
+screen, outlined. "3 of 12" shows where you are.
+
+* **Enter / Shift+Enter** (or the ↓ / ↑ buttons, or **F3 / Shift+F3** for the
+  last used viewer) step to the next / previous match, wrapping around the
+  document. **Esc** in the Find bar clears the search (it does not clear the
+  areas drawn for Rematch Areas). **Ctrl+Shift+F** puts the cursor in the last
+  used viewer's Find bar (Ctrl+F still filters the results list).
+* **Aa** matches case; **Whole word** matches whole words only ("mg" does not
+  find "mgs").
+* A sentence is found across line and page breaks (one box per line).
+  Curly and straight quotes, the various dashes and ligatures (ﬁ, ﬂ) match
+  each other, and runs of spaces in the query match any single break.
+* Part of a word is boxed as that part ("disorder" inside "disorder,").
+  Rotated pages are boxed where the page is drawn.
+* The text is read in the background when a document opens (about half a
+  second for a 34-page SPL), so opening never waits; a search typed before
+  then shows "Reading…" and runs as soon as the text is ready. A new document
+  keeps the query and shows its own matches.
+* With **Lock views** on, the other viewer follows a match the way it follows
+  scrolling.
+
+What is searched is the PDF's own text layer, the same one the comparison
+reads (`core/text_search.py`, Qt-free). A Word document laid out by Word is
+searched in that layout; one shown as an approximate layout is searched in
+the words drawn there. A scanned page with no text layer has nothing to find.
+Checked in smoke TEST 38 and GUI step 28.

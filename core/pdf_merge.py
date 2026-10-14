@@ -24,9 +24,19 @@ logger = logging.getLogger(__name__)
 SUPPORTED_MERGE_EXTENSIONS = (".pdf", ".docx")
 
 
+# The two sides of one printed sheet, in reading order. Alphabetically
+# "Back" sorts before "Front", so a leaflet added as "X Front.pdf" and
+# "X Back.pdf" was merged back to front: every section of the back read
+# as moved against a document in reading order.
+_SIDE_ORDER = {"front": "0", "back": "1", "recto": "0", "verso": "1", "outside": "0", "inside": "1"}
+_SIDE_RE = re.compile(r"(?<![a-z])(" + "|".join(_SIDE_ORDER) + r")(?![a-z])")
+
+
 def natural_sort_key(s: str) -> list[int | str]:
-    """Key for natural human sorting (e.g., 'part1', 'part2', 'part10')."""
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r"(\d+)", s)]
+    """Key for natural human sorting (e.g., 'part1', 'part2', 'part10'),
+    with the sides of a sheet in reading order ('front' before 'back')."""
+    s = _SIDE_RE.sub(lambda m: "\x00side" + _SIDE_ORDER[m.group(1)], s.lower())
+    return [int(text) if text.isdigit() else text for text in re.split(r"(\d+)", s)]
 
 
 def merge_cache_dir() -> str:

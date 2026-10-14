@@ -82,6 +82,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -163,6 +164,18 @@ _SEVERITY_OVERLAY_PENS = {
     for sev, c in _SEVERITY_OVERLAY_COLORS.items()
 }
 _DEFAULT_OVERLAY_PEN = QPen(QColor(120, 120, 120, 120), 1)
+
+# Find bar: every match tinted green (a colour no difference uses), the
+# current one filled deeper and outlined.
+_SEARCH_BRUSH = QBrush(QColor(0, 200, 83, 60))
+_SEARCH_PEN = QPen(Qt.PenStyle.NoPen)
+_SEARCH_CURRENT_BRUSH = QBrush(QColor(0, 200, 83, 120))
+_SEARCH_CURRENT_PEN = QPen(QColor(0, 137, 60), 2)
+_SEARCH_CURRENT_PEN.setCosmetic(True)
+# Typing pauses this long (ms) before the document is searched.
+_SEARCH_DELAY_MS = 180
+# Matches tinted at once; past this the count still covers them all.
+_MAX_TINTED_MATCHES = 5000
 
 # Each Ctrl+wheel notch (or gesture update) multiplies the zoom factor
 # by this much -- chosen to match the feel of the toolbar +/- buttons
@@ -271,6 +284,71 @@ class _PageRenderer(QObject):
             self.rendered.emit(generation, index, resolution, image)
 
 
+class _TextIndexer(QObject):
+    """Reads a document's words for the Find bar on a background thread
+    (a long PDF takes a moment), so opening a document never waits."""
+
+    indexed = Signal(int, object)  # generation, core.text_search.SearchIndex (None on failure)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._requests: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, name="text-indexer", daemon=True).start()
+
+    def request(self, generation: int, path: str, kind: str) -> None:
+        self._requests.put((generation, path, kind))
+
+    def _run(self) -> None:
+        from core.text_search import build_search_index
+
+        while True:
+            request = self._requests.get()
+            while not self._requests.empty():  # only the newest document matters
+                request = self._requests.get()
+            generation, path, kind = request
+            try:
+                index = build_search_index(path, kind)
+            except Exception:  # noqa: BLE001 -- the Find bar just finds nothing
+                logger.exception("Could not read the text of %s for searching", path)
+                index = None
+            self.indexed.emit(generation, index)
+
+
+class _SearchField(QLineEdit):
+    """The Find bar's text box: Enter / Shift+Enter step through the
+    matches, Esc clears the search. These keys are claimed before the
+    window's shortcuts (Esc there clears drawn areas)."""
+
+    next_requested = Signal()
+    previous_requested = Signal()
+    escaped = Signal()
+    focused = Signal()
+
+    _KEYS = (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ShortcutOverride and event.key() in self._KEYS:
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt override
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self.previous_requested.emit()
+            else:
+                self.next_requested.emit()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.escaped.emit()
+            return
+        super().keyPressEvent(event)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802 -- Qt override
+        super().focusInEvent(event)
+        self.focused.emit()
+
+
 class _ZoomableGraphicsView(QGraphicsView):
     """QGraphicsView that turns trackpad pinch + Ctrl+wheel into zoom,
     and reports clicks (as opposed to drags).
@@ -289,6 +367,10 @@ class _ZoomableGraphicsView(QGraphicsView):
     interacted = Signal()  # any mouse/wheel use of this view
     file_dropped = Signal(str)  # a single supported document dropped onto the view
     files_dropped = Signal(list)  # multiple supported documents dropped onto the view
+    # A rectangle drawn with Shift+drag (or a plain drag in area mode),
+    # in scene coordinates; the flag is True when Ctrl was held too,
+    # adding the rectangle to the selection instead of replacing it.
+    area_dragged = Signal(QRectF, bool)
 
     def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None) -> None:
         super().__init__(scene, parent)
@@ -296,6 +378,12 @@ class _ZoomableGraphicsView(QGraphicsView):
         self.grabGesture(Qt.GestureType.PinchGesture)
         self._press_pos: QPointF | None = None
         self.setAcceptDrops(True)
+        # Area selection: a plain drag draws a rectangle instead of
+        # panning while this is on; Shift+drag always does.
+        self.area_mode = False
+        self._area_start: QPointF | None = None
+        self._area_add = False
+        self._area_item: QGraphicsRectItem | None = None
 
     @staticmethod
     def _dropped_paths(event) -> list[str]:
@@ -368,9 +456,45 @@ class _ZoomableGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.position()
             self.interacted.emit()
+            modifiers = event.modifiers()
+            if self.area_mode or modifiers & Qt.KeyboardModifier.ShiftModifier:
+                self._start_area(event, bool(modifiers & Qt.KeyboardModifier.ControlModifier))
+                event.accept()
+                return
+            self._press_pos = event.position()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._area_start is not None:
+            current = self.mapToScene(event.position().toPoint())
+            if self._area_item is not None:
+                self._area_item.setRect(QRectF(self._area_start, current).normalized())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def _start_area(self, event, add: bool) -> None:
+        self._area_start = QPointF(self.mapToScene(event.position().toPoint()))
+        self._area_add = add
+        accent = QColor(theme.tokens().accent)
+        pen = QPen(accent, 1.5, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        fill = QColor(accent)
+        fill.setAlpha(30)
+        self._area_item = self.scene().addRect(QRectF(self._area_start, self._area_start), pen, QBrush(fill))
+        self._area_item.setZValue(5)
+
+    def _finish_area(self, event) -> None:
+        start, self._area_start = self._area_start, None
+        end = QPointF(self.mapToScene(event.position().toPoint()))
+        if self._area_item is not None:
+            self.scene().removeItem(self._area_item)
+            self._area_item = None
+        rect = QRectF(start, end).normalized()
+        # A click without a drag selects nothing.
+        if rect.width() >= 4 and rect.height() >= 4:
+            self.area_dragged.emit(rect, self._area_add)
 
     def mouseDoubleClickEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -381,6 +505,10 @@ class _ZoomableGraphicsView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._area_start is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_area(event)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
         press, self._press_pos = self._press_pos, None
         if (
@@ -421,6 +549,9 @@ class DocumentPanel(QWidget):
     # A double-click on a page, as (page, x, y) in PDF points: the
     # reviewer asking for whatever is there to be rematched.
     point_double_clicked = Signal(int, float, float)
+    # The area drawn on this document changed (see `area_selection`):
+    # the text a reviewer picked to rematch by hand.
+    area_selected = Signal()
     loaded = Signal(str)
     # Emitted with (merged_path, should_compare) when multiple files are merged and loaded
     merge_completed = Signal(str, bool)
@@ -458,6 +589,26 @@ class DocumentPanel(QWidget):
         # (scene rect, DiffItem) for every overlay, to find the
         # difference under a click.
         self._overlay_hits: list[tuple[QRectF, object]] = []
+        # The area drawn to rematch by hand: (page, (x0, top, x1, bottom))
+        # in PDF points, and the outlines showing it.
+        self._area: list[tuple[int, tuple[float, float, float, float]]] = []
+        self._area_items: list[QGraphicsRectItem] = []
+        # Find bar: the document's words (read in the background), the
+        # matches for the current query, which one is current, and the
+        # tints drawn for them.
+        self._indexer = _TextIndexer()
+        self._indexer.indexed.connect(self._on_indexed)
+        self._search_index = None
+        self._indexing = False
+        self._search_matches: list = []
+        self._search_current = -1
+        self._search_items: list[QGraphicsRectItem] = []
+        self._search_current_items: list[QGraphicsRectItem] = []
+        self._search_navigate_when_ready = False
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(_SEARCH_DELAY_MS)
+        self._search_timer.timeout.connect(lambda: self._run_search(navigate=True))
 
         # --- Multi-page state ---
         # One Y offset (in unscaled scene pixels) per page, in page order,
@@ -554,6 +705,45 @@ class DocumentPanel(QWidget):
         nav_layout.addWidget(self.zoom_in_button)
         nav_layout.addWidget(self.fit_button)
 
+        # --- find bar: search this document's text ---
+        search_bar = QWidget()
+        search_bar.setObjectName("panelNav")
+        self.search_field = _SearchField()
+        self.search_field.setPlaceholderText(f"Search the {title} document\u2026")
+        self.search_field.setClearButtonEnabled(True)
+        self.search_field.setToolTip(
+            "Find a word or sentence in this document (Ctrl+Shift+F).\n"
+            "Enter: next match \u00b7 Shift+Enter: previous \u00b7 Esc: clear"
+        )
+        self.search_field.textChanged.connect(self._on_search_text_changed)
+        self.search_field.next_requested.connect(self.find_next)
+        self.search_field.previous_requested.connect(self.find_previous)
+        self.search_field.escaped.connect(self._on_search_escaped)
+        self.search_field.focused.connect(self.interacted)
+        self.search_count_label = QLabel("")
+        self.search_count_label.setObjectName("muted")
+        self.search_count_label.setMinimumWidth(64)
+        self.search_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.search_prev_button = self._flat_button("\u2191", "Previous match (Shift+Enter, Shift+F3)")
+        self.search_prev_button.clicked.connect(self.find_previous)
+        self.search_next_button = self._flat_button("\u2193", "Next match (Enter, F3)")
+        self.search_next_button.clicked.connect(self.find_next)
+        self.match_case_button = self._flat_button("Aa", "Match case")
+        self.match_case_button.setCheckable(True)
+        self.match_case_button.toggled.connect(lambda _on: self._run_search(navigate=True))
+        self.whole_word_button = self._flat_button("Whole word", "Match whole words only")
+        self.whole_word_button.setCheckable(True)
+        self.whole_word_button.toggled.connect(lambda _on: self._run_search(navigate=True))
+        search_layout = QHBoxLayout(search_bar)
+        search_layout.setContentsMargins(8, 3, 8, 3)
+        search_layout.setSpacing(4)
+        search_layout.addWidget(self.search_field, stretch=1)
+        search_layout.addWidget(self.search_count_label)
+        search_layout.addWidget(self.search_prev_button)
+        search_layout.addWidget(self.search_next_button)
+        search_layout.addWidget(self.match_case_button)
+        search_layout.addWidget(self.whole_word_button)
+
         self.layout_note = QLabel()
         self.layout_note.setObjectName("note")
         self.layout_note.setWordWrap(True)
@@ -570,6 +760,7 @@ class DocumentPanel(QWidget):
         self.view.interacted.connect(self.interacted)
         self.view.clicked.connect(self._on_view_clicked)
         self.view.double_clicked.connect(self._on_view_double_clicked)
+        self.view.area_dragged.connect(self._on_area_dragged)
         self.view.file_dropped.connect(self.load_document)
         self.view.files_dropped.connect(lambda paths: self.on_merge_clicked(initial_files=paths))
 
@@ -578,6 +769,7 @@ class DocumentPanel(QWidget):
         layout.setSpacing(0)
         layout.addWidget(header)
         layout.addWidget(nav)
+        layout.addWidget(search_bar)
         layout.addWidget(self.layout_note)
         layout.addWidget(self.view, stretch=1)
         self.setLayout(layout)
@@ -586,6 +778,7 @@ class DocumentPanel(QWidget):
         self._apply_theme()
         self._show_message("Open a PDF or Word document,\nor drop a file here.")
         self._update_page_controls()
+        self._update_search_controls()
 
     # Folder the next Open dialog starts in (shared by both panels).
     last_dir = ""
@@ -728,8 +921,20 @@ class DocumentPanel(QWidget):
         self._overlay_items = []
         self._overlay_hits = []
         self._crop_overlay_items = []
+        had_area = bool(self._area)
+        self._area = []
+        self._area_items = []
+        # scene.clear() deleted the tints; a new document is searched anew.
+        self._search_items = []
+        self._search_current_items = []
+        self._search_matches = []
+        self._search_current = -1
+        self._search_index = None
+        self._indexing = False
         self._page_y_offsets = []
         self._page_rects = []
+        if had_area:
+            self.area_selected.emit()
         self._page_border_items = []
         self._message_item = None
 
@@ -874,6 +1079,7 @@ class DocumentPanel(QWidget):
         self.view.resetTransform()
         self.scene.setSceneRect(self.scene.itemsBoundingRect())
         self._update_page_controls()
+        self._update_search_controls()
 
     def render_synthesized(self, path: str) -> None:
         """Render a DOCX/PPTX/XLSX document as a plain, scrollable text
@@ -955,6 +1161,7 @@ class DocumentPanel(QWidget):
             self.layout_note.show()
         else:
             self.layout_note.hide()
+        self._request_search_index(path, document_kind(path))
         self.file_path = path  # set before `loaded` so listeners see it
         self.loaded.emit(path)
 
@@ -1036,6 +1243,7 @@ class DocumentPanel(QWidget):
                 f"{kind_label} \u00b7 {pages}" + (" \u00b7 laid out by Microsoft Word" if source_path else ""),
             )
         self.layout_note.hide()
+        self._request_search_index(path, "pdf")
         self.file_path = source_path or path  # set before `loaded` so listeners see it
         self.loaded.emit(self.file_path)
 
@@ -1481,13 +1689,13 @@ class DocumentPanel(QWidget):
     # ------------------------------------------------------------------
 
     def draw_crop_overlays(
-        self, page_crops: dict[int, tuple[float, float]]
+        self, page_crops: dict[int, tuple]
     ) -> None:
         """Draw semi-transparent red crop bands on the rendered pages.
 
         Args:
-            page_crops: ``{page_number: (header_bottom_y_pt, footer_top_y_pt)}``
-                in PDF points.  Pages not in the dict have no crop.
+            page_crops: ``{page_number: (header_bottom_y_pt, footer_top_y_pt, [left_x_pt, right_x_pt])}``
+                in PDF points. Pages not in the dict have no crop.
         """
         self.clear_crop_overlays()
         if not page_crops or not self._page_y_offsets:
@@ -1496,15 +1704,24 @@ class DocumentPanel(QWidget):
         crop_brush = QBrush(QColor(220, 40, 40, 60))
         crop_pen = QPen(QColor(220, 40, 40, 140), 1.5, Qt.PenStyle.DashLine)
 
-        for page, (header_bottom_pt, footer_top_pt) in page_crops.items():
+        for page, crop in page_crops.items():
             if page < 1 or page > len(self._page_y_offsets):
                 continue
+            header_bottom_pt = float(crop[0])
+            footer_top_pt = float(crop[1])
+            left_pt = float(crop[2]) if len(crop) >= 4 else 0.0
+
             page_offset = self._page_y_offsets[page - 1]
             page_h_pt = 800.0
+            page_w_pt = 600.0
             scene_w = self.scene.sceneRect().width()
             if page <= len(self._page_rects):
                 page_h_pt = self._page_rects[page - 1].height() / RENDER_DPI_SCALE
+                page_w_pt = self._page_rects[page - 1].width() / RENDER_DPI_SCALE
                 scene_w = self._page_rects[page - 1].width()
+
+            page_h_px = page_h_pt * RENDER_DPI_SCALE
+            right_pt = float(crop[3]) if len(crop) >= 4 else page_w_pt
 
             # Header crop band
             if header_bottom_pt > 0.0:
@@ -1522,6 +1739,24 @@ class DocumentPanel(QWidget):
                 item = self.scene.addRect(rect, crop_pen, crop_brush)
                 item.setZValue(2)
                 self._crop_overlay_items.append(item)
+
+            # Left crop band
+            if left_pt > 0.0:
+                l_w = left_pt * RENDER_DPI_SCALE
+                rect = QRectF(0, page_offset, l_w, page_h_px)
+                item = self.scene.addRect(rect, crop_pen, crop_brush)
+                item.setZValue(2)
+                self._crop_overlay_items.append(item)
+
+            # Right crop band
+            if right_pt < page_w_pt:
+                r_x = right_pt * RENDER_DPI_SCALE
+                r_w = (page_w_pt - right_pt) * RENDER_DPI_SCALE
+                rect = QRectF(r_x, page_offset, r_w, page_h_px)
+                item = self.scene.addRect(rect, crop_pen, crop_brush)
+                item.setZValue(2)
+                self._crop_overlay_items.append(item)
+
 
     def clear_crop_overlays(self) -> None:
         """Remove all crop region overlays."""
@@ -1652,6 +1887,247 @@ class DocumentPanel(QWidget):
         point = self.pdf_point(scene_pos)
         if point is not None:
             self.point_double_clicked.emit(*point)
+
+    # ------------------------------------------------------------------
+    # Area selection (a manual rematch: core/rematch.rematch_areas)
+    # ------------------------------------------------------------------
+
+    def set_area_mode(self, on: bool) -> None:
+        """While on, a plain drag draws an area instead of panning."""
+        self.view.area_mode = on
+        self.view.setDragMode(
+            QGraphicsView.DragMode.NoDrag if on else QGraphicsView.DragMode.ScrollHandDrag
+        )
+        if on:
+            self.view.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.view.viewport().unsetCursor()
+
+    def area_selection(self) -> list[tuple[int, tuple[float, float, float, float]]]:
+        """The area drawn on this document, per page, in PDF points."""
+        return list(self._area)
+
+    def clear_area_selection(self) -> None:
+        for item in self._area_items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._area_items = []
+        if self._area:
+            self._area = []
+            self.area_selected.emit()
+
+    def select_area(self, page: int, box: tuple[float, float, float, float], add: bool = False) -> None:
+        """Select ``box`` (PDF points) on ``page``, as a drag would."""
+        rects = self._scene_rects_for(page, [box])
+        if rects:
+            rect = rects[0].adjusted(2, 2, -2, -2)  # undo the highlight padding
+            self._on_area_dragged(rect, add)
+
+    def _on_area_dragged(self, rect: QRectF, add: bool) -> None:
+        boxes = self._pdf_boxes_in(rect)
+        if not add:
+            for item in self._area_items:
+                try:
+                    self.scene.removeItem(item)
+                except RuntimeError:
+                    pass
+            self._area_items = []
+            self._area = []
+        if boxes:
+            accent = QColor(theme.tokens().accent)
+            pen = QPen(accent, 2, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            fill = QColor(accent)
+            fill.setAlpha(28)
+            for page, box in boxes:
+                for scene_rect in self._scene_rects_for(page, [box]) or []:
+                    item = self.scene.addRect(scene_rect.adjusted(2, 2, -2, -2), pen, QBrush(fill))
+                    item.setZValue(4)  # above the difference overlays
+                    self._area_items.append(item)
+            self._area.extend(boxes)
+        self.area_selected.emit()
+
+    def _pdf_boxes_in(self, rect: QRectF) -> list[tuple[int, tuple[float, float, float, float]]]:
+        """A scene rectangle as (page, box in PDF points), one per page
+        it crosses -- a drag can run from the foot of one page onto the
+        next."""
+        boxes = []
+        for index, page_rect in enumerate(self._page_rects):
+            part = rect.intersected(page_rect)
+            if part.isEmpty():
+                continue
+            top = self._page_y_offsets[index]
+            boxes.append((
+                index + 1,
+                (
+                    part.left() / RENDER_DPI_SCALE,
+                    (part.top() - top) / RENDER_DPI_SCALE,
+                    part.right() / RENDER_DPI_SCALE,
+                    (part.bottom() - top) / RENDER_DPI_SCALE,
+                ),
+            ))
+        return boxes
+
+    # ------------------------------------------------------------------
+    # Find bar (core/text_search.py)
+    # ------------------------------------------------------------------
+
+    def focus_search(self) -> None:
+        """Put the cursor in this document's Find bar, query selected."""
+        self.search_field.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_field.selectAll()
+
+    def search(self, query: str) -> int:
+        """Search for ``query`` now and go to the first match at or after
+        the view; returns how many matches there are (-1 while the
+        document's text is still being read)."""
+        self.search_field.blockSignals(True)
+        self.search_field.setText(query)
+        self.search_field.blockSignals(False)
+        self._search_timer.stop()
+        self._run_search(navigate=True)
+        return len(self._search_matches) if self._search_index is not None else -1
+
+    def search_matches(self) -> list:
+        """The matches for the current query (core.text_search.SearchMatch)."""
+        return list(self._search_matches)
+
+    def current_search_match(self) -> int:
+        """Index of the match being shown, or -1."""
+        return self._search_current
+
+    def find_next(self) -> None:
+        self._step_search(1)
+
+    def find_previous(self) -> None:
+        self._step_search(-1)
+
+    def _request_search_index(self, path: str, kind: str) -> None:
+        self._indexing = True
+        self._indexer.request(self._generation, path, kind)
+        self._update_search_controls()
+
+    def _on_indexed(self, generation: int, index) -> None:
+        if generation != self._generation:
+            return  # a document that's no longer shown
+        self._search_index = index
+        self._indexing = False
+        navigate, self._search_navigate_when_ready = self._search_navigate_when_ready, False
+        self._run_search(navigate=navigate)
+
+    def _on_search_text_changed(self, _text: str) -> None:
+        self.interacted.emit()
+        self._search_timer.start()
+
+    def _on_search_escaped(self) -> None:
+        if self.search_field.text():
+            self.search_field.clear()
+            self._search_timer.stop()
+            self._run_search(navigate=False)
+        else:
+            self.view.setFocus()
+
+    def _clear_search_items(self, items: list[QGraphicsRectItem]) -> None:
+        for item in items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        items.clear()
+
+    def _run_search(self, *, navigate: bool) -> None:
+        """Find the query again, tint every match, and (``navigate``) go
+        to the first one at or after what's on screen."""
+        self._clear_search_items(self._search_items)
+        self._clear_search_items(self._search_current_items)
+        self._search_matches = []
+        self._search_current = -1
+        query = self.search_field.text().strip()
+        if query and self._search_index is None:
+            # Still reading the document: search as soon as it's read.
+            self._search_navigate_when_ready = self._search_navigate_when_ready or navigate
+        elif query:
+            self._search_matches = self._search_index.find_all(
+                query,
+                match_case=self.match_case_button.isChecked(),
+                whole_word=self.whole_word_button.isChecked(),
+            )
+            for match in self._search_matches[:_MAX_TINTED_MATCHES]:
+                for page, boxes in match.iter_pages():
+                    for rect in self._scene_rects_for(page, boxes) or []:
+                        item = self.scene.addRect(rect, _SEARCH_PEN, _SEARCH_BRUSH)
+                        item.setZValue(3)  # above the difference overlays
+                        self._search_items.append(item)
+            if navigate and self._search_matches:
+                self._search_current = self._match_from_view(1)
+                self._show_current_match()
+        self._update_search_controls()
+
+    def _match_from_view(self, step: int) -> int:
+        """The first match at/after the top of the view (``step`` 1), or
+        the last one before it (-1), wrapping around the document."""
+        top = self.pdf_point(self.view.mapToScene(self.view.viewport().rect().topLeft()))
+        here = (top[0], top[2]) if top else (1, 0.0)
+        keys = [(m.page, m.pages[0][1][0][1]) for m in self._search_matches]
+        if step > 0:
+            return next((i for i, key in enumerate(keys) if key >= here), 0)
+        return next((i for i in range(len(keys) - 1, -1, -1) if keys[i] < here), len(keys) - 1)
+
+    def _step_search(self, step: int) -> None:
+        if self.search_field.text().strip() and self._search_timer.isActive():
+            self._search_timer.stop()  # typed but not yet searched
+            self._run_search(navigate=True)
+            return
+        if not self._search_matches:
+            return
+        if self._search_current < 0:
+            self._search_current = self._match_from_view(step)
+        else:
+            self._search_current = (self._search_current + step) % len(self._search_matches)
+        self._show_current_match()
+        self._update_search_controls()
+
+    def _show_current_match(self) -> None:
+        """Outline the current match and bring it on screen. The view
+        moves as a scroll would, so a locked partner follows."""
+        self._clear_search_items(self._search_current_items)
+        match = self._search_matches[self._search_current]
+        first: list[QRectF] = []
+        for page, boxes in match.iter_pages():
+            rects = self._scene_rects_for(page, boxes) or []
+            for rect in rects:
+                item = self.scene.addRect(rect, _SEARCH_CURRENT_PEN, _SEARCH_CURRENT_BRUSH)
+                item.setZValue(3.5)
+                self._search_current_items.append(item)
+            if rects and not first:
+                first = rects
+        if not first:
+            return
+        target = self._union_rect(first)
+        visible = self.view.mapToScene(self.view.viewport().rect()).boundingRect()
+        if not visible.contains(target):
+            self.view.centerOn(target.center())
+        self._current_page = match.page
+        self._update_page_controls()
+
+    def _update_search_controls(self) -> None:
+        query = self.search_field.text().strip()
+        count = len(self._search_matches)
+        if not query:
+            text = ""
+        elif self._search_index is None:
+            text = "Reading\u2026" if self._indexing else ""
+        elif not count:
+            text = "No matches"
+        elif self._search_current < 0:
+            text = f"{count} match{'es' if count != 1 else ''}"
+        else:
+            text = f"{self._search_current + 1} of {count}"
+        self.search_count_label.setText(text)
+        self.search_prev_button.setEnabled(count > 0)
+        self.search_next_button.setEnabled(count > 0)
 
     # ------------------------------------------------------------------
     # Scroll sync plumbing

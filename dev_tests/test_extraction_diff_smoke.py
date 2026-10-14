@@ -1744,18 +1744,25 @@ def main() -> None:
     # `rtl=True` (a real observed case: a wide RTL proof sheet's real
     # columns were read left-to-right regardless, splicing a LATER
     # column's text into an EARLIER column's sentence).
+    # Columns of running text: about 120pt wide, five words a line (a
+    # grid of single 10pt tokens is what a TABLE looks like, and is read
+    # row by row since tables are told apart from text columns).
     rtl_zone_words: list[dict] = []
     for i in range(5):
         top = 10.0 + i * 12.0
-        rtl_zone_words.append(w17(f"R{i}", 400.0, 410.0, top))  # rightmost
-        rtl_zone_words.append(w17(f"M{i}", 200.0, 210.0, top))  # middle
-        rtl_zone_words.append(w17(f"L{i}", 20.0, 30.0, top))    # leftmost
-    rtl_units, rtl_bands = _order_body_units(rtl_zone_words, 20.0, 410.0, rtl=True)
+        for name, x in (("R", 400.0), ("M", 220.0), ("L", 40.0)):  # rightmost first
+            for k in range(5):
+                word = w17(f"{name}{i}", x + k * 24.0, x + k * 24.0 + 20.0, top)
+                word["bottom"] = top + 9.0
+                rtl_zone_words.append(word)
+    rtl_units, rtl_bands = _order_body_units(rtl_zone_words, 40.0, 516.0, rtl=True)
     rtl_ordered: list[str] = []
     for band_idx in range(len(rtl_bands)):
         band_units = sorted((u for u in rtl_units if u[0] == band_idx), key=lambda u: u[1])
         for _, _, line_words in band_units:
-            rtl_ordered.extend(ww["text"] for ww in line_words)
+            for ww in line_words:
+                if not rtl_ordered or rtl_ordered[-1] != ww["text"]:
+                    rtl_ordered.append(ww["text"])
     rtl_expected = (
         [f"R{i}" for i in range(5)] + [f"M{i}" for i in range(5)] + [f"L{i}" for i in range(5)]
     )
@@ -2416,19 +2423,119 @@ def main() -> None:
         print(f"FAIL: genuine deletion rematched to {result.items} ({result.message})")
         ok24 = False
 
-    # (e) One or two words are refused: every document contains a stray
-    #     "4", and matching one would hide a dosage change.
+    # (e) A one-word difference is rematched through its PARAGRAPH, never
+    #     as a bare word: the dosage change is checked again and stands,
+    #     however many stray "8"s the suspect has elsewhere.
     tiny = DiffItem(
         index=0, kind="text_changed", severity="critical",
         approved_text="4", suspect_text="8",
         approved_location=_location_of([t for t in rm_a if t.text == "4"][:1]),
         suspect_location=None,
     )
-    result = rematch_item(tiny, rm_a, rm_b, side=RM_APPROVED, context=rm_context)
-    if not result.found and result.items == [tiny] and "Too short" in result.message:
-        print("PASS: a one-word difference is refused, not matched against a stray word.")
+    rm_b_eights = paragraphs([intro, dose_edited, store, report, ["Take 8 tablets with 4 mg of 8 water."]])
+    result = rematch_item(tiny, rm_a, rm_b_eights, side=RM_APPROVED, context=RematchContext(rm_a, rm_b_eights))
+    if not result.found and result.items == [tiny] and "stands" in result.message:
+        print("PASS: a one-word difference is checked through its paragraph and stands.")
     else:
         print(f"FAIL: short rematch gave found={result.found} {result.message!r}")
+        ok24 = False
+
+    # (f) A two-word false positive -- a short phrase paired with the
+    #     wrong words -- is found by the words around it and goes away.
+    meal = [t for t in rm_a if t.text in ("evening", "meal.")]
+    wrong = DiffItem(
+        index=0, kind="text_changed", severity="critical",
+        approved_text="evening meal.", suspect_text="dry place",
+        approved_location=_location_of(meal), suspect_location=None,
+    )
+    result = rematch_item(wrong, rm_a, rm_b, side=RM_APPROVED, context=rm_context)
+    in_middle = DiffItem(
+        index=0, kind="text_changed", severity="critical",
+        approved_text="starting dose", suspect_text="dose",
+        approved_location=_location_of([t for t in rm_a if t.text in ("starting", "dose")][:2]),
+        suspect_location=None,
+    )
+    middle = rematch_item(in_middle, rm_a, rm_b, side=RM_APPROVED, context=rm_context)
+    if result.found and result.items == [] and middle.found and middle.items == []:
+        print("PASS: a two-word mispairing is placed by its neighbours and removed.")
+    else:
+        print(f"FAIL: two-word mispairing rematched to {[(i.approved_text, i.suspect_text) for i in result.items]} "
+              f"/ {[(i.approved_text, i.suspect_text) for i in middle.items]} ({result.message} | {middle.message})")
+        ok24 = False
+
+    # (g) Areas drawn by the reviewer: exactly those two passages are
+    #     compared; rows touching them are replaced, and words outside
+    #     them that lose their partner are reported, never dropped.
+    from core.rematch import rematch_areas
+    from core.token_map import TokenMap as _TokenMap
+
+    def area_of(tokens, text):
+        words = text.split()
+        texts = [t.text for t in tokens]
+        start_at = next(i for i in range(len(texts)) if texts[i:i + len(words)] == words)
+        loc = _location_of(tokens[start_at:start_at + len(words)])
+        x0, top, x1, bottom = loc.bbox
+        return [(loc.page, (x0 - 3, top - 3, x1 + 3, bottom + 3))]
+
+    area_matches = []
+    area_rows = diff_documents(rm_a, rm_b, area_matches)
+    area_map = _TokenMap(rm_a, rm_b, area_matches)
+    right = rematch_areas(area_rows, rm_a, rm_b, area_of(rm_a, dose[0]), area_of(rm_b, dose_edited[0]),
+                          area_map.partners())
+    wrong_area = rematch_areas(area_rows, rm_a, rm_b, area_of(rm_a, dose[0]), area_of(rm_b, store[0]),
+                               area_map.partners())
+    nothing = rematch_areas(area_rows, rm_a, rm_b, [(1, (500.0, 700.0, 520.0, 720.0))],
+                            area_of(rm_b, store[0]), area_map.partners())
+    # Pairing the dose with the storage paragraph leaves the whole edited
+    # dose paragraph (its "8" included: its row was replaced) and the
+    # whole Original storage paragraph without a partner.
+    expected_unpaired = len(dose_edited[0].split()) + len(store[0].split())
+    if (right.ok and [(i.approved_text, i.suspect_text) for i in right.items] == [("4", "8")]
+            and right.replaced == area_rows and right.unpaired == 0
+            and wrong_area.ok and wrong_area.unpaired == expected_unpaired and wrong_area.replaced == area_rows
+            and not nothing.ok and "Original" in nothing.message):
+        print("PASS: two drawn areas are compared with each other; unpaired words are reported.")
+    else:
+        print(f"FAIL: area rematch right={[(i.approved_text, i.suspect_text) for i in right.items]} "
+              f"unpaired {right.unpaired}/{wrong_area.unpaired} (expected {expected_unpaired}), "
+              f"empty area ok={nothing.ok}")
+        ok24 = False
+
+    # Words left unpaired are marked at their insertion point in the
+    # OTHER document -- never by mirroring their own boxes onto it, which
+    # lands on unrelated text there.
+    one_sided = [i for i in wrong_area.items if bool(i.approved_text) != bool(i.suspect_text)]
+    placed = all((i.suspect_caret if i.approved_text else i.approved_caret) is not None for i in one_sided)
+    if one_sided and placed:
+        print("PASS: every word left unpaired by an area rematch has its insertion point in the other document.")
+    else:
+        print(f"FAIL: unpaired rows without an insertion point: "
+              f"{[(i.approved_text, i.suspect_text) for i in one_sided if not placed]}")
+        ok24 = False
+
+    # A "section in a different order" row spans paired words: an area
+    # rematch leaves it be, and none of its words become "unpaired".
+    order_row = DiffItem(
+        index=0, kind="reordered_section", severity="reorder", approved_text="", suspect_text="",
+        approved_location=_location_of(rm_a), suspect_location=_location_of(rm_b),
+    )
+    with_order = rematch_areas(area_rows + [order_row], rm_a, rm_b, area_of(rm_a, dose[0]),
+                               area_of(rm_b, dose_edited[0]), area_map.partners())
+    if with_order.ok and order_row not in with_order.replaced and with_order.unpaired == 0:
+        print("PASS: a reordered-section row is left alone by an area rematch.")
+    else:
+        print(f"FAIL: reordered-section row replaced={order_row in with_order.replaced}, "
+              f"unpaired {with_order.unpaired}")
+        ok24 = False
+
+    snap = area_map.snapshot()
+    area_map.rebind(right.selected["approved"], right.selected["suspect"], right.pairs)
+    rebound = all(area_map.partners()["approved"][i] == j for i, j in right.pairs)
+    area_map.restore(snap)
+    if rebound and area_map.partners() == snap:
+        print("PASS: the word pairing follows an area rematch, and is put back on undo.")
+    else:
+        print("FAIL: TokenMap rebind/restore")
         ok24 = False
 
     if ok24:
@@ -2439,36 +2546,45 @@ def main() -> None:
     print("TEST 25: 'Moved' never swallows a real difference")
     print("=" * 70)
     ok25 = True
-    from core.diff_engine import _downgrade_relocated_runs, _is_same_text_relocated
+    from core.diff_engine import _downgrade_relocated_runs
 
-    # Two passages that merely share a few words are not one passage
-    # relocated. Reported as "moved" they sit in the lowest tier, and
-    # the change they contain is never reviewed -- a real case was
-    # "Hold the" against "Fever - Itching one pre-filled", demoted
-    # because each of those words appears somewhere in the other file.
+    # A replacement is never relabelled as moved -- not two passages that
+    # merely share a few words (a real case: "Hold the" against "Fever -
+    # Itching one pre-filled"), and not the same passage with one word
+    # changed either: that one word IS the difference ("healthcare" ->
+    # "health" was hidden this way on a revised FPL). Moves are found by
+    # the moved-text pass, which reports the edits inside them separately.
     unrelated = DiffItem(
         index=0, kind="text_changed", severity="critical",
         approved_text="Hold the syringe firmly",
         suspect_text="Fever Itching one pre-filled",
         approved_location=None, suspect_location=None,
     )
-    # The same text, one word apart: that IS a relocation when the
-    # document holds it elsewhere.
     same_text = DiffItem(
         index=0, kind="text_changed", severity="critical",
         approved_text="Hold the syringe firmly in one hand",
         suspect_text="Hold the syringe gently in one hand",
         approved_location=None, suspect_location=None,
     )
-    if not _is_same_text_relocated(unrelated.approved_text, unrelated.suspect_text):
-        print("PASS: two passages sharing a few words are not 'the same text moved'.")
+    one_word = DiffItem(
+        index=0, kind="text_changed", severity="critical",
+        approved_text="healthcare", suspect_text="health",
+        approved_location=None, suspect_location=None,
+    )
+    elsewhere_a = build_comparison_tokens(lines_to_words([
+        "Hold the syringe firmly in one hand", "Hold the syringe gently in one hand",
+        "health healthcare health",
+    ]))
+    elsewhere_b = build_comparison_tokens(lines_to_words([
+        "Hold the syringe gently in one hand", "Hold the syringe firmly in one hand",
+        "healthcare health healthcare",
+    ]))
+    rows = [same_text, one_word]
+    _downgrade_relocated_runs(rows, elsewhere_a, elsewhere_b)
+    if all(r.kind == "text_changed" and r.severity == "critical" for r in rows):
+        print("PASS: a replacement stays an edit even when both sides occur elsewhere.")
     else:
-        print("FAIL: unrelated passages count as a relocation.")
-        ok25 = False
-    if _is_same_text_relocated(same_text.approved_text, same_text.suspect_text):
-        print("PASS: the same passage with one word changed still counts as relocatable.")
-    else:
-        print("FAIL: a near-identical passage no longer counts as a relocation.")
+        print(f"FAIL: replacements demoted: {[(r.kind, r.severity, r.approved_text) for r in rows]}")
         ok25 = False
 
     # End to end: both documents contain every word of both passages
@@ -3129,6 +3245,540 @@ def main() -> None:
         ok33 = False
     if ok33:
         print("PASS: extraction speed-ups are exact.")
+
+    print()
+    print("=" * 70)
+    print("TEST 34: dense outsert columns are read column by column")
+    print("=" * 70)
+    ok34 = True
+
+    def outsert_words(info_lines: int, gutter: float, word_gap: float = 1.6) -> list[dict]:
+        """Four columns of 6pt prose (word gap 1.6pt) separated by real
+        gutters of `gutter` points at fractional positions -- so whole-point
+        buckets lose part of each gap -- with `info_lines` lines of an
+        artwork-information block above the MIDDLE two columns only, the
+        way the outsert's block sits: it crosses the gutter between them,
+        while the outer gutters stay clean."""
+        words: list[dict] = []
+        col_lefts = []
+        col_left = 20.3
+        for col in range(4):
+            col_lefts.append(col_left)
+            for row in range(60):
+                top = 60.0 + row * 7.5
+                x = col_left
+                if col == 1 and row == 30:
+                    # A section heading part-way down a middle column: it
+                    # starts a new reading zone across whatever band the
+                    # column was put in.
+                    for text in ("5", "WARNINGS", "AND", "PRECAUTIONS"):
+                        words.append({"text": text, "x0": x, "x1": x + 30.0, "top": top, "bottom": top + 6})
+                        x += 31.6
+                    continue
+                for k in range(8):
+                    text = f"C{col}L{row}" if k == 0 else "w"
+                    words.append({"text": text, "x0": x, "x1": x + 39.5, "top": top, "bottom": top + 6})
+                    x += 39.5 + word_gap
+            col_left = col_lefts[-1] + 8 * 39.5 + 7 * word_gap + gutter
+        for row in range(info_lines):
+            top = 10.0 + row * 9.0
+            x = col_lefts[1] + 120.0
+            while x < col_lefts[2] + 180.0:
+                words.append({"text": "INFO", "x0": x, "x1": x + 21.7, "top": top, "bottom": top + 6})
+                x += 21.7 + 1.6
+        return words
+
+    def column_major(words: list[dict]) -> bool:
+        units, bands = _order_body_units(words, 20.0, 1340.0)
+        order = []
+        for band_idx in range(len(bands)):
+            for _, _, line in sorted((u for u in units if u[0] == band_idx), key=lambda u: u[1]):
+                order.extend(w["text"] for w in line if w["text"].startswith("C"))
+        expected = [f"C{c}L{r}" for c in range(4) for r in range(60) if (c, r) != (1, 30)]
+        return order == expected
+
+    if column_major(outsert_words(info_lines=0, gutter=8.3)):
+        print("PASS: four 8.3pt-gutter columns read column by column (control).")
+    else:
+        print("FAIL: plain three-column layout is not read column by column.")
+        ok34 = False
+    # Whole-point buckets read a gutter 1-2pt narrower than it is; with
+    # slightly wider word spacing the minimum gutter rises to ~6.5pt and a
+    # real 7.4pt gutter (the FPL's page 2 had 8.1-8.3pt ones measured as 6)
+    # was rejected, merging the columns.
+    if column_major(outsert_words(info_lines=0, gutter=7.4, word_gap=1.85)):
+        print("PASS: a narrow real gutter is not lost to whole-point measurement.")
+    else:
+        print("FAIL: a 7.4pt gutter with 1.85pt word spacing merged the columns.")
+        ok34 = False
+    if column_major(outsert_words(info_lines=2, gutter=8.3)):
+        print("PASS: an information block above the middle columns does not merge them.")
+    else:
+        print("FAIL: an information block over the middle columns merged them into one band.")
+        ok34 = False
+
+    # And the comparison: the same text set in a different number of rows
+    # per column must not come out as "moved" fragments.
+    from core.diff_engine import category_of as _cat34
+
+    def to_tokens(words):
+        units, bands = _order_body_units(words, 20.0, 1340.0)
+        ordered = []
+        for band_idx in range(len(bands)):
+            for _, _, line in sorted((u for u in units if u[0] == band_idx), key=lambda u: u[1]):
+                ordered.extend(line)
+        return build_comparison_tokens([
+            Word(text=w["text"], page=1, x0=w["x0"], top=w["top"], x1=w["x1"], bottom=w["bottom"])
+            for w in ordered
+        ])
+
+    with_info = to_tokens(outsert_words(info_lines=2, gutter=8.3))
+    plain = to_tokens(outsert_words(info_lines=0, gutter=8.3))
+    rows34 = diff_documents(plain, with_info)
+    moved34 = [d for d in rows34 if _cat34(d) == "moved"]
+    if not moved34 and all(set(d.suspect_text.split()) <= {"INFO"} for d in rows34):
+        print("PASS: the only difference reported is the added information block.")
+    else:
+        print(f"FAIL: {len(moved34)} moved row(s), rows: "
+              f"{[(d.kind, d.approved_text[:20], d.suspect_text[:20]) for d in rows34][:6]}")
+        ok34 = False
+    if ok34:
+        print("PASS: outsert column detection.")
+
+    print()
+    print("=" * 70)
+    print("TEST 35: Highlights in two narrow columns, running headers, sheet order")
+    print("=" * 70)
+    ok35 = True
+    from core.page_furniture import drop_repeated_furniture
+    from core.pdf_extractor import _sub_column_segments
+    from core.pdf_merge import natural_sort_key
+
+    def highlights_rows(rows_top: int, rows_bottom: int, gap: float = 4.9) -> list[list[dict]]:
+        """One page column: a two-column block (left 232-358, right
+        358+gap-490, 6pt justified text: 1.8pt word spaces, every fourth
+        line stretched to 4.5pt) of `rows_top` lines, then
+        `rows_bottom` ordinary full-width lines -- the shape of an outsert's
+        Highlights box above the start of the full prescribing information."""
+        rows = []
+        for r in range(rows_top):
+            top = 200.0 + r * 7.0
+            row = []
+            space = 4.5 if r % 4 == 0 else 1.8
+            for name, x, end in (("L", 232.0, 358.0), ("R", 358.0 + gap, 490.0)):
+                width = (end - x - 5 * space) / 6
+                for k in range(6):
+                    row.append({"text": f"{name}{r}" if k == 0 else "w", "x0": x, "x1": x + width,
+                                "top": top, "bottom": top + 6})
+                    x += width + space
+            rows.append(row)
+        for r in range(rows_bottom):
+            top = 200.0 + (rows_top + r) * 7.0
+            x, row = 232.0, []
+            for k in range(12):
+                row.append({"text": f"B{r}" if k == 0 else "w", "x0": x, "x1": x + 19.0,
+                            "top": top, "bottom": top + 6})
+                x += 19.0 + 2.6
+            rows.append(row)
+        return rows
+
+    def reading(segments):
+        order = []
+        for words, gutter in segments:
+            if gutter is None:
+                order += [w["text"] for w in sorted(words, key=lambda w: (w["top"], w["x0"])) if w["text"] != "w"]
+                continue
+            mid = (gutter[0] + gutter[1]) / 2
+            for side in (lambda w: w["x1"] <= mid, lambda w: w["x0"] >= mid):
+                order += [w["text"] for w in sorted((w for w in words if side(w)), key=lambda w: (w["top"], w["x0"]))
+                          if w["text"] != "w"]
+        return order
+
+    segments = _sub_column_segments(highlights_rows(40, 10))
+    expected = [f"L{r}" for r in range(40)] + [f"R{r}" for r in range(40)] + [f"B{r}" for r in range(10)]
+    if segments and reading(segments) == expected:
+        print("PASS: a 4.9pt-gutter block reads its left column, then its right, then the text below.")
+    else:
+        print(f"FAIL: two-column block read as {reading(segments)[:12] if segments else None}")
+        ok35 = False
+
+    rule_y = 200.0 + 20 * 7.0 - 2.0
+    segments = _sub_column_segments(highlights_rows(40, 0), [(rule_y, 230.0, 492.0)])
+    expected = ([f"L{r}" for r in range(20)] + [f"R{r}" for r in range(20)]
+                + [f"L{r}" for r in range(20, 40)] + [f"R{r}" for r in range(20, 40)])
+    if segments and reading(segments) == expected:
+        print("PASS: a rule across the gutter ends one block (the Highlights) and starts the next (Contents).")
+    else:
+        print(f"FAIL: block with a rule read as {reading(segments)[:12] if segments else None}")
+        ok35 = False
+
+    if _sub_column_segments(highlights_rows(0, 40)) is None and _sub_column_segments(highlights_rows(12, 30)) is None:
+        print("PASS: ordinary text, and a too-short two-column run, are left exactly as before.")
+    else:
+        print("FAIL: a two-column block was claimed where there is none.")
+        ok35 = False
+
+    bullets = []
+    for r in range(40):
+        top = 200.0 + r * 7.0
+        bullets.append([{"text": "\u2022", "x0": 232.0, "x1": 235.0, "top": top, "bottom": top + 6}]
+                       + [{"text": "w", "x0": 245.0 + k * 22.0, "x1": 264.0 + k * 22.0, "top": top, "bottom": top + 6}
+                          for k in range(11)])
+    if _sub_column_segments(bullets) is None:
+        print("PASS: a bullet column beside its text is not a two-column block.")
+    else:
+        print("FAIL: a bulleted list was split into columns.")
+        ok35 = False
+
+    def page_tokens(pages, header=True, footer=True, body_repeat=None):
+        words = []
+        for page in range(1, pages + 1):
+            lines = []
+            if header:
+                lines.append("Draft Labeling Text 1.14.1.3")
+            lines.append(body_repeat or f"Body text unique to page number {page} here.")
+            lines.append(f"More body content follows on page {['one', 'two', 'three', 'four', 'five', 'six'][page - 1]}.")
+            if footer:
+                lines.append(f"Page {page} of {pages}")
+            for row, line in enumerate(lines):
+                x = 70.0
+                for text in line.split():
+                    words.append(Word(text=text, page=page, x0=x, top=57.0 + row * 14, x1=x + 6 * len(text),
+                                      bottom=69.0 + row * 14))
+                    x += 6 * len(text) + 4
+        return build_comparison_tokens(words)
+
+    draft = page_tokens(6)
+    outsert = page_tokens(1, header=False, footer=False)
+    kept, found = drop_repeated_furniture(draft, outsert)
+    texts = " ".join(t.text for t in kept)
+    if (sorted(found) == ["Draft Labeling Text 1.14.1.3", "Page 1 of 6"]
+            and texts.count("Draft Labeling Text") == 1 and texts.count("Page") == 1):
+        print("PASS: a running header and footer are compared once, their repeats left out.")
+    else:
+        print(f"FAIL: furniture found {found}, header kept {texts.count('Draft Labeling Text')}x")
+        ok35 = False
+    both = drop_repeated_furniture(draft, page_tokens(6))
+    long_line = "This full width paragraph line repeats at the top of every single page of the file"
+    repeated_body = drop_repeated_furniture(page_tokens(5, header=False, footer=False, body_repeat=long_line))
+    if not both[1] and not repeated_body[1] and len(page_tokens(2)) == len(drop_repeated_furniture(page_tokens(2))[0]):
+        print("PASS: kept when the other document repeats it too, for long body lines, and for 2-page documents.")
+    else:
+        print(f"FAIL: furniture removed wrongly: both-sides {both[1]}, body {repeated_body[1]}")
+        ok35 = False
+
+    names = ["Leaflet 8108575 Back.pdf", "Leaflet 8108575 Front.pdf", "part10.pdf", "part2.pdf", "frontier.pdf"]
+    if sorted(names, key=natural_sort_key) == ["frontier.pdf", "Leaflet 8108575 Front.pdf",
+                                              "Leaflet 8108575 Back.pdf", "part2.pdf", "part10.pdf"]:
+        print("PASS: merged sheets default to Front before Back; part2 before part10.")
+    else:
+        print(f"FAIL: merge order {sorted(names, key=natural_sort_key)}")
+        ok35 = False
+    if ok35:
+        print("PASS: two-column blocks, page furniture and sheet order.")
+
+    print()
+    print("=" * 70)
+    print("TEST 36: Word draft against an SPL -- hidden print headers, line-break")
+    print("         hyphens, subscripts, table rows, dash rules, spacing")
+    print("=" * 70)
+    ok36 = True
+    from core.pdf_extractor import _read_lines, _drop_dash_rules  # noqa: F401
+
+    # (a) A browser's print header set above the page's crop box is not on
+    #     the page; text just inside the crop box still is.
+    hidden_pdf = os.path.join(tmp, "hidden_header.pdf")
+    hdoc = fitz.open()
+    hpage = hdoc.new_page(width=400, height=300)
+    # Ends about 2pt above the crop box (inside the old 5pt tolerance),
+    # its centre outside it -- as the SPL's header did.
+    hpage.insert_text((40, 17.5), "These highlights Page 4 of 34", fontsize=10, fontname="helv")
+    hpage.insert_text((40, 34), "Visible first line", fontsize=10, fontname="helv")
+    hpage.insert_text((40, 120), "Body text of the page", fontsize=10, fontname="helv")
+    hpage.set_cropbox(fitz.Rect(0, 20, 400, 300))
+    hdoc.save(hidden_pdf)
+    hdoc.close()
+    hidden_text = " ".join(w.text for w in extract_words(hidden_pdf))
+    if "highlights" not in hidden_text and "Visible" in hidden_text and "Body" in hidden_text:
+        print("PASS: text printed outside the crop box is not compared; text inside it is.")
+    else:
+        print(f"FAIL: off-page text handling read {hidden_text!r}")
+        ok36 = False
+
+    # (b) A Wingdings bullet given as a private-use code is a bullet.
+    if _normalize_word_text("\uf06c") == "\u2022":
+        print("PASS: a Wingdings bullet (U+F06C) compares as a bullet.")
+    else:
+        print(f"FAIL: U+F06C normalized to {_normalize_word_text(chr(0xF06C))!r}")
+        ok36 = False
+
+    # (c) A compound broken at its own hyphen across a line is the same
+    #     word as the one printed whole -- and the answer is decided per
+    #     comparison, not carried over to the next one.
+    def lines_words(lines, page=1):
+        words, y = [], 50.0
+        for line in lines:
+            x = 50.0
+            for text in line.split():
+                words.append(Word(text=text, page=page, x0=x, top=y, x1=x + 6 * len(text), bottom=y + 10))
+                x += 6 * len(text) + 4
+            y += 14
+        return words
+
+    broken = build_comparison_tokens(lines_words(["compared with placebo-", "treated patients in the study"]))
+    whole_hyphen = build_comparison_tokens(lines_words(["compared with placebo-treated patients in the study"]))
+    whole_plain = build_comparison_tokens(lines_words(["compared with placebotreated patients in the study"]))
+    first = diff_documents(broken, whole_hyphen)
+    second = diff_documents(broken, whole_plain)
+    if not first and not second:
+        print("PASS: 'placebo-' + 'treated' matches the word printed whole, with or without its hyphen.")
+    else:
+        print(f"FAIL: line-break hyphen rows {[(i.approved_text, i.suspect_text) for i in first + second]}")
+        ok36 = False
+    suspended = build_comparison_tokens(lines_words(["by comparisons to age-", "and sex-matched standards"]))
+    if [t.text for t in suspended][3:5] == ["age-", "and"]:
+        print("PASS: 'age- and sex-matched' is not stitched into 'ageand'.")
+    else:
+        print(f"FAIL: suspended hyphen read as {[t.text for t in suspended]}")
+        ok36 = False
+
+    # (d) A subscript set a space's width after its base is still its
+    #     subscript: "C max" against "Cmax" is spacing, never a rewording.
+    sub_pdf = os.path.join(tmp, "spaced_subscript.pdf")
+    sdoc = fitz.open()
+    spage = sdoc.new_page(width=400, height=200)
+    spage.insert_text((40, 60), "increases the C", fontsize=7.44, fontname="helv")
+    c_end = 40 + fitz.get_text_length("increases the C", fontname="helv", fontsize=7.44)
+    spage.insert_text((c_end + 1.87, 62.6), "max", fontsize=5.94, fontname="helv")
+    spage.insert_text((c_end + 1.87 + fitz.get_text_length("max", fontname="helv", fontsize=5.94) + 1.9, 60),
+                      "approximately", fontsize=7.44, fontname="helv")
+    sdoc.save(sub_pdf)
+    sdoc.close()
+    sub_words = [w.text for w in extract_words(sub_pdf)]
+    if "\u2098\u2090\u2093" in sub_words:
+        print("PASS: a subscript a space's width from its base is read as a subscript.")
+    else:
+        print(f"FAIL: spaced subscript read as {sub_words}")
+        ok36 = False
+
+    # (e) Table rows whose cells have different numbers of lines read the
+    #     same in both layouts: cell by cell.
+    def wd(text, x, top, h=7.4):
+        return {"text": text, "x0": x, "x1": x + 4.5 * len(text), "top": top, "bottom": top + h}
+
+    # Layout 1: "Placebo" centred beside two-line dose cells.
+    layout1 = [
+        [wd("20", 120, 100), wd("40", 180, 100), wd("80", 240, 100)],
+        [wd("Placebo", 40, 104.5)],
+        [wd("mg/day", 115, 109), wd("mg/day", 175, 109), wd("mg/day", 235, 109)],
+    ]
+    # Layout 2: the "80" cell is wide enough for one line, centred too.
+    layout2 = [
+        [wd("20", 120, 100), wd("40", 180, 100)],
+        [wd("Placebo", 40, 104.5), wd("80", 240, 104.5), wd("mg/day", 255, 104.5)],
+        [wd("mg/day", 115, 109), wd("mg/day", 175, 109)],
+    ]
+
+    def read(lines):
+        return " ".join(w["text"] for _top, words in _read_lines(lines, rtl=False) for w in words)
+
+    want = "Placebo 20 mg/day 40 mg/day 80 mg/day"
+    if read(layout1) == want and read(layout2) == want:
+        print("PASS: a header with centred and wrapped cells reads cell by cell in both layouts.")
+    else:
+        print(f"FAIL: header rows read {read(layout1)!r} / {read(layout2)!r}")
+        ok36 = False
+    # Every cell wraps, the row label is on the first line only.
+    wrapped = [
+        [wd("All", 40, 200), wd("Patients", 58, 200), wd("-1.9", 120, 200), wd("-1.1", 180, 200), wd("-1.4", 240, 200)],
+        [wd("(n=672)", 115, 209), wd("(n=70)", 175, 209), wd("(n=476)", 235, 209)],
+        [wd("Females", 40, 218), wd("-5.1", 120, 218), wd("-0.7", 180, 218), wd("-4.0", 240, 218)],
+    ]
+    if read(wrapped) == "All Patients -1.9 (n=672) -1.1 (n=70) -1.4 (n=476) Females -5.1 -0.7 -4.0":
+        print("PASS: a row whose every cell wraps reads each cell whole.")
+    else:
+        print(f"FAIL: wrapped row read {read(wrapped)!r}")
+        ok36 = False
+    # Not tables: ordinary lines, and a title of mixed sizes, keep their order.
+    prose = [[wd("The", 40, 300), wd("first", 60, 300), wd("line", 90, 300)],
+             [wd("the", 40, 312), wd("second", 60, 312), wd("one", 100, 312)]]
+    title = [[wd("INJECTION", 200, 79, 14)], [wd("(Acyclovir", 150, 86, 10), wd("Sodium)", 260, 86, 10)],
+             [wd("500mg", 150, 97, 8)]]
+    if read(prose) == "The first line the second one" and read(title) == "INJECTION (Acyclovir Sodium) 500mg":
+        print("PASS: ordinary text and a mixed-size title are read line by line, as before.")
+    else:
+        print(f"FAIL: non-table lines read {read(prose)!r} / {read(title)!r}")
+        ok36 = False
+
+    # (f) Dash rules around Highlights headings carry no text.
+    ruled = build_comparison_tokens(lines_words(["----------- RECENT MAJOR CHANGES- ----------",
+                                                 "-------DOSAGE FORMS AND STRENGTHS-------"]))
+    plain = build_comparison_tokens(lines_words(["RECENT MAJOR CHANGES", "DOSAGE FORMS AND STRENGTHS"]))
+    if [t.text for t in ruled] == [t.text for t in plain] and not diff_documents(ruled, plain):
+        print("PASS: '------ HEADING ------' and '------HEADING' compare as the plain heading.")
+    else:
+        print(f"FAIL: dash rules read {[t.text for t in ruled]}")
+        ok36 = False
+
+    # (g) A cross-reference spaced differently is ONE spacing row.
+    ref_a = build_comparison_tokens(lines_words(["see Warnings and Precautions (5.2)] . Next sentence here"]))
+    ref_b = build_comparison_tokens(lines_words(["see Warnings and Precautions ( 5.2) ]. Next sentence here"]))
+    ref_rows = diff_documents(ref_a, ref_b)
+    if len(ref_rows) == 1 and ref_rows[0].severity == "minor":
+        print("PASS: '(5.2)] .' against '( 5.2) ].' is one minor spacing difference.")
+    else:
+        print(f"FAIL: spacing rows {[(i.approved_text, i.suspect_text, i.severity) for i in ref_rows]}")
+        ok36 = False
+    if ok36:
+        print("PASS: Word draft against an SPL.")
+
+    print()
+    print("=" * 70)
+    print("TEST 37: Tables read the same whichever way they are drawn")
+    print("=" * 70)
+    ok37 = True
+    from core.pdf_extractor import _bands_are_number_table, _table_units_for
+
+    def cw(text, x, top, h=9.0, width=None):
+        return {"text": text, "x0": x, "x1": x + (width or 5.0 * len(text)), "top": top, "bottom": top + h}
+
+    def phrase(text, x, top, h=9.0):
+        out = []
+        for part in text.split():
+            out.append(cw(part, x, top, h))
+            x += 5.0 * len(part) + 3.0
+        return out
+
+    def read37(lines):
+        return " ".join(w["text"] for _top, words in _read_lines(lines, rtl=False) for w in words)
+
+    # (a) Which zones are tables, and which are columns of text or lists.
+    number_bands = [(90, 187), (218, 233), (294, 309), (391, 407), (493, 540)]
+    cell_bands = [(90, 187), (236, 349), (383, 540)]
+    cell_rows = [phrase("80 mg", 100, 80) + phrase("pale green oval", 240, 80) + phrase("Plain on one side and debossed", 390, 76)]
+    prose_rows = [phrase("the quick brown fox jumps over", 92, y) + phrase("a lazy dog sat by the", 238, y)
+                  + phrase("river and slept all day", 385, y) for y in (10, 22, 34)]
+    list_rows = [phrase("• ritonavir", 92, y) + phrase("• carbamazepine", 238, y) + phrase("• rifampin", 385, y)
+                 for y in (10, 22)]
+    if (_bands_are_number_table(number_bands) and _bands_are_number_table(cell_bands, cell_rows)
+            and not _bands_are_number_table(cell_bands, prose_rows)
+            and not _bands_are_number_table(cell_bands, list_rows)):
+        print("PASS: number and short-cell columns are a table; text columns and bulleted lists are not.")
+    else:
+        print("FAIL: table / text-column / list zones misjudged")
+        ok37 = False
+
+    # (b) A row label wrapped onto a line of its own: it belongs to the
+    #     row it sits closer to.
+    up_rows = [phrase("Flushing", 18, 98) + [cw("10%", 104, 98), cw("9%", 166, 98), cw("16%", 227, 98)],
+               phrase("Pain in", 18, 111) + [cw("7%", 104, 111), cw("15%", 166, 111), cw("9%", 227, 111)],
+               phrase("Limb", 18, 120.5),
+               phrase("Myalgia", 18, 133) + [cw("7%", 104, 133), cw("6%", 166, 133), cw("14%", 227, 133)]]
+    down_rows = [phrase("Akathisia", 58, 641) + [cw("3", 196, 641), cw("6", 247, 641), cw("11", 296, 641)],
+                 phrase("Extrapyramidal", 58, 652),
+                 phrase("Disorder**", 58, 663) + [cw("6", 196, 663), cw("6", 247, 663), cw("11", 296, 663)]]
+    if (read37(up_rows) == "Flushing 10% 9% 16% Pain in Limb 7% 15% 9% Myalgia 7% 6% 14%"
+            and read37(down_rows) == "Akathisia 3 6 11 Extrapyramidal Disorder** 6 6 11"):
+        print("PASS: 'Pain in / Limb' and 'Extrapyramidal / Disorder**' each read as one label.")
+    else:
+        print(f"FAIL: wrapped labels read {read37(up_rows)!r} / {read37(down_rows)!r}")
+        ok37 = False
+
+    # (c) A header stacked in columns on a shared line grid.
+    stacked = [phrase("Lurasidone", 300, 380) + phrase("Lurasidone", 420, 380),
+               phrase("hydrochloride tablets", 300, 391) + phrase("hydrochloride tablets", 420, 391),
+               phrase("Placebo", 200, 402) + phrase("40 mg/day", 300, 402) + phrase("80 mg/day", 420, 402),
+               phrase("All Patients", 90, 416) + [cw("+0.10", 200, 416), cw("+0.75", 300, 416), cw("+1.20", 420, 416)],
+               phrase("Females", 90, 430) + [cw("+0.70", 200, 430), cw("+0.60", 300, 430), cw("+4.40", 420, 430)]]
+    want37 = ("Lurasidone hydrochloride tablets Lurasidone hydrochloride tablets Placebo 40 mg/day 80 mg/day "
+              "All Patients +0.10 +0.75 +1.20 Females +0.70 +0.60 +4.40")
+    if read37(stacked) == want37:
+        print("PASS: a stacked header reads column by column; its data rows stay rows.")
+    else:
+        print(f"FAIL: stacked header read {read37(stacked)!r}")
+        ok37 = False
+
+    # (d) A ruled grid that gives a record's second line a grid row of its
+    #     own reads like the borderless table: cell by cell.
+    grid_words = [cw("All", 20, 100), cw("Patients", 40, 100), cw("+0.10", 120, 100), cw("+0.75", 200, 100),
+                  cw("(n=103)", 120, 112), cw("(n=102)", 200, 112),
+                  cw("Females", 20, 124), cw("+0.70", 120, 124), cw("+0.60", 200, 124),
+                  cw("(n=39)", 120, 136), cw("(n=42)", 200, 136)]
+    grid_cells = {0: (0, 0, 0), 1: (0, 0, 0), 2: (0, 0, 1), 3: (0, 0, 2), 4: (0, 1, 1), 5: (0, 1, 2),
+                  6: (0, 2, 0), 7: (0, 2, 1), 8: (0, 2, 2), 9: (0, 3, 1), 10: (0, 3, 2)}
+    units = _table_units_for(0, list(enumerate(grid_words)), [(0.0, 300.0)], grid_cells, (10, 95, 260, 150))
+    grid_read = " ".join(w["text"] for _b, _k, ws in sorted(units, key=lambda u: u[1]) for w in ws)
+    if grid_read == "All Patients +0.10 (n=103) +0.75 (n=102) Females +0.70 (n=39) +0.60 (n=42)":
+        print("PASS: a grid row with no label continues the cells of the labelled row above.")
+    else:
+        print(f"FAIL: grid continuation read {grid_read!r}")
+        ok37 = False
+    if ok37:
+        print("PASS: tables read the same whichever way they are drawn.")
+
+    print()
+    print("=" * 70)
+    print("TEST 38: The Find bar finds words and sentences where they are drawn")
+    print("=" * 70)
+    ok38 = True
+    from core.text_search import SearchIndex, SearchWord, build_search_index
+
+    find_pdf = os.path.join(tmp, "find_bar.pdf")
+    fdoc = fitz.open()
+    fp1 = fdoc.new_page(width=400, height=300)
+    fp1.insert_text((40, 60), "The quick brown fox jumps", fontsize=12)
+    fp1.insert_text((40, 80), "over the lazy dog.", fontsize=12)
+    fp2 = fdoc.new_page(width=400, height=300)
+    fp2.insert_text((40, 60), "Foxes and a fox: THE FOX again.", fontsize=12)
+    fp2.set_rotation(90)
+    fdoc.save(find_pdf)
+    fdoc.close()
+    index = build_search_index(find_pdf, "pdf")
+
+    # (a) A sentence across a line break: one match, one box per line.
+    across = index.find_all("brown fox jumps over the lazy")
+    if len(across) == 1 and [(pg, len(b)) for pg, b in across[0].pages] == [(1, 2)]:
+        print("PASS: a sentence across a line break is one match with a box per line.")
+    else:
+        print(f"FAIL: line-break sentence gave {[(m.pages) for m in across]}")
+        ok38 = False
+
+    # (b) Case, whole words, look-alike quotes, every occurrence in order.
+    any_case = index.find_all("fox")
+    exact = index.find_all("fox", match_case=True)
+    whole = index.find_all("fox", whole_word=True)
+    quote = SearchIndex([SearchWord(1, 0.0, 0.0, 30.0, 10.0, "Don’t")]).find_all("don't")
+    if (len(any_case) == 4 and len(exact) == 2 and len(whole) == 3 and len(quote) == 1
+            and [m.page for m in any_case] == [1, 2, 2, 2]):
+        print("PASS: case, whole-word and curly-quote searches count every occurrence in order.")
+    else:
+        print(f"FAIL: fox {len(any_case)}/{len(exact)}/{len(whole)}, don't {len(quote)}")
+        ok38 = False
+
+    # (c) Boxes land where the page is drawn: on a rotated page too.
+    with fitz.open(find_pdf) as fdoc:
+        # search_for answers in the unrotated page; the page is drawn rotated.
+        drawn = fdoc[1].search_for("again")[0] * fdoc[1].rotation_matrix
+        page_rect = fdoc[1].rect
+    box = index.find_all("again")[0].pages[0][1][0]
+    # "again" of "again." -- cut along the line, which runs down the drawn page.
+    if (abs(box[0] - drawn.x0) < 1 and abs(box[1] - drawn.y0) < 1 and abs(box[3] - drawn.y1) < 3
+            and box[3] - box[1] > box[2] - box[0] and page_rect.width == 300):
+        print("PASS: a match on a rotated page is boxed where the page is drawn.")
+    else:
+        print(f"FAIL: rotated-page box {box} vs drawn {tuple(drawn)}")
+        ok38 = False
+
+    # (d) Part of a word is boxed as that part, narrow punctuation allowed for.
+    part_index = SearchIndex([SearchWord(1, 100.0, 10.0, 145.0, 20.0, "disorder,")])
+    part = part_index.find_all("disorder")[0].pages[0][1][0]
+    if 140.0 < part[2] < 145.0 and part[0] == 100.0:
+        print("PASS: 'disorder' inside 'disorder,' is boxed up to the comma.")
+    else:
+        print(f"FAIL: partial-word box {part}")
+        ok38 = False
+    if ok38:
+        print("PASS: the Find bar finds words and sentences where they are drawn.")
 
     print()
     print(f"(test PDFs written to {tmp} if you want to open them manually)")

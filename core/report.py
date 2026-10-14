@@ -156,6 +156,8 @@ def _write_html(path: str, data: ReportInput) -> None:
             f"<th>Suspect text</th><th>Reason</th></tr>{entries}</table>"
         )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    unique_count = len({(data.category_of(item), item.approved_text, item.suspect_text) for item in data.items})
+    unique_str = f" ({unique_count} unique)" if data.items else ""
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -177,7 +179,7 @@ def _write_html(path: str, data: ReportInput) -> None:
 <table><tr><th></th><th>File</th><th>Size</th><th>SHA-256</th></tr>{''.join(files)}</table>
 {f'<h2>What could not be compared</h2><ul class="warn">{warnings}</ul>' if warnings else ''}
 <h2>Summary</h2>
-<p>{len(data.items)} difference{'s' if len(data.items) != 1 else ''}: {summary}<br>Review: {review or 'nothing reviewed'}</p>
+<p>{len(data.items)} difference{'s' if len(data.items) != 1 else ''}{unique_str}: {summary}<br>Review: {review or 'nothing reviewed'}</p>
 <h2>Differences</h2>
 <table><tr>{''.join(f'<th>{e(c)}</th>' for c in _COLUMNS)}</tr>{''.join(body_rows)}</table>
 {rematch}

@@ -39,6 +39,7 @@ a tooltip.
 from __future__ import annotations
 
 import getpass
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -163,6 +164,12 @@ class ResultsPanel(QWidget):
         show_label = QLabel("Show")
         show_label.setObjectName("muted")
         chip_layout.addWidget(show_label)
+        # Ticks every category chip, or unticks every chip, in one click
+        # and one table refresh. The label says which it will do.
+        self.select_all_button = QToolButton()
+        self.select_all_button.setProperty("chip", True)
+        self.select_all_button.clicked.connect(self._toggle_all_chips)
+        chip_layout.addWidget(self.select_all_button)
         for category in CATEGORY_ORDER:
             chip = QToolButton()
             chip.setCheckable(True)
@@ -178,9 +185,30 @@ class ResultsPanel(QWidget):
                 else f"Show or hide '{CATEGORY_LABELS[category]}' differences"
             )
             chip.toggled.connect(self._refresh_table)
+            chip.toggled.connect(self._update_select_all_label)
             self._chips[category] = chip
             chip_layout.addWidget(chip)
+        # Not a category: a view. Ticked, the list holds only differences
+        # that occur more than once, each identical set as ONE row with
+        # its count; the comparator then shows every occurrence (Context,
+        # Letters). Off by default, so nothing is hidden until asked.
+        self._group_sizes: Counter = Counter()
+        self.identical_chip = QToolButton()
+        self.identical_chip.setCheckable(True)
+        self.identical_chip.setChecked(False)
+        self.identical_chip.setProperty("chip", True)
+        self.identical_chip.setToolTip(
+            "Show only differences that occur more than once -- identical text, "
+            "identical change -- each set as one row with its count. Works on its "
+            "own (no other chip needed); with category chips ticked, only the "
+            "repeated ones in those categories. Tick Context or Letters in the "
+            "comparator to see every occurrence."
+        )
+        self.identical_chip.toggled.connect(self._refresh_table)
+        self.identical_chip.toggled.connect(self._update_select_all_label)
+        chip_layout.addWidget(self.identical_chip)
         self._update_chip_labels()
+        self._update_select_all_label()
 
         # --- view options ---
         self.ignore_minor_checkbox = QCheckBox("Ignore minor and below")
@@ -403,7 +431,7 @@ class ResultsPanel(QWidget):
         for item in diff_items:
             self._categories[id(item)] = category_of(item)
         self._update_chip_labels()
-        if self.group_checkbox.isChecked() or self._page_order():
+        if self.group_checkbox.isChecked() or self.identical_chip.isChecked() or self._page_order():
             # Grouping can merge a new row into an existing one, and page
             # order can put it anywhere: both need the full rebuild.
             self._refresh_table(keep_selection=True)
@@ -441,20 +469,40 @@ class ResultsPanel(QWidget):
         place in the list. Returns the new rows (empty when the rematch
         left nothing to report). Undone by `undo_rematch`. Every rematch
         is logged (`rematch_log`), so a removed row stays on record."""
-        try:
-            position = next(i for i, existing in enumerate(self._items) if existing is item)
-        except StopIteration:
+        if not any(existing is item for existing in self._items):
             return []
-        self._log_rematch(
-            item,
-            "removed" if not replacements else f"replaced by {len(replacements)} row(s)",
-            reason,
-        )
-        self._rematches.append((position, item, list(replacements)))
-        self._items[position : position + 1] = replacements
-        self._decisions.pop(id(item), None)
-        self._categories.pop(id(item), None)
-        self._viewed_items.discard(id(item))
+        return self.replace_items([item], replacements, reason)
+
+    def replace_items(
+        self, items: list[DiffItem], replacements: list[DiffItem], reason: str = ""
+    ) -> list[DiffItem]:
+        """Swap several differences for the rows one rematch produced
+        (an area rematch takes over every row inside the areas). The new
+        rows go where the first of the old ones was. One `undo_rematch`
+        puts them all back."""
+        replaced_ids = {id(item) for item in items}
+        positions = [i for i, existing in enumerate(self._items) if id(existing) in replaced_ids]
+        position = positions[0] if positions else len(self._items)
+        old = [self._items[i] for i in positions]
+        for item in old:
+            self._log_rematch(
+                item,
+                "removed" if not replacements
+                else f"replaced by {len(replacements)} row(s)" if len(old) == 1
+                else f"replaced, with {len(old) - 1} other row(s), by {len(replacements)} row(s)",
+                reason,
+            )
+        if not old:
+            # Nothing listed was inside the areas: the new rows are all new.
+            for new_item in replacements:
+                self._log_rematch(new_item, "added by an area rematch", reason)
+        self._rematches.append((position, old, list(replacements)))
+        remaining = [existing for existing in self._items if id(existing) not in replaced_ids]
+        self._items = remaining[:position] + list(replacements) + remaining[position:]
+        for item in old:
+            self._decisions.pop(id(item), None)
+            self._categories.pop(id(item), None)
+            self._viewed_items.discard(id(item))
         for new_item in replacements:
             self._categories[id(new_item)] = category_of(new_item)
         self._renumber()
@@ -464,26 +512,32 @@ class ResultsPanel(QWidget):
         return replacements
 
     def undo_rematch(self) -> DiffItem | None:
-        """Put the most recently rematched difference back. Returns it,
-        or None when nothing has been rematched."""
+        """Put the most recently rematched difference(s) back. Returns
+        the first of them, or None when nothing has been rematched (or
+        the rematch had replaced no row)."""
         if not self._rematches:
             return None
-        position, item, replacements = self._rematches.pop()
-        self._log_rematch(item, "rematch undone (row restored)", "")
+        position, old, replacements = self._rematches.pop()
+        for item in old:
+            self._log_rematch(item, "rematch undone (row restored)", "")
+        replaced_ids = {id(new_item) for new_item in replacements}
         start = next(
-            (i for i, existing in enumerate(self._items)
-             if any(existing is new_item for new_item in replacements)),
+            (i for i, existing in enumerate(self._items) if id(existing) in replaced_ids),
             position,
         )
-        remaining = [i for i in self._items if not any(i is r for r in replacements)]
-        remaining.insert(min(start, len(remaining)), item)
+        remaining = [i for i in self._items if id(i) not in replaced_ids]
+        start = min(start, len(remaining))
+        remaining[start:start] = old
+        if not old:
+            for new_item in replacements:
+                self._log_rematch(new_item, "area rematch undone (row withdrawn)", "")
         self._items = remaining
         self._categories = {id(i): self._categories.get(id(i)) or category_of(i) for i in self._items}
         self._renumber()
         self._update_chip_labels()
         self._refresh_table()
         self.review_changed.emit()
-        return item
+        return old[0] if old else None
 
     def _log_rematch(self, item: DiffItem, outcome: str, reason: str) -> None:
         self._rematch_log.append({
@@ -566,6 +620,14 @@ class ResultsPanel(QWidget):
 
     def all_items(self) -> list[DiffItem]:
         return list(self._items)
+
+    def unique_item_count(self) -> int:
+        """Total number of unique deviations (identical deviations counted once)."""
+        return len({_group_key(item) for item in self._items})
+
+    def unique_listed_count(self) -> int:
+        """Number of unique deviations currently shown/passing the filters."""
+        return len({_group_key(item) for group in self._row_groups for item in group})
 
     def selected_items(self) -> list[DiffItem]:
         """Every difference in the selected rows (a grouped row stands
@@ -677,6 +739,32 @@ class ResultsPanel(QWidget):
     # Internal
     # ------------------------------------------------------------------
 
+    def _all_categories_shown(self) -> bool:
+        return all(chip.isChecked() for chip in self._chips.values())
+
+    def _update_select_all_label(self, *_args) -> None:
+        if self._all_categories_shown():
+            self.select_all_button.setText("Unselect All")
+            self.select_all_button.setToolTip("Untick every filter in this row (Identical too): the list empties.")
+        else:
+            self.select_all_button.setText("Select All")
+            self.select_all_button.setToolTip(
+                "Tick every category filter in this row. Identical is left as it is: "
+                "it narrows the list to repeated differences rather than adding rows."
+            )
+
+    def _toggle_all_chips(self) -> None:
+        """Select All: tick every category chip. Unselect All: untick every
+        chip, Identical included. One table refresh, not one per chip."""
+        select = not self._all_categories_shown()
+        chips = list(self._chips.values()) + ([] if select else [self.identical_chip])
+        for chip in chips:
+            chip.blockSignals(True)
+            chip.setChecked(select)
+            chip.blockSignals(False)
+        self._update_select_all_label()
+        self._refresh_table(keep_selection=True)
+
     def _update_chip_labels(self) -> None:
         counts = {category: 0 for category in CATEGORY_ORDER}
         for item in self._items:
@@ -684,9 +772,23 @@ class ResultsPanel(QWidget):
         for category, chip in self._chips.items():
             chip.setText(f"{CATEGORY_LABELS[category]} {counts[category]}")
             chip.setEnabled(counts[category] > 0)
+        self._group_sizes = Counter(_group_key(item) for item in self._items)
+        repeated = sum(1 for size in self._group_sizes.values() if size > 1)
+        self.identical_chip.setText(f"Identical {repeated}")
+        # Stays clickable while ticked, so it can always be unticked.
+        self.identical_chip.setEnabled(repeated > 0 or self.identical_chip.isChecked())
 
     def _passes_filters(self, item: DiffItem) -> bool:
-        if not self._chips[self._categories[id(item)]].isChecked():
+        category_shown = self._chips[self._categories[id(item)]].isChecked()
+        if self.identical_chip.isChecked():
+            # Identical stands on its own: with no category chip ticked it
+            # shows every repeated difference; with some ticked, only the
+            # repeated ones in those categories.
+            if not category_shown and any(chip.isChecked() for chip in self._chips.values()):
+                return False
+            if self._group_sizes.get(_group_key(item), 0) < 2:
+                return False
+        elif not category_shown:
             return False
         if self.ignore_minor_checkbox.isChecked() and item.severity in _MINOR_AND_BELOW:
             return False
@@ -713,11 +815,16 @@ class ResultsPanel(QWidget):
         listed = [item for item in self._items if self._passes_filters(item)]
         if self._page_order():
             listed.sort(key=_page_position)
-        if self.group_checkbox.isChecked():
+        if self.group_checkbox.isChecked() or self.identical_chip.isChecked():
             groups: dict[tuple, list[DiffItem]] = {}
             for item in listed:
                 groups.setdefault(_group_key(item), []).append(item)
             self._row_groups = list(groups.values())
+            if self.identical_chip.isChecked():
+                # Repeated among what is LISTED: with one copy accepted and
+                # "Hide reviewed" on, the rest is no longer a repeated set.
+                self._row_groups = [group for group in self._row_groups if len(group) > 1]
+                listed = [item for group in self._row_groups for item in group]
         else:
             self._row_groups = [[item] for item in listed]
         self._visible_items = [group[0] for group in self._row_groups]
@@ -751,13 +858,20 @@ class ResultsPanel(QWidget):
     def _update_summary_labels(self, listed_count: int | None = None) -> None:
         t = theme.tokens()
         total_items = len(self._items)
+        unique_total = self.unique_item_count()
         unseen_count = sum(1 for i in self._items if id(i) not in self._viewed_items)
         unseen_pct = (unseen_count / total_items * 100) if total_items > 0 else 0
         reviewed = [self._decisions[id(i)].status for i in self._items if id(i) in self._decisions]
         count_shown = listed_count if listed_count is not None else len(self._visible_items)
+        unique_shown = self.unique_listed_count()
+
+        if count_shown == total_items:
+            shown_text = f"{count_shown} of {total_items} shown ({unique_total} unique)"
+        else:
+            shown_text = f"{count_shown} of {total_items} shown ({unique_shown} of {unique_total} unique)"
 
         self.summary_label.setText(
-            f"{count_shown} of {total_items} shown · "
+            f"{shown_text} · "
             f"{reviewed.count(ACCEPTED)} accepted · {reviewed.count(REJECTED)} rejected · "
             f"{total_items - len(reviewed)} to review"
         )

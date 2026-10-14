@@ -301,6 +301,7 @@ def diff_documents(
         if worth_showing:
             on_found(worth_showing)
 
+    _harmonize_line_break_hyphens(approved_tokens, suspect_tokens)
     sections_a = _split_sections(approved_tokens)
     sections_b = _split_sections(suspect_tokens)
     if sections_a is not None and sections_b is not None:
@@ -310,6 +311,60 @@ def diff_documents(
     whole = _diff_runs(approved_tokens, suspect_tokens, matches)
     _found(whole)
     return _finalize_items(whole, approved_tokens, suspect_tokens)
+
+
+def _harmonize_line_break_hyphens(
+    approved_tokens: list[ComparisonToken], suspect_tokens: list[ComparisonToken]
+) -> None:
+    """Decide, for each word stitched across a line break, whether the
+    hyphen it was broken at belongs to the word.
+
+    "placebo-" at the end of one line and "treated" on the next is read
+    as "placebotreated" -- right for typesetter hyphenation
+    ("pharmaco-" + "kinetics"), wrong for a compound that merely broke
+    at its own hyphen. Neither Word nor a browser hyphenates on its own,
+    so in a Word draft against an SPL nearly every such break is a real
+    hyphen, and each one became a "hyphenation" difference ("placebo-
+    treated" against "placebotreated") that is on neither page.
+
+    The words printed WHOLE, on one line, settle it -- in either
+    document: when the word appears there with the hyphen and never
+    without, the hyphen is put back (the token then reads as printed).
+    Otherwise -- written without, both ways, or never on one line --
+    the stitched form stands, as before. Decided afresh on every call,
+    from the stitched form: the same extracted document compared next
+    with a different one gets that comparison's answer, not this one's.
+    """
+    whole = {
+        _EDGE_PUNCTUATION.sub("", t.text)
+        for tokens in (approved_tokens, suspect_tokens)
+        for t in tokens
+        if getattr(t, "line_break_hyphen", None) is None
+    }
+    for tokens in (approved_tokens, suspect_tokens):
+        for token in tokens:
+            at = getattr(token, "line_break_hyphen", None)
+            if at is None:
+                continue
+            stitched = _stitched_text(token)
+            hyphenated = stitched[:at] + "-" + stitched[at:]
+            # The word itself, without what clings to it: "short-term,"
+            # is evidence for "short-" + "term." as much as "short-term".
+            with_hyphen = _EDGE_PUNCTUATION.sub("", hyphenated) in whole
+            without = _EDGE_PUNCTUATION.sub("", stitched) in whole
+            token.text = hyphenated if with_hyphen and not without else stitched
+
+
+# Punctuation at either end of a word (and nothing else).
+_EDGE_PUNCTUATION = re.compile(r"^[^\w]+|[^\w]+$")
+
+
+def _stitched_text(token: ComparisonToken) -> str:
+    """A token's text with a line-break hyphen left out (as stitched)."""
+    at = getattr(token, "line_break_hyphen", None)
+    if at is not None and token.text[at : at + 1] == "-" and len(token.text) > at + 1:
+        return token.text[:at] + token.text[at + 1 :]
+    return token.text
 
 
 def _diff_runs(
@@ -387,7 +442,14 @@ def _items_from_opcodes(
         # since character-level realignment there tends to produce
         # meaningless partial-word fragments instead of cleaner
         # results.
-        if tag == "replace" and len(approved_slice) > 1 and len(suspect_slice) > 1:
+        # The same characters, only spaced differently ("(5.2)]." against
+        # an SPL's "( 5.2) ].") is ONE spacing difference: re-diffing it
+        # character by character split it into an inserted "(" and two
+        # changed fragments.
+        same_letters = tag == "replace" and "".join(t.text for t in approved_slice) == "".join(
+            t.text for t in suspect_slice
+        )
+        if tag == "replace" and len(approved_slice) > 1 and len(suspect_slice) > 1 and not same_letters:
             items.extend(
                 _diff_replace_span(
                     approved_slice, suspect_slice, base_index=len(items), matches=matches
@@ -682,9 +744,15 @@ def _locate_moved_counterparts(
         else:
             continue
         start = _find_token_run(tokens, text.split(), used[side])
-        if start is None:
-            continue
-        run = tokens[start:start + len(text.split())]
+        if start is not None:
+            run = tokens[start:start + len(text.split())]
+        else:
+            # Found by its letters and digits (a heading whose dash rules
+            # differ in length): locate it the same way.
+            run = _find_alnum_run(tokens, text, used[side])
+            if not run:
+                continue
+            start = tokens.index(run[0])
         used[side].add(start)
         if side == "suspect":
             item.suspect_text = text
@@ -692,6 +760,25 @@ def _locate_moved_counterparts(
         else:
             item.approved_text = text
             item.approved_location = _location_of(run)
+
+
+def _find_alnum_run(tokens: list[ComparisonToken], text: str, taken: set[int]) -> list[ComparisonToken]:
+    """The shortest run of tokens whose letters and digits spell ``text``'s,
+    ignoring punctuation and case; [] when there is none."""
+    target = "".join(ch for ch in text if ch.isalnum()).casefold()
+    if len(target) < 12:
+        return []
+    keys = ["".join(ch for ch in t.text if ch.isalnum()).casefold() for t in tokens]
+    for i, key in enumerate(keys):
+        if i in taken or not key or not target.startswith(key):
+            continue
+        built, j = "", i
+        while j < len(tokens) and len(built) < len(target):
+            built += keys[j]
+            j += 1
+        if built == target:
+            return tokens[i:j]
+    return []
 
 
 def _find_token_run(tokens: list[ComparisonToken], words: list[str], taken: set[int]) -> Optional[int]:
@@ -1556,6 +1643,17 @@ def _same_title(sec_a: _Section, sec_b: _Section) -> bool:
     )
 
 
+def _titles_alike(sec_a: _Section, sec_b: _Section) -> bool:
+    """Stricter than `_same_title`: the titles name the same section,
+    not merely share a number and a few letters."""
+    if sec_a.header_key == sec_b.header_key:
+        return True
+    title_a, title_b = sec_a.header_key[1], sec_b.header_key[1]
+    return bool(title_a and title_b) and (
+        difflib.SequenceMatcher(None, title_a, title_b).ratio() >= _UNNUMBERED_SECTION_TITLE_RATIO
+    )
+
+
 def _longest_increasing_subsequence_indices(seq: list[int]) -> set[int]:
     """Return the set of indices in `seq` that belong to the longest strictly
     increasing subsequence. Elements at indices NOT in this set are the ones
@@ -1718,7 +1816,16 @@ def _diff_by_sections(
         # Sections paired only by content (different headers -- e.g. a
         # figure label read as a header) aren't reported as moved: that
         # would claim a section move the documents don't have.
-        if a_idx in moved_sections and _same_title(sec_a, sec_b):
+        # Only when the titles are recognizably the SAME section. One
+        # that moved and was renumbered or lightly retitled ("5.2
+        # Pancreatitis" -> "5.1 Pancreatitis", "Diabetic Ketoacidosis" ->
+        # "Ketoacidosis") is a move. Two different titles paired by their
+        # number ("2.1 Recommendations for All Patients" -> "2.1 Important
+        # Dosage and Administration Information", 0.41 alike) are not: the
+        # change is already an edit in this section's own comparison, and
+        # a "moved" row setting them side by side reads as a wrong
+        # comparison.
+        if a_idx in moved_sections and _titles_alike(sec_a, sec_b):
             items.append(
                 DiffItem(
                     index=len(items),
@@ -1931,65 +2038,30 @@ def _downgrade_relocated_runs(
     suspect_full = " ".join(t.text for t in suspect_tokens)
     approved_alnum = "".join(ch for ch in approved_full if ch.isalnum()).casefold()
     suspect_alnum = "".join(ch for ch in suspect_full if ch.isalnum()).casefold()
-    # Every relocation test below is COUNT-based, never a bare "appears
+    # The relocation test below is COUNT-based, never a bare "appears
     # somewhere" check: text only counts as relocated when the other
     # document holds at least as many copies of it as this one does. A
     # substring/membership test demoted genuine edits -- an added
-    # "daily" (present elsewhere in the approved text), "especially" ->
-    # "especial y" ("especial" is a substring of "especially"), "one" ->
-    # "ONE" -- all silently became "reorder" and were hidden by the
-    # results table's "Ignore minor and below" filter.
-    approved_words = Counter(_relocation_word(t.text) for t in approved_tokens)
-    suspect_words = Counter(_relocation_word(t.text) for t in suspect_tokens)
-    approved_side = (approved_full, approved_alnum, approved_words)
-    suspect_side = (suspect_full, suspect_alnum, suspect_words)
+    # "daily" (present elsewhere in the approved text) silently became
+    # "reorder" and was hidden by the "Ignore minor and below" filter.
+    approved_side = (approved_full, approved_alnum)
+    suspect_side = (suspect_full, suspect_alnum)
 
     for item in items:
-        # For word replacements (text_changed), genuine numeric edits (e.g. 10 mg -> 5 mg) must stay critical
+        # A REPLACEMENT is never relabelled as moved: a row comparing two
+        # different texts is an edit, whatever else the documents contain.
+        # Deciding otherwise from document-wide word counts hid real edits
+        # in heavily revised labels -- "healthcare" -> "health" was called
+        # moved because, across a label where "doctor" became "healthcare
+        # provider" throughout, the counts happened to balance.
         if item.kind == "text_changed":
-            app_digits = _extract_digit_runs(item.approved_text)
-            sus_digits = _extract_digit_runs(item.suspect_text)
-            if app_digits != sus_digits and (app_digits or sus_digits):
-                continue
-
-            app_w = _relocation_word(item.approved_text)
-            sus_w = _relocation_word(item.suspect_text)
-            # Same word modulo case/punctuation/spacing is an in-place
-            # edit (major/minor/typo), never a relocation.
-            if _strip_punct(app_w).replace(" ", "") == _strip_punct(sus_w).replace(" ", ""):
-                continue
-            # Two PASSAGES that are not recognizably the same text are
-            # not one passage relocated, whatever else the documents
-            # contain. Calling them "moved" says nothing true about
-            # either, and buries a real difference in the lowest tier
-            # (and out of the list entirely when "Moved" is unticked):
-            # a real case, "Hold the" against "Fever - Itching one
-            # pre-filled", was reported as moved because every one of
-            # those words appears somewhere in the other document.
-            if not _is_same_text_relocated(item.approved_text, item.suspect_text):
-                continue
-            if (
-                " " not in app_w
-                and " " not in sus_w
-                and len(app_w) >= 3
-                and len(sus_w) >= 3
-                and suspect_words[app_w] >= approved_words[app_w]
-                and approved_words[sus_w] >= suspect_words[sus_w]
-            ):
-                item.kind = "reordered"
-                item.severity = "reorder"
-                continue
+            continue
 
         # (text, its own document, the other document)
         if item.kind == "removed_in_suspect":
             candidates = [(item.approved_text, approved_side, suspect_side)]
         elif item.kind == "added_in_suspect":
             candidates = [(item.suspect_text, suspect_side, approved_side)]
-        elif item.kind == "text_changed":
-            candidates = [
-                (item.approved_text, approved_side, suspect_side),
-                (item.suspect_text, suspect_side, approved_side),
-            ]
         else:
             continue
         # A pure deletion/insertion is only "moved" when the passage is
@@ -1998,20 +2070,14 @@ def _downgrade_relocated_runs(
         # finding the passage: a deleted "Patients should not take this
         # medicine with alcohol." was demoted that way because each of its
         # words occurs somewhere in the other document.
-        # A replacement is moved only when BOTH of its sides are accounted
-        # for elsewhere; one side found is not enough, or new text written
-        # in place of a passage that also appears elsewhere would hide.
-        if all(
-            _is_relocated(text, own, other, allow_word_bag=item.kind == "text_changed")
-            for text, own, other in candidates
-        ):
+        if all(_is_relocated(text, own, other) for text, own, other in candidates):
             item.kind = "reordered"
             item.severity = "reorder"
 
 
-def _is_relocated(text: str, own_side: tuple, other_side: tuple, *, allow_word_bag: bool) -> bool:
-    own_full, own_alnum, own_words = own_side
-    other_full, other_alnum, other_words = other_side
+def _is_relocated(text: str, own_side: tuple, other_side: tuple) -> bool:
+    own_full, own_alnum = own_side
+    other_full, other_alnum = other_side
     word_count = text.count(" ") + 1
     text_alnum = "".join(ch for ch in text if ch.isalnum()).casefold()
     if word_count >= _MIN_RELOCATION_RUN_WORDS and (
@@ -2027,15 +2093,7 @@ def _is_relocated(text: str, own_side: tuple, other_side: tuple, *, allow_word_b
     # prefilled syringe." side by side in one document -- is moved when
     # every fragment is itself found verbatim, a few whole phrases rather
     # than scattered words.
-    if _splits_into_verbatim_fragments(text, own_full, other_full):
-        return True
-    # Word-bag test, for the two sides of a replacement only (a column
-    # permutation swapping words between neighbouring lines): every word
-    # of this side occurs at least as often in the other document.
-    if allow_word_bag and not _contains_digit(text):
-        words = {w for w in (_relocation_word(t) for t in text.split()) if len(w) >= 3}
-        return bool(words) and all(other_words[w] >= own_words[w] for w in words)
-    return False
+    return _splits_into_verbatim_fragments(text, own_full, other_full)
 
 
 _MIN_FRAGMENT_WORDS = 4
@@ -2061,33 +2119,6 @@ def _splits_into_verbatim_fragments(text: str, own_full: str, other_full: str) -
             return False
         start = end
     return True
-
-
-def _relocation_word(text: str) -> str:
-    """Normalize a token/phrase for relocation counting."""
-    return text.strip("•.,()").casefold()
-
-
-# How alike the two sides of a replacement must be before it can count
-# as the same text in a different place. Single words are exempt: one
-# word swapped for another by a column permutation is the case the
-# relocation rule was built for, and is handled above by its own
-# count-based test.
-_RELOCATION_SAME_TEXT_RATIO = 0.5
-
-
-def _is_same_text_relocated(approved: str, suspect: str) -> bool:
-    """Whether a replacement's two sides are the same text, so that
-    finding it elsewhere makes this a relocation rather than a change."""
-    left, right = approved.split(), suspect.split()
-    if not left or not right:
-        return True  # a pure insertion/deletion: judged by the count tests
-    if len(left) == 1 and len(right) == 1:
-        return True
-    return (
-        difflib.SequenceMatcher(None, left, right, autojunk=False).ratio()
-        >= _RELOCATION_SAME_TEXT_RATIO
-    )
 
 
 _MAX_SLUG_WORDS = 12

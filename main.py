@@ -207,7 +207,7 @@ from PySide6.QtWidgets import (
 from core import word_pool
 from core.diff_engine import DiffItem
 from core.office_convert import available_engine
-from core.rematch import RematchContext, rematch_item
+from core.rematch import RematchContext, rematch_areas, rematch_item
 from core.report import ReportInput, write_report
 from core.review_store import ReviewStore
 from core.token_map import APPROVED, CONTEXT, SUSPECT, TokenMap
@@ -236,6 +236,9 @@ _SHORTCUTS = [
     ("Next / previous difference", "F8 / Shift+F8"),
     ("Accept / Reject / Reset selected", "A / R / U (in the list)"),
     ("Rematch one difference", "Double-click it in a viewer, or Ctrl+Shift+R"),
+    ("Draw an area to rematch by hand", "Shift+Drag (Ctrl+Shift+Drag adds a box)"),
+    ("Rematch the two drawn areas", "Ctrl+Shift+A"),
+    ("Clear the drawn areas", "Esc"),
     ("Undo the last rematch", "Ctrl+Shift+Z"),
     ("Zoom in / out (last used viewer)", "Ctrl++ / Ctrl+\u2212"),
     ("Fit width (last used viewer)", "Ctrl+0"),
@@ -243,6 +246,9 @@ _SHORTCUTS = [
     ("Lock views", "Ctrl+L"),
     ("Show highlights", "Ctrl+H"),
     ("Find in list", "Ctrl+F"),
+    ("Search the last used viewer's document", "Ctrl+Shift+F"),
+    ("Next / previous match in the document", "Enter / Shift+Enter in its Find bar, or F3 / Shift+F3"),
+    ("Clear the document search", "Esc in its Find bar"),
 ]
 
 
@@ -279,6 +285,9 @@ class MainWindow(QMainWindow):
         # structure the comparison used, built on the first rematch
         # after a comparison and reused after that.
         self._rematch_context: RematchContext | None = None
+        # The word pairing as it was before each rematch (None for one
+        # that left it alone), so Undo Rematch puts it back too.
+        self._map_undo: list[dict | None] = []
         self._syncing_views = False  # guard against lock-sync feedback loops
         # The review of the current pair of files, kept on disk (see
         # core/review_store.py) so closing the window loses nothing.
@@ -332,6 +341,7 @@ class MainWindow(QMainWindow):
             panel.point_double_clicked.connect(
                 lambda page, x, y, p=panel: self._on_viewer_double_clicked(p, page, x, y)
             )
+            panel.area_selected.connect(lambda p=panel: self._on_area_selected(p))
             # Enable Compare only once both documents are actually loaded;
             # a Word document is laid out in the background first.
             panel.loaded.connect(self._on_document_loaded)
@@ -416,7 +426,7 @@ class MainWindow(QMainWindow):
             tip="Merge multiple split files into the Original document",
         )
         self.compare_action = self._action("&Compare", self.on_compare_clicked, "F5")
-        self.crop_action = self._action("Crop &Header/Footer...", self.on_crop_clicked, "Ctrl+H")
+        self.crop_action = self._action("Crop &Margins (Header/Footer/Sides)...", self.on_crop_clicked, "Ctrl+H")
         self.export_action = self._action(
             "&Export Report...", self._export_report, "Ctrl+E",
             tip="Save every difference with its review decision, both files' SHA-256 "
@@ -440,6 +450,16 @@ class MainWindow(QMainWindow):
         )
         self.reset_action = self._action("Rese&t Selected", lambda: self.results_panel.decide_selected(None))
         self.find_action = self._action("&Find in List", self._focus_search, "Ctrl+F")
+        self.find_in_document_action = self._action(
+            "Find in &Document", lambda: self._active_panel.focus_search(), "Ctrl+Shift+F",
+            tip="Search the text of the last used viewer (each viewer has its own Find bar).",
+        )
+        self.find_next_action = self._action(
+            "Find &Next in Document", lambda: self._active_panel.find_next(), "F3"
+        )
+        self.find_previous_action = self._action(
+            "Find Pre&vious in Document", lambda: self._active_panel.find_previous(), "Shift+F3"
+        )
         self.rematch_action = self._action(
             "Re&match Selected", self._rematch_selected, "Ctrl+Shift+R",
             tip="Compare the selected difference again against the paragraph it belongs "
@@ -451,6 +471,18 @@ class MainWindow(QMainWindow):
             tip="Put the last rematched difference back as it was.",
         )
         self.undo_rematch_action.setEnabled(False)
+        self.rematch_areas_action = self._action(
+            "Rematch &Areas", self._rematch_areas, "Ctrl+Shift+A",
+            tip="Compare a passage you pick in the Original with the passage you pick in the "
+                "Suspect, and nothing else. Drag a box around the text in each document "
+                "(Shift+drag works at any time; Ctrl+Shift+drag adds another box).",
+        )
+        self.rematch_areas_action.setEnabled(False)
+        self.clear_areas_action = self._action(
+            "C&lear Areas", self._clear_areas, "Esc",
+            tip="Remove the boxes drawn for Rematch Areas.",
+        )
+        self.clear_areas_action.setEnabled(False)
 
         self.lock_checkbox = self._action(
             "&Lock Views", self._on_lock_toggled, "Ctrl+L", checkable=True,
@@ -517,6 +549,8 @@ class MainWindow(QMainWindow):
         view_menu = bar.addMenu("&View")
         view_menu.addActions([self.zoom_in_action, self.zoom_out_action, self.fit_action])
         view_menu.addSeparator()
+        view_menu.addActions([self.find_in_document_action, self.find_next_action, self.find_previous_action])
+        view_menu.addSeparator()
         view_menu.addActions([self.lock_checkbox, self.show_highlights_checkbox, self.blink_checkbox])
         view_menu.addSeparator()
         view_menu.addAction(self.toggle_deviations_action)
@@ -531,7 +565,9 @@ class MainWindow(QMainWindow):
         review_menu.addSeparator()
         review_menu.addActions([self.accept_action, self.reject_action, self.reset_action])
         review_menu.addSeparator()
-        review_menu.addActions([self.rematch_action, self.undo_rematch_action])
+        review_menu.addActions([
+            self.rematch_action, self.rematch_areas_action, self.clear_areas_action, self.undo_rematch_action,
+        ])
         review_menu.addSeparator()
         review_menu.addAction(self.find_action)
 
@@ -551,9 +587,9 @@ class MainWindow(QMainWindow):
         self.compare_button.clicked.connect(self.on_compare_clicked)
         toolbar.addWidget(self.compare_button)
 
-        self.crop_button = QPushButton("Crop Header/Footer")
+        self.crop_button = QPushButton("Crop Margins")
         self.crop_button.setEnabled(False)
-        self.crop_button.setToolTip("Define header/footer regions to exclude from comparison.")
+        self.crop_button.setToolTip("Define header, footer, and side margin regions to exclude from comparison.")
         self.crop_button.clicked.connect(self.on_crop_clicked)
         toolbar.addWidget(self.crop_button)
 
@@ -564,6 +600,11 @@ class MainWindow(QMainWindow):
             toolbar.widgetForAction(action).setProperty("flat", True)
         self.prev_action.setText("\u2039 Previous")
         self.next_action.setText("Next \u203a")
+        toolbar.addSeparator()
+        for action, label in ((self.rematch_action, "Rematch"), (self.rematch_areas_action, "Rematch Areas")):
+            toolbar.addAction(action)
+            toolbar.widgetForAction(action).setProperty("flat", True)
+            action.setIconText(label)
         toolbar.addSeparator()
         for action in (self.lock_checkbox, self.show_highlights_checkbox, self.blink_checkbox):
             toolbar.addAction(action)
@@ -678,12 +719,18 @@ class MainWindow(QMainWindow):
 
     def _update_review_actions(self) -> None:
         total = len(self.results_panel.all_items())
-        self.results_dock.setWindowTitle(f"Deviations · {total}" if total else "Deviations")
-        self.toggle_deviations_action.setText(f"&Deviation List ({total})" if total else "&Deviation List")
+        unique = self.results_panel.unique_item_count()
+        self.results_dock.setWindowTitle(f"Deviations · {total} ({unique} unique)" if total else "Deviations")
+        self.toggle_deviations_action.setText(f"&Deviation List ({total} · {unique} unique)" if total else "&Deviation List")
         has_rows = self.results_panel.rowCount() > 0
         has_selection = bool(self.results_panel.table.selectedIndexes())
         self.rematch_action.setEnabled(has_selection and self._token_map is not None)
         self.undo_rematch_action.setEnabled(self.results_panel.can_undo_rematch())
+        self.rematch_areas_action.setEnabled(self._token_map is not None)
+        self.clear_areas_action.setEnabled(
+            self.original_panel.view.area_mode
+            or bool(self.original_panel.area_selection() or self.suspect_panel.area_selection())
+        )
         for action in (self.next_action, self.prev_action):
             action.setEnabled(has_rows)
         for action in (self.accept_action, self.reject_action, self.reset_action):
@@ -724,6 +771,7 @@ class MainWindow(QMainWindow):
     def _on_document_loaded(self, path: str) -> None:
         self._token_map = None
         self._rematch_context = None
+        self._map_undo = []
         self._update_window_title()
         self._update_compare_enabled()
         self._start_extraction(path)
@@ -731,6 +779,7 @@ class MainWindow(QMainWindow):
     def _on_document_loading(self, path: str) -> None:
         self._token_map = None
         self._rematch_context = None
+        self._map_undo = []
         self._update_compare_enabled()
         self._refresh_busy()
         if self._active_worker is None:
@@ -814,7 +863,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def on_crop_clicked(self) -> None:
-        """Open the Crop Header/Footer dialog."""
+        """Open the Crop Margins (Header / Footer / Sides) dialog."""
         dialog = CropDialog(
             original_path=self.original_panel.file_path,
             suspect_path=self.suspect_panel.file_path,
@@ -863,6 +912,7 @@ class MainWindow(QMainWindow):
         self.results_panel.set_token_map(None)
         self._token_map = None
         self._rematch_context = None
+        self._map_undo = []
         self.original_panel.clear_highlight()
         self.suspect_panel.clear_highlight()
         # Stop blinking and clear previous overlays
@@ -974,6 +1024,7 @@ class MainWindow(QMainWindow):
         self._draw_crop_overlays_on_panels()
         self._token_map = result.token_map
         self._rematch_context = None  # rebuilt lazily for these documents
+        self._map_undo = []
         self.results_panel.set_token_map(result.token_map)
         self._update_compare_enabled()
         self._blink_visible = True
@@ -991,9 +1042,14 @@ class MainWindow(QMainWindow):
         if results:
             noun = "difference" if len(results) == 1 else "differences"
             critical = sum(1 for d in results if d.severity == "critical")
+            unique = self.results_panel.unique_item_count()
             self.status_label.setText(
-                f"{len(results)} {noun} found \u00b7 {critical} critical."
+                f"{len(results)} {noun} found ({unique} unique) \u00b7 {critical} critical."
                 + (f" Restored {restored} earlier decision(s) for these files." if restored else "")
+                + (
+                    f" Repeated page headers/footers compared once: {'; '.join(result.furniture)}."
+                    if result.furniture else ""
+                )
                 + (" Parts of the documents could not be read -- see the warning." if result.warnings else "")
             )
             
@@ -1358,6 +1414,7 @@ class MainWindow(QMainWindow):
                 suspect_tokens,
                 side=side,
                 context=self._rematch_context,
+                partners=self._token_map.partners(),
             )
         finally:
             QApplication.restoreOverrideCursor()
@@ -1368,6 +1425,7 @@ class MainWindow(QMainWindow):
             return
 
         replacements = self.results_panel.replace_item(item, result.items, reason=result.message)
+        self._map_undo.append(None)  # the word pairing is left as it was
         self._diff_results = self.results_panel.all_items()
         self._redraw_overlays()
         shown = bool(replacements) and self.results_panel.select_item(replacements[0])
@@ -1382,14 +1440,111 @@ class MainWindow(QMainWindow):
         self._update_review_actions()
 
     def _undo_rematch(self) -> None:
-        item = self.results_panel.undo_rematch()
-        if item is None:
+        if not self.results_panel.can_undo_rematch():
             self.status_label.setText("Nothing to undo.")
             return
+        item = self.results_panel.undo_rematch()
+        snapshot = self._map_undo.pop() if self._map_undo else None
+        if snapshot is not None and self._token_map is not None:
+            self._token_map.restore(snapshot)
         self._diff_results = self.results_panel.all_items()
         self._redraw_overlays()
-        self.results_panel.select_item(item)
-        self.status_label.setText("Rematch undone -- the difference is back as it was.")
+        if item is not None:
+            self.results_panel.select_item(item)
+        self.status_label.setText("Rematch undone -- the differences are back as they were.")
+        self._update_review_actions()
+
+    # --- Rematch Areas: the reviewer pairs two passages by hand ----------
+
+    def _rematch_areas(self) -> None:
+        """Compare the area drawn on the Original with the one drawn on
+        the Suspect (core/rematch.rematch_areas). With an area missing,
+        start drawing: a plain drag then draws a box, and the comparison
+        runs as soon as both documents have one."""
+        if self._token_map is None:
+            self.status_label.setText("Compare the documents first.")
+            return
+        approved_area = self.original_panel.area_selection()
+        suspect_area = self.suspect_panel.area_selection()
+        if not approved_area or not suspect_area:
+            self._set_area_mode(True)
+            self._prompt_for_areas()
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        try:
+            result = rematch_areas(
+                self.results_panel.all_items(),
+                self._token_map.tokens(APPROVED),
+                self._token_map.tokens(SUSPECT),
+                approved_area,
+                suspect_area,
+                self._token_map.partners(),
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not result.ok:
+            self.status_label.setText(result.message)
+            return
+
+        self._map_undo.append(self._token_map.snapshot())
+        self._token_map.rebind(result.selected[APPROVED], result.selected[SUSPECT], result.pairs)
+        replacements = self.results_panel.replace_items(result.replaced, result.items, reason=result.message)
+        self._clear_areas(quiet=True)
+        self._diff_results = self.results_panel.all_items()
+        self._redraw_overlays()
+        shown = bool(replacements) and self.results_panel.select_item(replacements[0])
+        message = result.message
+        if replacements and not shown:
+            message += " (the new rows are hidden by the filters above the list.)"
+        self.status_label.setText(message + " Ctrl+Shift+Z undoes it.")
+        if replacements:
+            self.on_result_activated(replacements[0])
+        self._update_review_actions()
+
+    def _prompt_for_areas(self) -> None:
+        missing = [
+            name for panel, name in ((self.original_panel, "Original"), (self.suspect_panel, "Suspect"))
+            if not panel.area_selection()
+        ]
+        self.status_label.setText(
+            f"Rematch Areas: drag a box around the text in the {' and the '.join(missing)} "
+            "(Ctrl+drag adds another box). The two are compared as soon as both are drawn; Esc cancels."
+        )
+
+    def _on_area_selected(self, panel: DocumentPanel) -> None:
+        self._update_review_actions()
+        if not (self.original_panel.view.area_mode and panel.area_selection()):
+            if panel.area_selection():
+                other = self.suspect_panel if panel is self.original_panel else self.original_panel
+                self.status_label.setText(
+                    f"Area drawn on the {self._title(panel)}. "
+                    + (
+                        "Click Rematch Areas (Ctrl+Shift+A) to compare the two."
+                        if other.area_selection()
+                        else f"Shift+drag around the matching text in the {self._title(other)}, "
+                        "then click Rematch Areas (Ctrl+Shift+A)."
+                    )
+                )
+            return
+        if self.original_panel.area_selection() and self.suspect_panel.area_selection():
+            # Drawing was started from the button: both are there, go.
+            # (Deferred, so the mouse release that drew the box finishes first.)
+            QTimer.singleShot(0, self._rematch_areas)
+        else:
+            self._prompt_for_areas()
+
+    def _set_area_mode(self, on: bool) -> None:
+        for panel in (self.original_panel, self.suspect_panel):
+            panel.set_area_mode(on)
+        self._update_review_actions()
+
+    def _clear_areas(self, quiet: bool = False) -> None:
+        self._set_area_mode(False)
+        for panel in (self.original_panel, self.suspect_panel):
+            panel.clear_area_selection()
+        if not quiet:
+            self.status_label.setText("Areas cleared.")
         self._update_review_actions()
 
     def _activate_from_viewer(self, item: DiffItem, panel: DocumentPanel) -> None:

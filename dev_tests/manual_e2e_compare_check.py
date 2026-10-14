@@ -272,8 +272,10 @@ def main():
     win.original_panel.file_path = three_approved
     win.suspect_panel.file_path = two_suspect
     win.on_compare_clicked()
-    deadline = time.time() + 10
-    while win.results_panel.rowCount() == 0 and time.time() < deadline:
+    # Until the comparison has finished, not just until a first row
+    # streams in (a background Word start-up can slow the first one).
+    deadline = time.time() + 30
+    while (win._active_worker is not None or win.results_panel.rowCount() == 0) and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
     removed_p3 = next(
@@ -910,6 +912,243 @@ def main():
           "PASS" if kept_streaming and restored and page_ordered and reported and banner and warned else "FAIL",
           f"(streaming {kept_streaming}, restored {restored}, page order {page_ordered}, "
           f"report {reported}, banner {banner}, dialog {bool(warned)})")
+    # --- 25. "Identical": repeated differences once each, every occurrence in the comparator ---
+    from PySide6.QtCore import QUrl as _QUrl
+
+    rep_a = os.path.join(tmp, "identical_a.pdf")
+    rep_b = os.path.join(tmp, "identical_b.pdf")
+    make_pdf(rep_a, "The colour of the tablet is white. Store below 25 C. The colour may fade. "
+                    "Check the colour before use. Take one tablet daily.", 400)
+    make_pdf(rep_b, "The color of the tablet is white. Store below 30 C. The color may fade. "
+                    "Check the color before use. Take one tablet daily.", 400)
+    win.original_panel.render_pdf(rep_a)
+    win.suspect_panel.render_pdf(rep_b)
+    win.original_panel.file_path = rep_a
+    win.suspect_panel.file_path = rep_b
+    compare_and_wait()
+    for box in [w for w in app.topLevelWidgets() if isinstance(w, QMessageBox) and w.isVisible()]:
+        box.close()
+    all_rows = rp.rowCount()
+    chip_text = rp.identical_chip.text()
+    rp.identical_chip.setChecked(True)
+    app.processEvents()
+    only_repeats = rp.rowCount() == 1 and len(rp._row_groups[0]) == 3
+    count_cell = rp.table.item(0, 3).text() if rp.table.item(0, 3) else ""
+
+    rp.table.selectRow(0)
+    rp._update_comparator(immediate=True)
+    comparator.context_checkbox.setChecked(True)
+    comparator.letters_checkbox.setChecked(True)
+    app.processEvents()
+    context_all = all(f"#{k}" in comparator.original_view.toPlainText() for k in (1, 2, 3))
+    letters_all = all(f"#{k}" in comparator.letters_view.toPlainText() for k in (1, 2, 3))
+    jumped = []
+    comparator.occurrence_selected.connect(jumped.append)
+    comparator._on_anchor(_QUrl("occ:2"))
+    app.processEvents()
+    clicked = bool(jumped) and comparator.occ_label.text() == "Occurrence 3 of 3"
+    comparator.context_checkbox.setChecked(False)
+
+    # On its own: every category chip unticked, Identical still lists the
+    # repeated set; a category chip ticked narrows to that category.
+    for chip in rp._chips.values():
+        chip.setChecked(False)
+    app.processEvents()
+    alone = rp.rowCount() == 1 and len(rp._row_groups[0]) == 3
+    rp._chips["number"].setChecked(True)
+    app.processEvents()
+    narrowed = rp.rowCount() == 0  # the repeated set is spelling/wording, not a number
+    for chip in rp._chips.values():
+        chip.setChecked(True)
+    app.processEvents()
+
+    # A set reduced to one listed copy is no longer "identical".
+    rp.decide([rp._row_groups[0][0], rp._row_groups[0][1]], ACCEPTED)
+    rp.hide_reviewed_checkbox.setChecked(True)
+    app.processEvents()
+    reduced = rp.rowCount() == 0
+    rp.hide_reviewed_checkbox.setChecked(False)
+    rp.identical_chip.setChecked(False)
+    app.processEvents()
+    restored = rp.rowCount() == all_rows
+
+    print("25. 'Identical' lists each repeated difference once with its count; Context and Letters show every occurrence:",
+          "PASS" if chip_text == "Identical 1" and only_repeats and count_cell == "\u00d73"
+          and context_all and letters_all and clicked and alone and narrowed and reduced and restored else "FAIL",
+          f"(chip {chip_text!r}, all rows {all_rows}, one repeated set {only_repeats}, "
+          f"count {count_cell!r}, context {context_all}, letters {letters_all}, click {clicked}, "
+          f"alone {alone}, narrowed {narrowed}, hidden copies {reduced}, restored {restored})")
+    # --- 26. Select All / Unselect All for the Show row ---
+    full = rp.rowCount()
+    label_start = rp.select_all_button.text()
+    rp.identical_chip.setChecked(True)
+    rp.select_all_button.click()  # all categories ticked -> Unselect All
+    app.processEvents()
+    cleared = (rp.rowCount() == 0 and not any(c.isChecked() for c in rp._chips.values())
+               and not rp.identical_chip.isChecked() and rp.select_all_button.text() == "Select All")
+    rp.select_all_button.click()
+    app.processEvents()
+    selected = (rp.rowCount() == full and all(c.isChecked() for c in rp._chips.values())
+                and not rp.identical_chip.isChecked() and rp.select_all_button.text() == "Unselect All")
+    rp._chips["case"].setChecked(False)
+    app.processEvents()
+    partial_label = rp.select_all_button.text()
+    rp.select_all_button.click()
+    app.processEvents()
+    print("26. Select All / Unselect All ticks and unticks every filter in the Show row:",
+          "PASS" if label_start == "Unselect All" and cleared and selected and partial_label == "Select All"
+          and rp.rowCount() == full else "FAIL",
+          f"(start {label_start!r}, cleared {cleared}, selected {selected}, partial {partial_label!r})")
+
+    # --- 27. Short rematch, and Rematch Areas (pairing two passages by hand) ---
+    area_a = os.path.join(tmp, "areas_a.pdf")
+    area_b = os.path.join(tmp, "areas_b.pdf")
+    make_pdf(area_a, "The colour of the tablet is white.\n\nStore below 25 C in a dry place.", 420)
+    make_pdf(area_b, "The color of the tablet is white.\n\nStore below 30 C in a dry place.", 420)
+    win.original_panel.render_pdf(area_a)
+    win.suspect_panel.render_pdf(area_b)
+    win.original_panel.file_path = area_a
+    win.suspect_panel.file_path = area_b
+    compare_and_wait()
+    for box in [w for w in app.topLevelWidgets() if isinstance(w, QMessageBox) and w.isVisible()]:
+        box.close()
+    first_rows = list(rp.all_items())
+    colour_row = next(d for d in first_rows if d.approved_text == "colour")
+    temp_row = next(d for d in first_rows if d.approved_text == "25")
+
+    # A one-word difference is no longer refused: it is checked through
+    # its paragraph, and a real change stands untouched.
+    loc = temp_row.approved_location
+    x0, top, x1, bottom = loc.bbox
+    win._on_viewer_double_clicked(win.original_panel, loc.page, (x0 + x1) / 2, (top + bottom) / 2)
+    app.processEvents()
+    short_ok = ("stands" in win.status_label.text() and any(d is temp_row for d in rp.all_items())
+                and "Too short" not in win.status_label.text())
+
+    def line_box(location):
+        bx0, btop, bx1, bbottom = location.bbox
+        return location.page, (0.0, btop - 2.0, 600.0, bbottom + 2.0)
+
+    # The button starts drawing; the comparison runs once both are drawn.
+    win.rematch_areas_action.trigger()
+    app.processEvents()
+    drawing = win.original_panel.view.area_mode and "drag a box" in win.status_label.text()
+    win.original_panel.select_area(*line_box(colour_row.approved_location))
+    app.processEvents()
+    win.suspect_panel.select_area(*line_box(colour_row.suspect_location))
+    for _ in range(5):
+        app.processEvents()
+    after_area = list(rp.all_items())
+    by_hand = (len(after_area) == len(first_rows)
+               and not any(d is colour_row for d in after_area)
+               and any((d.approved_text, d.suspect_text) == ("colour", "color") for d in after_area)
+               and not win.original_panel.view.area_mode
+               and not win.original_panel.area_selection() and rp.can_undo_rematch())
+
+    # A real Shift+drag over a line of each document -- deliberately the
+    # WRONG lines -- then Rematch Areas: the mismatch is reported, and the
+    # words that lost their partner are listed, not dropped.
+    def drag_over(panel, location):
+        page, (bx0, btop, bx1, bbottom) = line_box(location)
+        rect = panel._scene_rects_for(page, [(bx0 + 20, btop, bx1 - 20, bbottom)])[0]
+        view = panel.view
+        start = view.mapFromScene(rect.topLeft())
+        end = view.mapFromScene(rect.bottomRight())
+        QTest.mousePress(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier, start)
+        QTest.mouseMove(view.viewport(), end)
+        QTest.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ShiftModifier, end)
+        app.processEvents()
+
+    snapshot = {side: list(p) for side, p in win._token_map.partners().items()}
+    new_colour = next(d for d in after_area if d.approved_text == "colour")
+    new_temp = next(d for d in after_area if d.approved_text == "25")
+    drag_over(win.original_panel, new_colour.approved_location)
+    drag_over(win.suspect_panel, new_temp.suspect_location)
+    gesture = bool(win.original_panel.area_selection()) and bool(win.suspect_panel.area_selection())
+    win._rematch_areas()
+    app.processEvents()
+    wrong_message = win.status_label.text()
+    wrong = ("unpaired" in wrong_message and not any(d is new_colour for d in rp.all_items())
+             and len(rp.all_items()) > len(after_area))
+    changed_map = win._token_map.partners() != snapshot
+    # Selecting a row left unpaired marks ONE insertion point on the
+    # other document -- not a copy of its own boxes at those coordinates.
+    one_marker = True
+    for d in rp.all_items():
+        if bool(d.approved_text) != bool(d.suspect_text):
+            win.on_result_activated(d)
+            app.processEvents()
+            other = win.suspect_panel if d.approved_text else win.original_panel
+            one_marker = one_marker and len(other._missing_items) <= 1
+    wrong = wrong and one_marker
+
+    win._undo_rematch()
+    app.processEvents()
+    undone = ([id(d) for d in rp.all_items()] == [id(d) for d in after_area]
+              and win._token_map.partners() == snapshot)
+
+    win.original_panel.select_area(*line_box(new_colour.approved_location))
+    app.processEvents()
+    esc_enabled = win.clear_areas_action.isEnabled()
+    win.clear_areas_action.trigger()
+    app.processEvents()
+    cleared_areas = esc_enabled and not win.original_panel.area_selection() and not win.clear_areas_action.isEnabled()
+
+    print("27. Short differences are rematched through their paragraph; Rematch Areas pairs two passages by hand:",
+          "PASS" if short_ok and drawing and by_hand and gesture and wrong and changed_map and undone
+          and cleared_areas else "FAIL",
+          f"(short {short_ok}, drawing {drawing}, by hand {by_hand}, gesture {gesture}, wrong pairing {wrong} "
+          f"{wrong_message[:70]!r}, map {changed_map}, undo {undone}, esc {cleared_areas})")
+
+    # --- 28. Find bar: search each document, step through the matches ---
+    import time as _time
+    from PySide6.QtCore import Qt as _Qt
+    from PySide6.QtTest import QTest as _QTest
+
+    for panel in (win.original_panel, win.suspect_panel):
+        deadline = _time.time() + 15
+        while panel._search_index is None and _time.time() < deadline:
+            app.processEvents()
+            _time.sleep(0.02)
+    op = win.original_panel
+    words = [w.text.strip(".,;:()").lower() for w in op._search_index.words]
+    words = [w for w in words if w.isalpha() and len(w) > 1]
+    common = max(set(words), key=words.count)  # the word that occurs most often
+    found = op.search(common)
+    stepped = []
+    for _ in range(found + 1):
+        op.find_next()
+        stepped.append(op.current_search_match())
+    wraps = found > 1 and stepped[-1] == stepped[0] and len(set(stepped)) == found
+    op.find_previous()
+    back = op.current_search_match() == (stepped[-1] - 1) % found
+    tinted = len(op._search_items) >= found and len(op._search_current_items) >= 1
+    # Ctrl+Shift+F puts the cursor in the last used viewer's Find bar; F3 steps.
+    win._set_active_panel(win.suspect_panel)
+    win.find_in_document_action.trigger()
+    app.processEvents()
+    focused = win.suspect_panel.search_field.hasFocus() or not win.isActiveWindow()
+    sp = win.suspect_panel
+    _QTest.keyClicks(sp.search_field, common)
+    _QTest.keyClick(sp.search_field, _Qt.Key.Key_Return)  # searches at once, no wait
+    typed = sp.current_search_match() >= 0 or not sp.search_matches()
+    before = sp.current_search_match()
+    win.find_next_action.trigger()
+    f3 = len(sp.search_matches()) < 2 or sp.current_search_match() == (before + 1) % len(sp.search_matches())
+    # Esc in the Find bar clears the search -- and not the drawn areas.
+    win.original_panel.select_area(1, (10, 10, 200, 60))
+    _QTest.keyClick(sp.search_field, _Qt.Key.Key_Escape)
+    app.processEvents()
+    esc = (not sp.search_field.text() and not sp._search_items
+           and bool(win.original_panel.area_selection()))
+    win._clear_areas()
+    none = op.search("zz-no-such-text-zz") == 0 and op.search_count_label.text() == "No matches"
+    op.search("")
+    print("28. Find bar searches each document and steps through every match:",
+          "PASS" if found > 1 and wraps and back and tinted and focused and typed and f3 and esc and none
+          else "FAIL",
+          f"({common!r}: {found} matches, wraps {wraps}, back {back}, tinted {tinted}, Ctrl+Shift+F {focused}, "
+          f"Enter {typed}, F3 {f3}, Esc {esc}, no match {none})")
     print("dialogs:", dialogs or "none")
 
 
