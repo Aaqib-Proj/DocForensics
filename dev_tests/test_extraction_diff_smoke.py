@@ -2935,8 +2935,15 @@ def main() -> None:
         ("especially", "especial y", "typo", "spelling"),
         ("specifically", "speci cally", "typo", "spelling"),
         ("first", "rst", "typo", "spelling"),
-        ("2.3, 5.1,", "2.3,5.1,", "minor", "punctuation"),
-        ("100 mg", "100mg", "minor", "punctuation"),
+        ("2.3, 5.1,", "2.3,5.1,", "minor", "spacing"),
+        ("100 mg", "100mg", "minor", "spacing"),
+        ("2633 patients", "2,633 patients", "minor", "number"),
+        ("2,633", "2,663", "critical", "number"),
+        ("1,500", "1.5", "critical", "number"),
+        ("ο", "○", "minor", "punctuation"),
+        ("ο", "○ ○", "minor", "punctuation"),
+        ("ο", "η", "critical", "wording"),
+        ("a, b", "a b", "minor", "punctuation"),
     ]
     wrong = []
     for approved, suspect, severity, category in expectations:

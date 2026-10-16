@@ -2360,3 +2360,31 @@ reads (`core/text_search.py`, Qt-free). A Word document laid out by Word is
 searched in that layout; one shown as an approximate layout is searched in
 the words drawn there. A scanned page with no text layer has nothing to find.
 Checked in smoke TEST 38 and GUI step 28.
+
+## 48. Less formatting noise: spacing, thousands separators, list marks
+
+Three kinds of difference that change no word and no value were crowding
+the list (half of the SPL-against-Word-draft rows were spacing alone):
+
+* **Spacing has its own filter.** A difference only in where the spaces
+  are ("( 12.3)" vs "(12.3)", "≥ 65" vs "≥65", "100 mg" vs "100mg") is now
+  "Spacing" instead of "Punctuation/spacing", so it can be hidden without
+  hiding real punctuation changes (a lost comma stays "Punctuation"). Still
+  rated minor, so "Ignore minor and below" hides it too.
+* **Thousands separators are formatting.** "2633" vs "2,633" is the same
+  number: rated minor (still under "Number/dosage", so it can be found)
+  instead of critical. A changed digit ("2,633" vs "2,663") and a decimal
+  sign ("5.000" vs "5,000", "1,500" vs "1.5") are still critical.
+* **A list mark drawn with another glyph** (Greek "ο" in one layout, "○"
+  in the other; "o", "•", "▪", Wingdings bullets) is minor punctuation
+  instead of a critical wording change. Both sides must have a mark, and a
+  real letter change ("ο" vs "η") is still critical.
+
+On the corpus, no row appeared or disappeared and nothing else changed:
+FPL outsert critical 550 -> 495 (35 separators, 20 list marks), SPL draft
+132 rows now "Spacing" (critical 73 -> 71), Amlo 31 -> 30. Checked in smoke
+TEST 29.
+
+The table-row reading added in section 46 was also made faster (extraction
+had become up to twice as slow on dense outserts; it is back to the earlier
+speed with byte-identical output).

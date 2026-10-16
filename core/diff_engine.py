@@ -2342,6 +2342,15 @@ def _classify_severity(
     if _is_whitespace_only(approved_text, suspect_text):
         return "minor"
 
+    # The same number grouped differently ("2633" vs "2,633"): the value
+    # is unchanged, so it is a formatting difference, not a changed fact.
+    # A decimal sign ("5.000" vs "5,000") or a digit change stays critical.
+    if _is_thousands_grouping_only(approved_text, suspect_text):
+        return "minor"
+    # One list mark drawn with another glyph (Greek "ο" vs "○"): no word changed.
+    if _is_list_mark_only(approved_text, suspect_text):
+        return "minor"
+
     # Digit-value changes (dosages, strengths, counts, dates...) are
     # always critical, and this runs FIRST of the content rules: nothing below -- the artwork
     # rule included -- may outrank a changed number. Only triggers when
@@ -2409,6 +2418,46 @@ def _number_forms(text: str) -> tuple[str, ...]:
     return tuple(forms)
 
 
+_GROUPED_NUMBER_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?![\d]|[.,]\d)")
+
+
+def _ungroup_thousands(text: str) -> str:
+    return re.sub(r"\s+", "", _GROUPED_NUMBER_RE.sub(lambda m: m.group().replace(",", ""), text))
+
+
+def _is_thousands_grouping_only(approved: str, suspect: str) -> bool:
+    """Whether the texts differ only in thousands separators."""
+    return approved != suspect and _ungroup_thousands(approved) == _ungroup_thousands(suspect)
+
+
+# Glyphs a layout uses as list marks; "o" and Greek "ο" only standing alone.
+_LIST_MARK_GLYPHS = frozenset(
+    ["•", "◦", "○", "ο", "o", "●", "▪", "■", "▫", "□",
+     "➢", "►", "‣", "⁃", "✓", "➤", "❖", "◆", "◇",
+     "", "", "", "", ""]
+)
+
+
+def _list_marks_folded(text: str) -> str:
+    out: list[str] = []
+    for word in text.split():
+        word = "•" if word in _LIST_MARK_GLYPHS else word
+        if not (word == "•" and out and out[-1] == "•"):
+            out.append(word)
+    return " ".join(out)
+
+
+def _is_list_mark_only(approved: str, suspect: str) -> bool:
+    """Whether the texts differ only in which glyph draws a list mark
+    (both sides have one): "ο" vs "○", "o" vs "• •"."""
+    return (
+        approved != suspect
+        and any(w in _LIST_MARK_GLYPHS for w in approved.split())
+        and any(w in _LIST_MARK_GLYPHS for w in suspect.split())
+        and _list_marks_folded(approved) == _list_marks_folded(suspect)
+    )
+
+
 # Difference categories for the results list, derived from the same
 # facts the severity ladder uses. Kept here, next to that ladder, so the
 # UI never re-implements the classification.
@@ -2418,7 +2467,8 @@ CATEGORY_LABELS = {
     "number": "Number/dosage",
     "wording": "Wording",
     "case": "Capitalization",
-    "punctuation": "Punctuation/spacing",
+    "punctuation": "Punctuation",
+    "spacing": "Spacing",
     "hyphenation": "Hyphenation",
     "spelling": "Spelling",
     "moved": "Moved",
@@ -2436,6 +2486,8 @@ def category_of(item: DiffItem) -> str:
         return "removed"
     approved, suspect = item.approved_text, item.suspect_text
     if _is_whitespace_only(approved, suspect):
+        return "spacing"
+    if _is_list_mark_only(approved, suspect):
         return "punctuation"
     if _extract_digit_runs(approved) != _extract_digit_runs(suspect) or _number_forms(
         approved
