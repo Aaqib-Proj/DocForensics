@@ -2529,6 +2529,19 @@ def _straddles(a: dict, b: dict) -> bool:
     return overlap >= _STRADDLE_OVERLAP * min(ha, hb)
 
 
+def _lines_straddle(upper: list[dict], lower: list[dict]) -> bool:
+    """Whether any word of ``upper`` straddles any word of ``lower``.
+    Only pairs that overlap vertically at all can (`_straddles` needs a
+    positive overlap), so the rest are skipped unexamined -- lines of
+    ordinary text usually have none."""
+    lower_top = min(w["top"] for w in lower)
+    reaching = [a for a in upper if a.get("bottom", a["top"] + 10.0) > lower_top]
+    if not reaching:
+        return False
+    upper_bottom = max(a.get("bottom", a["top"] + 10.0) for a in reaching)
+    return any(_straddles(a, b) for b in lower if b["top"] < upper_bottom for a in reaching)
+
+
 def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list[dict]]]:
     """(vertical key, words in reading order) for each line -- or, for
     lines a straddling word ties into one table row, for that row, read
@@ -2537,7 +2550,7 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
     # Lines a straddling (vertically centred) cell ties together first...
     groups: list[list[list[dict]]] = []
     for line in ordered:
-        if groups and any(_straddles(a, b) for a in groups[-1][-1] for b in line):
+        if groups and _lines_straddle(groups[-1][-1], line):
             groups[-1].append(line)
         else:
             groups.append([line])
@@ -2550,7 +2563,15 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
     # has nothing there.
     # A first cell standing over a value column ("Sildenafil" heading the
     # 20 mg column of a stacked header) is not a label.
-    tabular = [cells for cells in (_line_cells(line) for line in ordered) if len(cells) >= _ROW_MIN_COLUMNS]
+    # Each line's cells, split once (the lines stay alive throughout, so
+    # their ids are unique; any other word list is split as it comes).
+    line_cells = {id(line): _line_cells(line) for line in ordered}
+
+    def cells_of(words: list[dict]) -> list[list[dict]]:
+        found = line_cells.get(id(words))
+        return found if found is not None else _line_cells(words)
+
+    tabular = [cells for cells in (cells_of(line) for line in ordered) if len(cells) >= _ROW_MIN_COLUMNS]
 
     def span(cell: list[dict]) -> tuple[float, float]:
         return min(w["x0"] for w in cell), max(w["x1"] for w in cell)
@@ -2566,7 +2587,7 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
     row_gaps = sorted(
         _gap(a, b)
         for a, b in zip(ordered, ordered[1:])
-        if len(_line_cells(a)) >= _ROW_MIN_COLUMNS and len(_line_cells(b)) >= _ROW_MIN_COLUMNS
+        if len(cells_of(a)) >= _ROW_MIN_COLUMNS and len(cells_of(b)) >= _ROW_MIN_COLUMNS
     )
     row_gap = row_gaps[len(row_gaps) // 2] if row_gaps else None
     rows: list[list[list[dict]]] = []
@@ -2584,13 +2605,14 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
         # lines (a fourth header line "(n = 69) ... (n = 70)" reaches the
         # Placebo column the third, "20 mg 40 mg 80 mg", leaves empty).
         up = bool(rows) and plain[-1] and len(group) == 1 and _continues_cells(
-            [w for line in rows[-1] for w in line], group[0], label_spans, row_gap
+            rows[-1][0] if len(rows[-1]) == 1 else [w for line in rows[-1] for w in line],
+            group[0], label_spans, row_gap, cells_of=cells_of,
         )
         # A label alone on its line belongs to the row it sits closer to:
         # "Limb" under "Pain in | 7% | ..." ends that label; "Extrapyramidal"
         # over "Disorder** | 6 | ..." starts the next one.
         below = groups[k + 1][0] if k + 1 < len(groups) and len(groups[k + 1]) == 1 else None
-        down = len(group) == 1 and below is not None and _starts_label(group[0], below)
+        down = len(group) == 1 and below is not None and _starts_label(group[0], below, cells_of=cells_of)
         if down and (not up or _gap(group[0], below) < _gap(rows[-1][-1], group[0])):
             carried = group[0]
             continue
@@ -2636,6 +2658,7 @@ def _continues_cells(
     line: list[dict],
     label_spans: Optional[list[tuple[float, float]]] = None,
     row_gap: Optional[float] = None,
+    cells_of=_line_cells,
 ) -> bool:
     """Whether ``line`` is the second line of the cells of ``above``.
 
@@ -2650,8 +2673,8 @@ def _continues_cells(
     ``above``: a spanning header ("Lurasidone hydrochloride" over five
     dose columns) has several under one, and an ordinary data row has
     its own label in the first column."""
-    top_cells = _line_cells(above)
-    cells = _line_cells(line)
+    top_cells = cells_of(above)
+    cells = cells_of(line)
     if len(cells) == 1 and len(top_cells) >= _ROW_MIN_COLUMNS:
         # Only clearly closer than rows are to each other: the second
         # line of a label, not the first line of the next row's.
@@ -2666,7 +2689,7 @@ def _continues_cells(
         # Indented bulleted items set in columns ("o tingling   o
         # numbness") line up the same way and are not a header.
         def in_label_column(part: list[dict]) -> bool:
-            first = _line_cells(part)[0]
+            first = cells_of(part)[0]
             x0, x1 = min(w["x0"] for w in first), max(w["x1"] for w in first)
             return any(x0 < hi and lo < x1 for lo, hi in label_spans or [])
 
@@ -2723,12 +2746,12 @@ def _gap(upper: list[dict], lower: list[dict]) -> float:
     return min(w["top"] for w in lower) - max(w.get("bottom", w["top"] + 10.0) for w in upper)
 
 
-def _starts_label(line: list[dict], below: list[dict]) -> bool:
+def _starts_label(line: list[dict], below: list[dict], cells_of=_line_cells) -> bool:
     """Whether ``line``, a single cell alone on its line, is the first
     line of the row label of the table row directly below it
     ("Extrapyramidal" over "Disorder** | 6 | 6 | 11 ...")."""
-    cells = _line_cells(line)
-    below_cells = _line_cells(below)
+    cells = cells_of(line)
+    below_cells = cells_of(below)
     if len(cells) != 1 or len(below_cells) < _ROW_MIN_COLUMNS:
         return False
     label = below_cells[0]
