@@ -1,0 +1,112 @@
+================================================================================
+                         DOCFORENSICS ANALYZER - HOW TO USE
+================================================================================
+
+DocForensics Analyzer is a digital document comparison and forensic diffing tool
+for PDFs, DOCX, PPTX, and XLSX files.
+
+
+--------------------------------------------------------------------------------
+1. QUICK START (RUN FROM SOURCE)
+--------------------------------------------------------------------------------
+
+Prerequisites:
+  * Python 3.10 or higher installed (https://www.python.org/)
+  * Windows 10 / 11 (64-bit recommended)
+
+Step 1: Open a terminal (PowerShell or Command Prompt) in the project folder:
+  cd "path\to\docforensics-analyzer"
+
+Step 2 (Recommended): Create and activate a virtual environment:
+  python -m venv .venv
+  .venv\Scripts\activate
+
+Step 3: Install required dependencies:
+  pip install -r requirements.txt
+
+Step 4: Launch the application:
+  python main.py
+
+
+--------------------------------------------------------------------------------
+2. RUNNING AS A STANDALONE APPLICATION (NO PYTHON NEEDED)
+--------------------------------------------------------------------------------
+
+If you downloaded or built the standalone package:
+  1. Unzip "dist\DocForensicsAnalyzer-windows-x64.zip" (or go to "dist\DocForensicsAnalyzer\").
+  2. Double-click "DocForensicsAnalyzer.exe".
+  * No Python installation or pip packages are required.
+
+
+--------------------------------------------------------------------------------
+3. PACKAGING A NEW STANDALONE BUILD
+--------------------------------------------------------------------------------
+
+To recompile and create a new portable Windows executable and distribution ZIP:
+
+Option A (One-click batch script):
+  Double-click "package.bat"
+
+Option B (Command line):
+  python build_exe.py
+
+Output will be generated in:
+  * Standalone Folder:  dist\DocForensicsAnalyzer\DocForensicsAnalyzer.exe
+  * Distribution ZIP:   dist\DocForensicsAnalyzer-windows-x64.zip
+
+
+--------------------------------------------------------------------------------
+4. HOW TO COMPARE DOCUMENTS
+--------------------------------------------------------------------------------
+
+Step 1: Load the Original (Approved) document:
+  * Click "Open Original..." or press Ctrl+O, or drag and drop the file onto the left viewer.
+
+Step 2: Load the Suspect (Revised) document:
+  * Click "Open Suspect..." or press Ctrl+Shift+O, or drag and drop the file onto the right viewer.
+  * To merge multiple suspect files/pages into one document before comparing, press Ctrl+Shift+M.
+
+Step 3: Compare:
+  * Click the "Compare" button on the toolbar or press F5.
+  * The background worker analyzes layout, reading order, and text alignment.
+
+Step 4: Review Deviations (Bottom Dock):
+  * Deviations are listed in the bottom table categorized by severity (Critical, Major, Minor).
+  * Click any row to automatically navigate and highlight that passage on both documents.
+  * The comparator on the right displays the exact letter-by-letter diff.
+  * You can resize the bottom panel by dragging the separator bar up or down with your cursor.
+  * If a "Not everything could be compared" banner appears, you can dismiss it using the [x] button.
+
+Step 5: Review Decisions:
+  * Mark as Intended Change (Accepted): Press 'A' or click "Accept".
+  * Mark as Error / Defect (Rejected):  Press 'R' or click "Reject".
+  * Clear / Reset Decision:             Press 'U' or click "Reset".
+
+Step 6: Export Audit Report:
+  * Press Ctrl+E or click "Export Report..." to save an HTML / PDF audit report.
+
+
+--------------------------------------------------------------------------------
+5. KEYBOARD SHORTCUTS
+--------------------------------------------------------------------------------
+
+  * Ctrl+O            : Open Original (Approved) Document
+  * Ctrl+Shift+O      : Open Suspect Document
+  * Ctrl+Shift+M      : Merge Suspect Files
+  * F5                : Run Comparison
+  * F8 / Shift+F8     : Next / Previous Difference
+  * A                 : Accept selected deviation (Intended change)
+  * R                 : Reject selected deviation (Error to fix)
+  * U                 : Reset selected deviation decision
+  * Ctrl+F            : Find in viewer
+  * Ctrl+Shift+R      : Rematch selected difference
+  * Ctrl+E            : Export Report
+  * F1                : Help / About
+
+
+--------------------------------------------------------------------------------
+6. RUNNING TESTS
+--------------------------------------------------------------------------------
+
+To verify the test suite:
+  pytest
