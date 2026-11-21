@@ -14,6 +14,11 @@ Review workflow:
     matters right now. Filters only change the VIEW -- results are
     never dropped -- and main.py shows only the listed differences as
     highlights on the documents.
+  * Formatting extras -- spacing, a bullet drawn with another glyph or
+    present on one side only (`core.diff_engine.is_formatting_extra`) --
+    are a list of their own (the "Formatting extras" tab), not counted
+    with the deviations: not in the severity pills, the review counts or
+    the seen meter.
   * Each difference can be Accepted (an intended change) or Rejected
     (an error to fix): buttons, the A / R / U keys, or right-click, for
     every selected row at once. "Group identical" folds identical
@@ -43,11 +48,12 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QItemSelectionModel, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QItemSelectionModel, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetricsF, QKeySequence, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
@@ -56,7 +62,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QSplitter,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -64,14 +74,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.diff_engine import CATEGORY_LABELS, CATEGORY_ORDER, DiffItem, category_of
+from core.diff_engine import CATEGORY_LABELS, CATEGORY_ORDER, DiffItem, category_of, is_formatting_extra
 from core.review_store import fingerprints
 from core.token_map import TokenMap
-from ui import theme
+from ui import icons, theme
 from ui.comparator_panel import ComparatorPanel
 from ui.flow_layout import FlowLayout, FlowRow
 
-_SEVERITY_LABEL = {"reorder": "Moved"}
+_SEVERITY_LABEL: dict[str, str] = {}
 
 ACCEPTED = "accepted"
 REJECTED = "rejected"
@@ -86,16 +96,81 @@ _MAX_CELL_CHARS = 320
 
 _MINOR_AND_BELOW = ("minor", "typo", "reorder")
 
-# "Moved" is text both documents contain, in a different place. It is
-# shown as a category (with its count) but not listed by default --
-# see the chip tooltip below.
-_MOVED_CATEGORY = "moved"
-_MOVED_CHIP_TOOLTIP = (
-    "Text that BOTH documents contain, in a different place -- a column that "
-    "reflowed, a block printed in a different order, a section relocated. "
-    "Any wording that actually changed inside a moved passage is reported as "
-    "its own row, at its own severity."
-)
+# Text both documents contain in a different place is not a difference:
+# it is matched (core/diff_engine.py, `_pair_moved_text`), so there is no
+# "Moved" category -- only the edits inside moved text are listed.
+
+
+# What a Severity / Status cell shows, kept in its item's UserRole so the
+# delegate below can draw it (the cell text stays as it always was).
+_BADGE_ROLE = Qt.ItemDataRole.UserRole + 1
+_SUMMARY_SEVERITIES = ("critical", "major", "minor", "typo")
+
+
+class _BadgeDelegate(QStyledItemDelegate):
+    """Draws a Severity cell as a colored pill and a Status cell as a
+    colored dot with its label. Selection and hover backgrounds are
+    drawn by the style as for any other cell."""
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        badge = index.data(_BADGE_ROLE)
+        if not badge:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        widget = opt.widget
+        (widget.style() if widget else QApplication.style()).drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget
+        )
+        t = theme.tokens()
+        kind, value = badge
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(opt.rect).adjusted(10, 0, -6, 0)
+        font = QFont(opt.font)
+        if kind == "severity":
+            fg, bg = t.severity(value)
+            font.setPointSizeF(max(font.pointSizeF() - 0.5, 7.5))
+            font.setBold(True)
+            metrics = QFontMetricsF(font)
+            width = min(metrics.horizontalAdvance(text) + 18, rect.width())
+            pill = QRectF(rect.left(), rect.center().y() - 10, width, 20)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(bg))
+            painter.drawRoundedRect(pill, 10, 10)
+            painter.setPen(QColor(fg))
+            painter.setFont(font)
+            painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, text)
+        else:
+            colors = {
+                "unseen": t.accent, "viewed": t.border_strong, "accepted": t.success,
+                "rejected": t.danger, "mixed": t.muted,
+            }
+            color = QColor(colors.get(value, t.muted))
+            label = text.lstrip("\u25cf ").strip()
+            dot = QRectF(rect.left(), rect.center().y() - 4, 8, 8)
+            painter.setPen(Qt.PenStyle.NoPen)
+            if value == "viewed":
+                painter.setPen(color)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            else:
+                painter.setBrush(color)
+            if value in ("unseen", "viewed", "mixed"):
+                painter.drawEllipse(dot)
+                rect.setLeft(rect.left() + 16)
+            if value in ("accepted", "rejected"):
+                font.setBold(True)
+                painter.setPen(color)
+            else:
+                font.setBold(False)
+                font.setItalic(value == "viewed")
+                painter.setPen(QColor(t.muted if value != "unseen" else t.text))
+            painter.setFont(font)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+        painter.restore()
 
 
 @dataclass
@@ -132,6 +207,10 @@ class ResultsPanel(QWidget):
         super().__init__(parent)
         self._items: list[DiffItem] = []
         self._categories: dict[int, str] = {}  # id(item) -> category
+        # ids of the formatting extras, listed on their own tab and left
+        # out of every count; True while that tab is the one shown.
+        self._extra_ids: set[int] = set()
+        self._extras_view = False
         self._decisions: dict[int, Decision] = {}  # id(item) -> decision
         # (position, original item, rows that replaced it) per rematch,
         # newest last -- `undo_rematch` walks it back.
@@ -167,23 +246,16 @@ class ResultsPanel(QWidget):
         # Ticks every category chip, or unticks every chip, in one click
         # and one table refresh. The label says which it will do.
         self.select_all_button = QToolButton()
-        self.select_all_button.setProperty("chip", True)
+        self.select_all_button.setProperty("link", True)
         self.select_all_button.clicked.connect(self._toggle_all_chips)
         chip_layout.addWidget(self.select_all_button)
         for category in CATEGORY_ORDER:
             chip = QToolButton()
             chip.setCheckable(True)
-            # Every category is listed by default, "Moved" included: a
-            # moved row can be the only place a relocated passage is
-            # mentioned, so hiding it by default would quietly take
-            # that passage off the review. One click still hides it.
+            # Every category is listed by default; one click hides it.
             chip.setChecked(True)
             chip.setProperty("chip", True)
-            chip.setToolTip(
-                _MOVED_CHIP_TOOLTIP
-                if category == _MOVED_CATEGORY
-                else f"Show or hide '{CATEGORY_LABELS[category]}' differences"
-            )
+            chip.setToolTip(f"Show or hide '{CATEGORY_LABELS[category]}' differences")
             chip.toggled.connect(self._refresh_table)
             chip.toggled.connect(self._update_select_all_label)
             self._chips[category] = chip
@@ -248,13 +320,15 @@ class ResultsPanel(QWidget):
         self.search_box.setClearButtonEnabled(True)
         self.search_box.setMaximumWidth(200)
         self.search_box.textChanged.connect(self._refresh_table)
+        filter_icon = self.search_box.addAction(icons.icon("filter", "muted"), QLineEdit.ActionPosition.LeadingPosition)
+        theme.manager().changed.connect(lambda: filter_icon.setIcon(icons.icon("filter", "muted")))
 
         self.unseen_badge = QLabel()
         self.unseen_badge.setObjectName("unseenBadge")
         self.summary_label = QLabel()
         self.summary_label.setObjectName("muted")
 
-        self.unview_button = QPushButton("👁 Unview")
+        self.unview_button = QPushButton("Unview")
         self.unview_button.setToolTip("Mark the selected difference(s) as unviewed")
         self.unview_button.clicked.connect(self.unview_selected)
 
@@ -267,6 +341,56 @@ class ResultsPanel(QWidget):
         self.reset_button = QPushButton("Reset")
         self.reset_button.setToolTip("Clear the review decision of the selected differences (U)")
         self.reset_button.clicked.connect(lambda: self.decide_selected(None))
+        self.accept_button.setText("Accept")
+        self.reject_button.setText("Reject")
+        self.accept_button.setObjectName("accept")
+        self.reject_button.setObjectName("reject")
+        for button, name, role in (
+            (self.unview_button, "eye-off", "text"), (self.accept_button, "check", "success"),
+            (self.reject_button, "x", "danger"), (self.reset_button, "reset", "text"),
+        ):
+            button.setIconSize(QSize(15, 15))
+            icons.bind(button, name, role)
+
+        # --- which list: the deviations, or the formatting extras ---
+        self.deviations_tab = QToolButton()
+        self.extras_tab = QToolButton()
+        self.extras_tab.setToolTip(
+            "Spacing differences, bullets (a list mark drawn with another glyph, "
+            "or present in one document only) and the repeats of running headers "
+            "and footers (their first copy is compared with the text). Not counted "
+            "as deviations, nor in the seen meter -- listed here to look through "
+            "when you want to."
+        )
+        self.deviations_tab.setToolTip("The differences to review: every changed, added or removed word.")
+        tabs = QButtonGroup(self)
+        tabs.setExclusive(True)
+        for tab in (self.deviations_tab, self.extras_tab):
+            tab.setCheckable(True)
+            tab.setProperty("tab", True)
+            tabs.addButton(tab)
+        self.deviations_tab.setChecked(True)
+        self.deviations_tab.setText("Deviations")
+        self.extras_tab.setText("Formatting extras")
+        self.extras_tab.setEnabled(False)
+        self.extras_tab.toggled.connect(self._set_extras_view)
+
+        # --- summary strip: how many of each severity, review progress ---
+        self._severity_pills: dict[str, QLabel] = {}
+        summary_layout = QHBoxLayout()
+        summary_layout.setContentsMargins(0, 0, 0, 2)
+        summary_layout.setSpacing(6)
+        summary_layout.addWidget(self.deviations_tab)
+        summary_layout.addWidget(self.extras_tab)
+        summary_layout.addSpacing(8)
+        for severity in _SUMMARY_SEVERITIES:
+            pill = QLabel()
+            pill.setToolTip(f"Differences rated {severity}")
+            pill.setVisible(False)
+            pill.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            self._severity_pills[severity] = pill
+            summary_layout.addWidget(pill)
+        summary_layout.addStretch(1)
 
         options_layout = FlowLayout(spacing=10)
         options_layout.addWidget(self.ignore_minor_checkbox)
@@ -275,8 +399,8 @@ class ResultsPanel(QWidget):
         options_layout.addWidget(self.hide_viewed_checkbox)
         options_layout.addWidget(self.sort_combo)
         options_layout.addWidget(self.search_box)
-        options_layout.addWidget(self.unseen_badge)
-        options_layout.addWidget(self.summary_label)
+        summary_layout.addWidget(self.summary_label)
+        summary_layout.addWidget(self.unseen_badge)
         options_layout.addWidget(self.unview_button)
         options_layout.addWidget(self.accept_button)
         options_layout.addWidget(self.reject_button)
@@ -295,6 +419,10 @@ class ResultsPanel(QWidget):
         header.setSectionResizeMode(_COL_SUSPECT, QHeaderView.ResizeMode.Stretch)
         header.setMinimumSectionSize(70)
         header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._badge_delegate = _BadgeDelegate(self.table)
+        self.table.setItemDelegateForColumn(_COL_STATUS, self._badge_delegate)
+        self.table.setItemDelegateForColumn(_COL_SEVERITY, self._badge_delegate)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -305,7 +433,7 @@ class ResultsPanel(QWidget):
         self.table.setShowGrid(True)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
-        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.currentCellChanged.connect(self._on_current_cell_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -332,11 +460,28 @@ class ResultsPanel(QWidget):
         self.coverage_banner.setWordWrap(True)
         self.coverage_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.coverage_banner.setVisible(False)
+        banner_layout = QHBoxLayout(self.coverage_banner)
+        banner_layout.setContentsMargins(0, 0, 4, 0)
+        banner_layout.addStretch()
+        self.coverage_close_btn = QToolButton(self.coverage_banner)
+        self.coverage_close_btn.setText("\u00d7")
+        self.coverage_close_btn.setToolTip("Dismiss warning banner")
+        self.coverage_close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.coverage_close_btn.clicked.connect(lambda: self.coverage_banner.setVisible(False))
+        banner_layout.addWidget(self.coverage_close_btn, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
         layout.addWidget(self.coverage_banner)
+        # In a widget of its own, sized to its content: as a bare layout
+        # the column handed it spare height and the pills grew into blocks.
+        summary_strip = QWidget()
+        summary_strip.setObjectName("summaryStrip")
+        summary_strip.setLayout(summary_layout)
+        summary_strip.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.unseen_badge.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        layout.addWidget(summary_strip)
         # Each wrapping row lives in its own widget, capped at the
         # height it actually needs: as a bare sub-layout the vertical
         # layout handed it the spare space, which came straight out of
@@ -363,7 +508,11 @@ class ResultsPanel(QWidget):
         t = theme.tokens()
         self.coverage_banner.setStyleSheet(
             f"QLabel#coverageBanner {{ color: {t.danger}; border: 1px solid {t.danger};"
-            " border-radius: 4px; padding: 6px 8px; }"
+            f" border-radius: 4px; padding: 6px 26px 6px 8px; }}"
+        )
+        self.coverage_close_btn.setStyleSheet(
+            f"QToolButton {{ border: none; background: transparent; font-size: 15px; font-weight: bold; color: {t.danger}; padding: 0 4px; }}"
+            f"QToolButton:hover {{ background: rgba(220, 40, 40, 0.15); border-radius: 3px; }}"
         )
         self.coverage_banner.setText(
             "<b>\u26a0 Not everything could be compared.</b><br>"
@@ -406,6 +555,9 @@ class ResultsPanel(QWidget):
             self._rematch_log = []
         self._items = diff_items
         self._categories = {id(item): category_of(item) for item in diff_items}
+        self._extra_ids = {id(item) for item in diff_items if is_formatting_extra(item)}
+        if self._extras_view and not self._extra_ids:
+            self.deviations_tab.setChecked(True)  # nothing left on the extras tab
         self._update_chip_labels()
         self._refresh_table()
 
@@ -430,6 +582,8 @@ class ResultsPanel(QWidget):
         self._items.extend(diff_items)
         for item in diff_items:
             self._categories[id(item)] = category_of(item)
+            if is_formatting_extra(item):
+                self._extra_ids.add(id(item))
         self._update_chip_labels()
         if self.group_checkbox.isChecked() or self.identical_chip.isChecked() or self._page_order():
             # Grouping can merge a new row into an existing one, and page
@@ -503,8 +657,11 @@ class ResultsPanel(QWidget):
             self._decisions.pop(id(item), None)
             self._categories.pop(id(item), None)
             self._viewed_items.discard(id(item))
+            self._extra_ids.discard(id(item))
         for new_item in replacements:
             self._categories[id(new_item)] = category_of(new_item)
+            if is_formatting_extra(new_item):
+                self._extra_ids.add(id(new_item))
         self._renumber()
         self._update_chip_labels()
         self._refresh_table()
@@ -533,6 +690,7 @@ class ResultsPanel(QWidget):
                 self._log_rematch(new_item, "area rematch undone (row withdrawn)", "")
         self._items = remaining
         self._categories = {id(i): self._categories.get(id(i)) or category_of(i) for i in self._items}
+        self._extra_ids = {id(i) for i in self._items if is_formatting_extra(i)}
         self._renumber()
         self._update_chip_labels()
         self._refresh_table()
@@ -619,11 +777,36 @@ class ResultsPanel(QWidget):
         return self._categories.get(id(item)) or category_of(item)
 
     def all_items(self) -> list[DiffItem]:
+        """Every difference, formatting extras included."""
         return list(self._items)
 
+    def counted_items(self) -> list[DiffItem]:
+        """The deviations: every difference but the formatting extras."""
+        return [item for item in self._items if id(item) not in self._extra_ids]
+
+    def extra_items(self) -> list[DiffItem]:
+        """The formatting extras (spacing, bullets, header/footer repeats),
+        not counted as deviations."""
+        return [item for item in self._items if id(item) in self._extra_ids]
+
+    def is_extra(self, item: DiffItem) -> bool:
+        return id(item) in self._extra_ids
+
     def unique_item_count(self) -> int:
-        """Total number of unique deviations (identical deviations counted once)."""
-        return len({_group_key(item) for item in self._items})
+        """Number of unique deviations (identical ones counted once),
+        formatting extras left out."""
+        return len({_group_key(item) for item in self.counted_items()})
+
+    def _pool(self) -> list[DiffItem]:
+        """The differences of the tab shown: deviations or formatting extras."""
+        return self.extra_items() if self._extras_view else self.counted_items()
+
+    def _set_extras_view(self, extras: bool) -> None:
+        if extras == self._extras_view:
+            return
+        self._extras_view = extras
+        self._update_chip_labels()
+        self._refresh_table()
 
     def unique_listed_count(self) -> int:
         """Number of unique deviations currently shown/passing the filters."""
@@ -637,7 +820,11 @@ class ResultsPanel(QWidget):
     def select_item(self, item: DiffItem) -> bool:
         """Select and scroll to ``item``'s row without emitting
         ``item_activated``. Returns False if the row is hidden by a
-        filter (or the item isn't in the results)."""
+        filter (or the item isn't in the results). A formatting extra
+        clicked in a viewer brings its tab forward (and a deviation, the
+        deviations')."""
+        if any(existing is item for existing in self._items) and self.is_extra(item) != self._extras_view:
+            (self.extras_tab if self.is_extra(item) else self.deviations_tab).setChecked(True)
         for row, group in enumerate(self._row_groups):
             if any(member is item for member in group):
                 self._programmatic = True
@@ -766,19 +953,22 @@ class ResultsPanel(QWidget):
         self._refresh_table(keep_selection=True)
 
     def _update_chip_labels(self) -> None:
+        pool = self._pool()
         counts = {category: 0 for category in CATEGORY_ORDER}
-        for item in self._items:
+        for item in pool:
             counts[self._categories[id(item)]] += 1
         for category, chip in self._chips.items():
             chip.setText(f"{CATEGORY_LABELS[category]} {counts[category]}")
             chip.setEnabled(counts[category] > 0)
-        self._group_sizes = Counter(_group_key(item) for item in self._items)
+        self._group_sizes = Counter(_group_key(item) for item in pool)
         repeated = sum(1 for size in self._group_sizes.values() if size > 1)
         self.identical_chip.setText(f"Identical {repeated}")
         # Stays clickable while ticked, so it can always be unticked.
         self.identical_chip.setEnabled(repeated > 0 or self.identical_chip.isChecked())
 
     def _passes_filters(self, item: DiffItem) -> bool:
+        if (id(item) in self._extra_ids) != self._extras_view:
+            return False  # on the other tab
         category_shown = self._chips[self._categories[id(item)]].isChecked()
         if self.identical_chip.isChecked():
             # Identical stands on its own: with no category chip ticked it
@@ -857,24 +1047,50 @@ class ResultsPanel(QWidget):
 
     def _update_summary_labels(self, listed_count: int | None = None) -> None:
         t = theme.tokens()
-        total_items = len(self._items)
-        unique_total = self.unique_item_count()
-        unseen_count = sum(1 for i in self._items if id(i) not in self._viewed_items)
+        # Every count is of the deviations: formatting extras are listed on
+        # their own tab and counted nowhere else.
+        counted = self.counted_items()
+        extras = self.extra_items()
+        self.deviations_tab.setText(f"Deviations {len(counted)}")
+        self.extras_tab.setText(f"Formatting extras {len(extras)}")
+        self.extras_tab.setEnabled(bool(extras) or self._extras_view)
+        total_items = len(counted)
+        unseen_count = sum(1 for i in counted if id(i) not in self._viewed_items)
         unseen_pct = (unseen_count / total_items * 100) if total_items > 0 else 0
-        reviewed = [self._decisions[id(i)].status for i in self._items if id(i) in self._decisions]
+        reviewed = [self._decisions[id(i)].status for i in counted if id(i) in self._decisions]
+        pool = self._pool()
+        pool_total = len(pool)
+        unique_total = len({_group_key(item) for item in pool})
         count_shown = listed_count if listed_count is not None else len(self._visible_items)
         unique_shown = self.unique_listed_count()
 
-        if count_shown == total_items:
-            shown_text = f"{count_shown} of {total_items} shown ({unique_total} unique)"
+        if count_shown == pool_total:
+            shown_text = f"{count_shown} of {pool_total} shown ({unique_total} unique)"
         else:
-            shown_text = f"{count_shown} of {total_items} shown ({unique_shown} of {unique_total} unique)"
+            shown_text = f"{count_shown} of {pool_total} shown ({unique_shown} of {unique_total} unique)"
 
-        self.summary_label.setText(
-            f"{shown_text} · "
-            f"{reviewed.count(ACCEPTED)} accepted · {reviewed.count(REJECTED)} rejected · "
-            f"{total_items - len(reviewed)} to review"
-        )
+        if not self._items:
+            self.summary_label.setText("No differences listed yet: open both documents and press Compare.")
+        elif self._extras_view:
+            self.summary_label.setText(f"{shown_text} · spacing, bullets and header/footer repeats, not counted as deviations")
+        else:
+            self.summary_label.setText(
+                f"{shown_text} · "
+                f"{reviewed.count(ACCEPTED)} accepted · {reviewed.count(REJECTED)} rejected · "
+                f"{total_items - len(reviewed)} to review"
+            )
+
+        counts = Counter(item.severity for item in counted)
+        for severity, pill in self._severity_pills.items():
+            fg, bg = t.severity(severity)
+            pill.setText(f"{_SEVERITY_LABEL.get(severity, severity.capitalize())}  {counts[severity]}")
+            pill.setStyleSheet(
+                f"background: {bg}; color: {fg}; border-radius: 11px; padding: 3px 11px; "
+                f"font-weight: 600;"
+            )
+            # The deviations' severities: beside the extras tab they would
+            # read as the extras' own.
+            pill.setVisible(counts[severity] > 0 and not self._extras_view)
 
         if total_items == 0:
             self.unseen_badge.setVisible(False)
@@ -925,6 +1141,12 @@ class ResultsPanel(QWidget):
                 f"{_STATUS_LABEL[status][2:]} by {decision.reviewer} on "
                 f"{decision.decided_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}"
             )
+        if status == "mixed":
+            status_cell.setData(_BADGE_ROLE, ("status", "mixed"))
+        elif status is None:
+            status_cell.setData(_BADGE_ROLE, ("status", "viewed" if is_viewed else "unseen"))
+        else:
+            status_cell.setData(_BADGE_ROLE, ("status", status))
         self.table.setItem(row, _COL_STATUS, status_cell)
         self.table.setItem(row, _COL_SEVERITY, self._make_severity_cell(item.severity))
         self.table.setItem(
@@ -942,9 +1164,6 @@ class ResultsPanel(QWidget):
         elif item.kind == "removed_in_suspect":
             self.table.setSpan(row, _COL_APPROVED, 1, 2)
             self.table.setItem(row, _COL_APPROVED, self._make_text_cell(f"Deleted on suspect: {item.approved_text}", text_color))
-        elif item.kind in ("reordered", "reordered_section"):
-            self.table.setSpan(row, _COL_APPROVED, 1, 2)
-            self.table.setItem(row, _COL_APPROVED, self._make_text_cell(f"Moved: {item.approved_text or item.suspect_text}", text_color))
         else:
             self.table.setSpan(row, _COL_APPROVED, 1, 1)
             self.table.setItem(row, _COL_APPROVED, self._make_text_cell(item.approved_text, text_color))
@@ -953,6 +1172,7 @@ class ResultsPanel(QWidget):
     def _make_severity_cell(self, severity: str) -> QTableWidgetItem:
         fg, bg = theme.tokens().severity(severity)
         cell = QTableWidgetItem(_SEVERITY_LABEL.get(severity, severity.capitalize()))
+        cell.setData(_BADGE_ROLE, ("severity", severity))
         cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         cell.setBackground(QColor(bg))
         cell.setForeground(QColor(fg))

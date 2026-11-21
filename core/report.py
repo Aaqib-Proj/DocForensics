@@ -43,6 +43,15 @@ class ReportInput:
     app_version: str
     warnings: list[str] = field(default_factory=list)
     rematch_log: list[dict] = field(default_factory=list)
+    # Formatting extras (spacing, bullets, header/footer repeats): reported in a section of
+    # their own, not counted with the deviations.
+    is_extra: Optional[Callable[[DiffItem], bool]] = None
+
+    def deviations(self) -> list[DiffItem]:
+        return [item for item in self.items if not (self.is_extra and self.is_extra(item))]
+
+    def extras(self) -> list[DiffItem]:
+        return [item for item in self.items if self.is_extra and self.is_extra(item)]
 
 
 _COLUMNS = (
@@ -67,9 +76,9 @@ def _pages(location: Optional[Location], caret: Optional[Location]) -> str:
     return ", ".join(str(p) for p in pages)
 
 
-def _rows(data: ReportInput) -> list[list[str]]:
+def _rows(data: ReportInput, items: list[DiffItem]) -> list[list[str]]:
     rows = []
-    for number, item in enumerate(data.items, start=1):
+    for number, item in enumerate(items, start=1):
         decision = data.decision_of(item)
         rows.append([
             str(number),
@@ -107,7 +116,12 @@ def _write_csv(path: str, data: ReportInput) -> None:
             writer.writerow(["WARNING", warning])
         writer.writerow([])
         writer.writerow(_COLUMNS)
-        writer.writerows(_rows(data))
+        writer.writerows(_rows(data, data.deviations()))
+        if data.extras():
+            writer.writerow([])
+            writer.writerow([_EXTRAS_TITLE + " -- not counted as deviations"])
+            writer.writerow(_COLUMNS)
+            writer.writerows(_rows(data, data.extras()))
         if data.rematch_log:
             writer.writerow([])
             writer.writerow(["Rematch log", "When (UTC)", "Reviewer", "Outcome", "Original text", "Suspect text", "Reason"])
@@ -121,10 +135,25 @@ _SEVERITY_COLORS = {
 }
 
 
+_EXTRAS_TITLE = "Formatting extras (spacing, bullets, repeated headers/footers)"
+
+
+def _html_rows(rows: list[list[str]]) -> str:
+    e = html.escape
+    out = []
+    for row in rows:
+        color = _SEVERITY_COLORS.get(row[1], "#000")
+        cells = [e(c) for c in row]
+        cells[1] = f"<span style='color:{color};font-weight:600'>{cells[1]}</span>"
+        out.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    return "".join(out)
+
+
 def _write_html(path: str, data: ReportInput) -> None:
     e = html.escape
-    rows = _rows(data)
-    by_severity = Counter(item.severity for item in data.items)
+    deviations = data.deviations()
+    rows = _rows(data, deviations)
+    by_severity = Counter(item.severity for item in deviations)
     by_status = Counter(row[7] for row in rows)
     files = []
     for label, file_path in (("Original", data.approved_path), ("Suspect", data.suspect_path)):
@@ -136,12 +165,15 @@ def _write_html(path: str, data: ReportInput) -> None:
     ) or "No differences found."
     review = " &middot; ".join(f"<b>{count}</b> {e(status)}" for status, count in sorted(by_status.items()))
     warnings = "".join(f"<li>{e(w)}</li>" for w in data.warnings)
-    body_rows = []
-    for row in rows:
-        color = _SEVERITY_COLORS.get(row[1], "#000")
-        cells = [e(c) for c in row]
-        cells[1] = f"<span style='color:{color};font-weight:600'>{cells[1]}</span>"
-        body_rows.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    header = "".join(f"<th>{e(c)}</th>" for c in _COLUMNS)
+    extras_section = ""
+    if data.extras():
+        extras_section = (
+            f"<h2>{e(_EXTRAS_TITLE)}</h2><p class='muted'>Layout only -- spacing, a list mark "
+            "drawn differently or present on one side, the repeats of a running header or footer "
+            "(its first copy is compared above) -- and not counted as deviations above.</p>"
+            f"<table><tr>{header}</tr>{_html_rows(_rows(data, data.extras()))}</table>"
+        )
     rematch = ""
     if data.rematch_log:
         entries = "".join(
@@ -156,8 +188,9 @@ def _write_html(path: str, data: ReportInput) -> None:
             f"<th>Suspect text</th><th>Reason</th></tr>{entries}</table>"
         )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    unique_count = len({(data.category_of(item), item.approved_text, item.suspect_text) for item in data.items})
-    unique_str = f" ({unique_count} unique)" if data.items else ""
+    unique_count = len({(data.category_of(item), item.approved_text, item.suspect_text) for item in deviations})
+    unique_str = f" ({unique_count} unique)" if deviations else ""
+    extras_note = f"<br>{len(data.extras())} formatting extra(s), listed apart below." if data.extras() else ""
     page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -179,9 +212,10 @@ def _write_html(path: str, data: ReportInput) -> None:
 <table><tr><th></th><th>File</th><th>Size</th><th>SHA-256</th></tr>{''.join(files)}</table>
 {f'<h2>What could not be compared</h2><ul class="warn">{warnings}</ul>' if warnings else ''}
 <h2>Summary</h2>
-<p>{len(data.items)} difference{'s' if len(data.items) != 1 else ''}{unique_str}: {summary}<br>Review: {review or 'nothing reviewed'}</p>
+<p>{len(deviations)} difference{'s' if len(deviations) != 1 else ''}{unique_str}: {summary}<br>Review: {review or 'nothing reviewed'}{extras_note}</p>
 <h2>Differences</h2>
-<table><tr>{''.join(f'<th>{e(c)}</th>' for c in _COLUMNS)}</tr>{''.join(body_rows)}</table>
+<table><tr>{header}</tr>{_html_rows(rows)}</table>
+{extras_section}
 {rematch}
 </body></html>
 """

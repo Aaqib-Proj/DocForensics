@@ -59,6 +59,13 @@ def _cache_key(path: str) -> tuple[str, int, int]:
     return (os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns, stat.st_size)
 
 
+def _crop_key(crop: dict | None) -> tuple:
+    """A crop as part of a cache key: the same margins, the same key."""
+    if not crop:
+        return ()
+    return tuple(sorted((int(page), tuple(float(v) for v in margins)) for page, margins in crop.items()))
+
+
 class ExtractionCache(QObject):
     """Starts and remembers background extractions.
 
@@ -77,7 +84,7 @@ class ExtractionCache(QObject):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._executor = self._new_executor()
-        self._futures: OrderedDict[tuple[str, int, int], Future] = OrderedDict()
+        self._futures: OrderedDict[tuple, Future] = OrderedDict()  # (path, mtime, size, crop)
         self._finished.connect(self._on_done)
 
     @staticmethod
@@ -87,14 +94,16 @@ class ExtractionCache(QObject):
             executor.submit(_warm_up)
         return executor
 
-    def extraction_for(self, path: str) -> Future:
+    def extraction_for(self, path: str, crop: dict | None = None) -> Future:
         """Return the Future holding ``path``'s comparison tokens,
         starting its extraction first if it isn't cached or running.
+        ``crop`` (margins cut off per page) is part of what is cached: a
+        cropped document is read again, from the kept part only.
 
         Must be called from the GUI thread.
         """
         try:
-            key = _cache_key(path)
+            key = _cache_key(path) + (_crop_key(crop),)
         except OSError as exc:
             future: Future = Future()
             future.set_exception(exc)
@@ -106,29 +115,29 @@ class ExtractionCache(QObject):
             return future
 
         try:
-            future = self._submit(path)
+            future = self._submit(path, crop)
         except BrokenProcessPool:
             logger.warning("Extraction process pool broke; restarting it")
             self._executor = self._new_executor()
-            future = self._submit(path)
+            future = self._submit(path, crop)
 
         self._futures[key] = future
         self._evict_finished()
         future.add_done_callback(lambda f, p=path, k=key: self._finished.emit(p, k, f))
         return future
 
-    def _submit(self, path: str) -> Future:
+    def _submit(self, path: str, crop: dict | None = None) -> Future:
         """Start extracting ``path``: page ranges in parallel for a PDF
         (or a Word document already laid out as one), else one job."""
         pdf = self._layout_pdf(path)
         if pdf is None:
-            return self._executor.submit(extract_document_tokens, path)
+            return self._executor.submit(extract_document_tokens, path, crop or None)
         pages = pdf_page_count(pdf)
         per_chunk = max(1, math.ceil(pages / _MAX_WORKERS))
         name = os.path.basename(path)
         parts = [
             self._executor.submit(
-                extract_pdf_page_range, pdf, first, min(first + per_chunk - 1, pages), name
+                extract_pdf_page_range, pdf, first, min(first + per_chunk - 1, pages), name, crop or None
             )
             for first in range(1, pages + 1, per_chunk)
         ]

@@ -2388,3 +2388,684 @@ TEST 29.
 The table-row reading added in section 46 was also made faster (extraction
 had become up to twice as slow on dense outserts; it is back to the earlier
 speed with byte-identical output).
+
+## 49. A cleaner, more professional interface
+
+Same features, same shortcuts (one fixed), a clearer look:
+
+* **Theme**: a cool neutral palette (white surfaces on soft grey) instead of
+  the warm beige, Windows 11's UI font when present, consistent radii and
+  borders; dark mode follows the same structure.
+* **Toolbar**: the app's mark and name, line icons on every action
+  (`ui/icons.py`: one icon set, redrawn in each theme's colors), Compare as
+  the one primary button, toggles (Lock views, Highlights, Blink) shown as
+  pressed when on, and a reviewer field with a person icon.
+* **Viewers**: a colored role tag (blue ORIGINAL, teal SUSPECT), icon
+  buttons for paging, zoom and Find, and an empty state that is a drop
+  zone saying what can be opened (and that several files are merged).
+* **Deviation list**: a summary row with the count of each severity
+  (Critical / Major / Minor / Moved) and review progress; severity drawn as
+  a colored badge (the table's style had been hiding the cell color, so it
+  was only colored text); status as a dot (Unseen, Viewed) or a colored
+  label (Accepted, Rejected); left-aligned headers and roomier rows; "Select
+  All / Unselect All" as a link rather than one more chip; Accept and
+  Reject in green and red with icons.
+* **Dialogs**: Crop Margins follows the app theme (it was dark in every
+  theme); the Merge dialog's button reads "Merge & Compare" (a lone "&"
+  had turned it into "Merge _Compare") and its checkbox is no longer cut off.
+* **Fixed shortcut**: Crop Margins and Show Highlights were both Ctrl+H,
+  and Qt runs neither when two actions share a key. Crop Margins is now
+  Ctrl+M; Ctrl+H toggles the highlights.
+
+## 50. Crop Margins works on Word documents
+
+The Crop Margins dialog could not show a Word document at all: for any
+file other than a PDF it imported a helper that did not exist, the error
+was swallowed, and the Original/Suspect button stayed greyed out. It now
+crops the same PDF Word (or LibreOffice) laid the document out as -- the
+pages the viewer shows and the comparison reads -- so the margins drawn
+there are removed from the comparison and shown on the viewer. A file with
+no fixed pages (PowerPoint, Excel, or a Word document in its approximate
+layout when neither Word nor LibreOffice is installed) still cannot be
+cropped; its button now says why. Checked in GUI step 29.
+
+## 51. Tables compared cell by cell: highlighted tables and tables inside tables
+
+A side-by-side Word document (sbs.docx: "RLD Label | Notations | Proposed
+Label") against the RLD PDF compared its tables line by line, one cell's
+words running into the next ("Adverse Placebo MOUNJARO MOUNJARO Reaction
+(N=235) ..."), while the PDF read the same tables cell by cell. Three causes:
+
+* **Highlights taken for table rules.** A highlighted word is a rectangle
+  filled in a highlighter color; its edges were read as column lines,
+  cutting each real column into slivers. The table then looked like a grid
+  drawn over flowing text, was rejected, and was read line by line. A
+  fill-only rectangle in a pure highlighter color (yellow, green, cyan,
+  pink, red, blue), wider than a rule and one line tall, is no longer a
+  table edge (`core/mupdf_page.py`). Word's borders (thin black fills) and
+  cell shading (greys, tints) still are.
+* **Tables inside a table's cell.** The outer grid claimed every word and
+  read the whole inner table as one cell, line by line. Now a table drawn
+  inside another is nested: the outer table is still read cell by cell, and
+  the cell holding the inner table reads its text above the table, then the
+  table cell by cell, row by row (with all the usual table rules), then the
+  text below it.
+* **A word left of a label column** ("New code | Revised: February 2026")
+  was read after the values; it is now read with the label. (A highlight
+  had been hiding this one by forming a one-row "table" around the line.)
+
+sbs.docx against RLD Label-08-2026.pdf: words inside the RLD's tables
+flagged as different 58 -> 21 (the rest are real -- "nonfatal" vs
+"non-fatal", a hyphen vs a dash, the pen diagram -- or the SBS's Proposed
+copy of a table paired with the RLD's); rows 860 -> 838; the adverse
+reactions table of page 22 now matches cell for cell. Every other corpus
+pair is unchanged except one table of SBS-R.pdf, now read correctly
+("1.6 (-4.5, 7.6) n = 39 | -3.5 (-8.9, 1.9) n = 55"). Checked in smoke
+TEST 39.
+
+## 52. Show Table Cells: see the tables as the comparison reads them
+
+**View > Show Table Cells** (Ctrl+T, or "Table Cells" in the toolbar)
+outlines, on both documents, every table the comparison detects and each
+of its cells, with a small tag at the table's corner:
+
+* **blue** -- "Table n · rows×cols": read cell by cell, row by row;
+* **purple** -- "Nested table n": a table inside another table's cell (a
+  side-by-side document's RLD table), read cell by cell inside that cell;
+* **grey dashes** -- "Read as text": a grid that was found but is read as
+  ordinary text (ruling lines over a paragraph, a one-column list).
+
+The outlines come from the same extraction the comparison runs
+(`extract_words(..., table_layout=...)`), so what is drawn is exactly what
+is compared. They are read in the background a few pages at a time and
+appear as they are ready; a Word document is analyzed in the layout Word
+gave it, the pages the viewer shows. Turning the option off removes them.
+Checked in smoke TEST 39 and GUI step 30.
+
+## 53. Crops are applied before the page is read
+
+A crop used to be applied AFTER extraction: the whole page was read --
+its columns, zones and tables worked out from everything on it -- and the
+words in the cropped margins were then dropped. Cropped content still
+shaped how the rest was read, and Show Table Cells outlined tables right
+across the cropped area (a side-by-side document cropped to its RLD column
+still showed its "RLD | Notations | Proposed Label" grid whole).
+
+Now the crop goes into the extraction itself (`extract_words(..., crop=)`,
+through `extract_document_tokens` and the background extraction cache,
+where it is part of the cache key): words outside the kept area are gone
+before anything is worked out, and detected tables are cut to the kept
+area -- cells outside it dropped, cells across its edge trimmed. A table
+the crop cut down (a side-by-side grid kept to one column) is still read as
+that table. Saving a crop starts the cropped extraction at once, and the
+viewers' table outlines are redrawn for the kept part.
+
+Along the way, the check that rejects a "table" whose column lines run
+through its words (a grid over flowing text) now asks whether a word runs
+out of ITS OWN cell, not across any column line of the table: a header
+cell spanning several dose columns is one cell, and its words crossing the
+lines between those columns in the rows below no longer get a real table
+rejected. On the corpus this fixed the FPL outsert's combination-therapy
+table headers (888 -> 876 rows) and joined the SPL's added package-label
+section into one row (266 -> 261); nothing else changed. Checked in smoke
+TEST 40 and GUI step 30.
+
+## 54. Matched text in light green
+
+After a comparison, every word found the same in both documents -- the
+word pairing the comparison made (`TokenMap.matched_boxes`) -- is tinted a
+very light green on both viewers, under the difference highlights, so what
+differs stands out against what is confirmed. Neighbouring matched words
+on a line share one box (a 68-page draft against a 34-page SPL: about
+3,500 and 2,800 boxes). The tint follows the pairing: it is redrawn after
+Rematch, Rematch Areas and Undo Rematch. Repeated headers/footers set
+aside before comparing are not tinted. **View > Show Matched Text**
+(Ctrl+G, "Matched" in the toolbar) turns it off and on; the choice is
+remembered. The Find bar's matches are now yellow, current match orange
+(as in a browser), so the two greens are never confused. Checked in GUI
+step 31.
+
+## 55. Split words count as matched
+
+Some words were neither tinted green nor listed as a difference -- on an
+Arabic pair (1.pdf, 2.pdf) 50 words of the Original and 44 of the Suspect,
+e.g. "القل ب." against "القلب.", "أبديل- أتش" against "أبديل-أتش". One PDF's
+text layer draws the word in pieces: same letters, a space in another
+place. The comparison rightly drops that as a text-layer artifact (not a
+difference), but the word pairing had no pair for it, so it showed as
+neither matched nor different, and a click on it said "This text isn't in
+the Suspect".
+
+The word pairing (`core/token_map.py`) now pairs, letter by letter, an
+unpaired stretch with the unpaired stretch between its neighbours'
+partners when the two hold the same letters and the comparison drops the
+change -- the whole stretch, or its start or end when a real change sits in
+the middle ("(12.3)] . 2.3 Concomitant" / "(12.3)]. 2.4 Recommendations").
+A space lost or added next to a digit ("100 mg" / "100mg") is a reported
+Spacing difference and stays unpaired. Every word of the Arabic pair, the
+SPL draft and the 100-page sample is now either matched or in a listed
+difference; on the FPL outsert 3 words of 36,000 remain (a pairing that
+jumps out of sequence there). Clicking a split word now also finds its
+counterpart. Checked in smoke TEST 41.
+
+## 56. Every word is matched or listed -- never neither
+
+A missed difference can be costly, so the comparison now ends with a check
+(`core/completeness.py`, run by the comparison worker) that enforces one
+rule for every word of both documents: it is EITHER matched to the other
+document (tinted green) OR inside a row of the deviation list.
+
+* **Repeated headers/footers.** A running header or footer the other
+  document does not have is compared on its first page; its copies on the
+  other pages were set aside so they would not be reported once per page.
+  They are now ONE row each, highlighting every copy: "Page 1 of 68
+  (repeated header/footer: 67 more copies, pages 2-68)" (minor -- the
+  first copy is reported in its own right).
+* **Any word still unaccounted for** -- whatever the cause -- gets a row of
+  its own (consecutive words together), "Deleted on suspect" or
+  "Inserted", rated as a deletion/insertion is. On the corpus this caught
+  words that had silently vanished: "tablets" left out of a moved
+  passage's row on the FPL outsert, "Olmesartan" / "medoxomil, amlodipine"
+  on the Amlo pair, a few words of the sbs.docx efficacy tables.
+
+Audited on all 17 pairs (about 395,000 words, the repeated-header copies
+included) by running the real comparison worker and checking every
+extracted word: 0 unaccounted. Checked in smoke TEST 42.
+
+Deliberately outside the comparison, as before: cropped margins (the
+reviewer's choice, shown as red bands); text outside the visible page;
+printer's plate lines ("Dimensions:", "Color:", "Pantone") and a bare
+page number in the top/bottom 65pt margin; decorative dash rules
+("--------"); text inside images (a scanned page is reported as such).
+
+## 57. Unconfirmed matches are listed, not shown as matched (superseded by section 64)
+
+A pairing of identical words is CONFIRMED (green) when it lies in a run of
+at least 3 words matched in sequence, or -- for a shorter run -- in a small
+gap (at most 8 words on each side) between such runs, in the same order in
+both documents: "take one tablet twice daily" / "take ONE tablet daily",
+where "tablet" is the same word in the same place between two one-word
+edits. A short match inside a long rewritten stretch is a coincidence --
+"of", "and", "it" shared by two different sentences -- and is NOT
+confirmed: it is not tinted green, and it is listed in the deviation list
+as an "Unconfirmed match" row (minor, its own filter chip) showing the
+words on both sides, so a reviewer checks it. A Suspect word follows its
+partner, so a pair is confirmed or not on both documents at once
+(`TokenMap.confirmed`); the run counter treats a word one text layer
+splits ("القل ب." / "القلب.") as continuous. The comparison itself and its
+rows are unchanged (merging such words into the changes around them was
+tried and rejected: it lost "moved" findings and separate small edits).
+
+On the corpus: FPL outsert 85 unconfirmed rows, sbs.docx 61, SPL draft 12,
+the clean pairs (100-page sample, Arabic pair, leaflet) none. Every word of
+all 17 pairs is still either confirmed-matched or listed. Checked in smoke
+TEST 42.
+
+## 58. No "Moved" rows: moved text is matched, real deviations are kept
+
+A concise version of a label reorders text as a matter of course, so text
+that is in both documents -- only somewhere else -- is not a difference any
+more. There is no "Moved" category, no "Moved" severity and no "Reordered
+Section" row. Moved text is MATCHED: its words are paired one for one with
+the words they moved to (`_pair_moved_text` in core/diff_engine.py), so it
+is tinted green and a click on it jumps to where it went. Only what changed
+is listed:
+
+1. A deleted row and an inserted row of the same words are paired.
+   Three or more words: matched (green). One or two words ("Total
+   cholesterol" moved across a table): paired, but a pair that short is not
+   confirmed, so it is listed as an "Unconfirmed match" showing both
+   places (minor) -- never two critical rows, never silently matched.
+2. The same 3+ words re-cased or re-punctuated ("KEEP OUT OF THE REACH OF
+   CHILDREN" / "Keep out of the reach of children") moved: ONE row setting
+   the two places side by side, rated as the change it is (capitalization
+   -> major).
+3. A passage of 6+ identical words moved, with edits inside: compared as a
+   unit -- its identical words matched, each edit a row at its own severity
+   (a dose "4 mg" -> "8 mg" inside a moved paragraph stays critical).
+4. A 3+ word row found whole, unmatched, inside the other document's
+   unexplained text: paired.
+
+Never by text alone: a word is only ever paired with a word no other match
+has taken. The old "moved" logic judged by text -- "the other document
+contains this somewhere", counting copies across the whole document, even
+ignoring case and punctuation -- and hid real deviations behind a "Moved"
+row. On the SBS-R pair it called these "moved": "It is not known if
+sildenafil tablets" (3 copies in the draft, 1 in SBS-R: two were really
+deleted), "sildenafil tablets? • Take or give sildenafil" and "sildenafil
+tablets if you:" (in neither form in SBS-R); on the Amlo pair "talc and
+iron oxide yellow" against the original's "talc, iron oxide yellow". All
+are now reported. A short phrase shared by two different sentences ("of
+the patient") is never paired; a replacement is never undone. Rematch
+(a reviewer's own pairing) is left alone by this pass.
+
+On the corpus: every former "Moved" row is gone (SPL draft 18, FPL 48,
+Amlo 18, SBS 16 ...); critical counts are unchanged or lower except where a
+hidden deviation now surfaces (SBS-R +4, Amlo +5); every word of all 17
+pairs is still matched or listed. Checked in smoke TESTs 7, 8, 9, 14, 20,
+25 (rewritten: moved text matched, and never swallowing a real difference)
+and 30, the multi-column unit tests and GUI step 10.
+
+The last traces of "Moved" are gone too: the list's "Moved:" row text, the
+purple "moved" highlight, the comparator's "moved to a different position"
+summary and Rematch's special cases for moved rows. The comparator's
+one-line summary of an "Unconfirmed match" row now says what it is ("Same
+words on both documents, paired only by a short match ... check they belong
+together") instead of "Spacing only".
+
+## 59. A missing line is marked where it belongs, not at the same coordinates
+
+A row present on one side only (a line missing from the Suspect, or added
+to it) is marked on the other document with a small dashed insertion point.
+Some rows had none: those built for a whole section missing on the other
+side, rows rebuilt after moved text was paired, repeated-header rows and the
+safety-net rows that list words neither matched nor listed. For those, the
+viewer drew the row's own boxes at the same page coordinates on the other
+document -- in a different layout, on unrelated text. The contents line
+"2.2 Recommended Dosage in Pediatric Patients" (SBS-R page 4, missing from
+the Word draft) was marked in the middle of the draft's Hearing Loss
+paragraph instead of after "2.1 Recommended Dosage in Adults".
+
+Every one-sided row is now given an insertion point once all rows exist
+(`place_insertion_points` in core/completeness.py, called by the worker):
+right after the partner of the nearest CONFIRMED match before it -- or, with
+nothing before it, right before the partner of the nearest one after it.
+Only confirmed (green) matches anchor it, so a coincidental one-word pair
+cannot pull the mark somewhere else. On the SBS-R / draft pair all 11 such
+rows now have one; the 2.2 contents line is marked on draft page 1, right
+after "2.1 Recommended Dosage in Adults", and the comparator shows
+"Original page 4 · Suspect page 1". Checked in smoke TEST 43.
+
+## 60. Moved text: edits far apart, longest copy first, no word paired twice
+
+Clicking "Inserted: sildenafil tablets 3 times a day. • If you take too
+much sildenafil" (draft page 25) showed text that IS in SBS-R page 55 --
+only with "Sildenafil" capitalized. The Patient Information leaflet moved
+as a whole, and moved text is compared in passages built from runs of 6+
+identical words. Two such runs were joined only when at most 5 words lay
+between them, so "Sildenafil tablets? • Take or give Sildenafil" (7 words
+between two runs) was never compared: every word of it became a critical
+Inserted/Deleted row instead of two capitalization changes.
+(core/diff_engine.py)
+
+- `_moved_passages` also joins two runs when the words between them are
+  mostly the same words ignoring case and punctuation (`_gaps_alike`,
+  similarity >= 0.5), and extends a passage over the words before its
+  first run / after its last when they are alike in the same way ("Know
+  the medicines you or your child" / "Know the medicines you"). It never
+  joins across a run that moved somewhere else -- its words would be
+  paired twice.
+- `_find_moved_blocks` takes the longest matches first across the whole
+  document, not in document order. In order, "physical condition. It is
+  not known if sildenafil tablets are safe" took the copy in "pregnant...
+  It is not known if sildenafil tablets will harm your unborn baby" for its
+  first seven words, and that sentence -- present in both -- was reported
+  deleted.
+- A row of bare marks ("•", "(%)") is no longer paired with the same mark
+  anywhere in the document: a bullet inserted before "If you take too
+  much" was listed as an Unconfirmed match with a bullet 40 pages away. It
+  is listed where it is, as a minor list-mark change.
+
+On the SBS-R / draft pair the sildenafil passage is now matched, each
+"Sildenafil" -> "sildenafil" a capitalization row, with the missing "or your
+child" words and the two extra bullets; critical words drop on every pair
+that changed (FPL 4137 -> 4030, Amlo 2127 -> 2116, SBS 2339 -> 2286), with
+precise edits in place of whole-block rows (Amlo's coating list: "yellow,"
+-> "yellow and", "red," -> "red and", "talc," -> "talc and"). Every word of
+all 17 pairs is still matched or listed, and no word is paired twice.
+Checked in smoke TEST 25 (cases 8 and 9).
+
+The pink dashed band at the foot of a cropped page is the crop, not a
+finding.
+
+## 61. Dashes typed into text are reported; only ruled headings are left out
+
+Dash rules around Highlights headings ("------ DRUG INTERACTIONS ------")
+are left out of the comparison, so their lengths never differ. The rule
+was recognised from the word alone -- 3+ dashes at the start or end of
+ANY word -- so "DISCONTINUATION OF------" in a boxed warning was read as
+"OF" and matched; and a dash typed after a word ("2011-", "use--",
+"INFORMATION-") was a minor "Hyphenation" row, the label for a word broken
+differently ("HIGHLIGHTS" / "HIGH-LIGHTS"). (core/pdf_extractor.py,
+core/diff_engine.py)
+
+- Rules are left out only where they FRAME a heading: a rule, at most 12
+  words, a rule -- on one line or wrapped over up to 3 -- or a heading
+  written as one word ("-----CONTRAINDICATIONS----"), or a rule on a line
+  of its own (`_rule_framed_tokens`). Text printed over the end of a
+  heading line does not unframe it. Everywhere else dashes are text.
+- A rule ending a line is never stitched to the next line as a broken
+  word ("------" + "s;" read as "-----s;" unframed the heading).
+- A dash added to or taken off the start or end of a word is a
+  Punctuation change, major (`_edge_dash_change`); a sign put in front of
+  a number ("1.4" / "-1.4", SPL) is critical. A run of dashes typed apart
+  ("OF ------") is major too. Compounds written with a space or a hyphen
+  ("two-year" / "two year") stay minor Hyphenation.
+- A dash at a line end before a lowercase word looks like a word broken
+  in two ("INFORMATION-" over "needed" was read "INFORMATIONneeded" and
+  then dropped as a spacing slip against "INFORMATION needed"). When the
+  halves are printed as two words in either document and the joined word
+  nowhere, the dash is kept: reported as a hyphenation row. This also
+  reads real compounds broken at their own hyphen correctly ("Anti-" over
+  "inflammatory" is "Anti-inflammatory", not "Antiinflammatory").
+
+On sample 2 (PDF against the Word file with "INFORMATION-", "use--",
+"2011-", "OF------" typed in), all four are reported (major punctuation);
+against the unedited Word file the result is the same 21 rows as before.
+On the corpus: SPL's "-1.4" / "1.4" is now critical; four false
+hyphenation rows (a compound read without its hyphen) are gone. Checked
+in smoke TEST 44.
+
+## 62. Formatting extras: spacing and bullets listed apart, not counted
+
+Spacing differences ("10,15," / "10, 15,", "≥ 5%" / "≥5%") and bullets (a
+list mark drawn with another glyph, "ο" / "○", or a bullet present in one
+document only, as an inserted, deleted or unconfirmed row) change the
+layout, not a word. They are no longer deviations: the Deviations dock has
+two tabs, **Deviations N** and **Formatting extras N**
+(`is_formatting_extra` in core/diff_engine.py, ui/results_panel.py).
+
+- The deviations tab, the dock title, the status line, the severity pills,
+  the accepted / rejected / to-review counts and the seen meter count the
+  deviations only. Viewing an extra never moves the meter.
+- The extras tab lists them with the same filters, grouping, comparator
+  and Accept / Reject; nothing is dropped. Clicking a highlighted extra in
+  a viewer brings its tab forward.
+- The report lists the deviations (and counts only them in its summary),
+  then the extras in a section of their own -- "Formatting extras
+  (spacing, bullets)", in HTML and CSV.
+
+On sample 2 (PDF against the Word file): 20 deviations, 5 formatting
+extras (all spacing). Checked in GUI step 32.
+
+## 63. Two versions of a label (ACTOPLUS MET RLD Dec 2017 / Jun 2024)
+
+Tested on the two 45-page FDA labels; each fix was checked against the
+17-pair corpus (no pair worse; SPL, SBS and FPL slightly better).
+
+- **Running lines stacked at the page edge** (core/page_furniture.py):
+  the 2017 pages carry "This label may not be the latest approved by
+  FDA." over "For current labeling information, please visit ..." over
+  "Page N of 45"; only the outermost was found. Lines are now peeled from
+  the edges inward, up to three deep; once a line is found, every whole-
+  line copy of it counts, wherever it sits on its page.
+- **A line both documents repeat** ("Reference ID: 4198886" / "...
+  5405221", "Page N of 45" / "of 40") is set aside in both, keeping the
+  first copy of each: the copies fell wherever each version's pages
+  broke and split the text around them on every page. The first copy is
+  moved, whole and left to right, to the top (or foot) of its page --
+  on a two-column page the stamp was read half in each column. Copies
+  found through the other document must be whole lines ("on 27-04-2023
+  at 12:48 PM" also ends a different footer). The set-aside repeats are
+  listed under **Formatting extras**, not counted as deviations.
+- **Section numbers beside a Contents list** (core/pdf_extractor.py
+  `_merge_label_strips`): "1" ... "7" at x=36 with their headings at x=54
+  were taken for a column and read first, all together. A strip under
+  50pt wide, under 2 words a line, mostly numbering labels, joins the
+  column to its right; a narrow strip of anything else stays apart.
+- **A full-width line in a short block** (`_detect_column_bands`): in a
+  3-line block one crossing line was "tolerated", and "... acidosis,
+  including diabetic ketoacidosis [see Warnings and" was cut at a 321pt
+  gap and its middle read after "Page 7 of 40". In blocks of fewer than 8
+  lines a gap some line crosses is a gutter only up to 60pt wide.
+- **Symbol-font characters** (core/mupdf_page.py): the 2024 PDF writes
+  arrows as private-use codes (U+F0AF for ↓, U+F0AD for ↑), the 2017 one
+  as Unicode -- 42 false rows. A font named Symbol is read as the
+  characters it draws; Wingdings is left alone.
+- **A soft hyphen drawn on its own** made an empty word that could be
+  neither matched nor listed (the one unaccounted word). Words with no
+  visible text are not read.
+- **Boilerplate is not "moved" across the document**
+  (core/diff_engine.py `_find_moved_blocks`): a deleted 2017 sentence had
+  its cross-reference "[see Boxed Warning and Warnings and Precautions"
+  paired with the same words closing a different sentence 16 pages away.
+  A moved block made only of phrases recurring in the documents must be
+  12+ words or stay within 10% of the documents' length.
+- **Insertion points of safety-net rows** use confirmed matches only (as
+  every other row): a coincidental one-word pair placed a deletion on
+  page 22 at page 6. Those rows, and Unconfirmed match rows, now carry
+  their words (spans).
+- "AUC_{0–∞}" / "AUC_{0–∞.}" is Punctuation, not Hyphenation: same dashes
+  in the same places.
+
+Result on the pair: 978 rows -> 842 (823 deviations + 19 extras), 537
+critical -> 470; every word of both documents matched or listed. Checked
+in smoke TEST 45 (each check fails with its fix switched off).
+
+## 64. No "Unconfirmed match": shared words belong to their change, short moves are trusted or reported
+
+An "Unconfirmed match" row was a word or two found on both sides and
+paired by the comparison, but not confirmed by matched text around it
+(a confirmed match is in a run of 3+ matched words or a small gap between
+such runs, core/token_map.py). They were listed apart so they would not
+pass silently. On 18 pairs there were 226; they were of two kinds, and
+each is now handled as what it is:
+
+- **Words two rewritten passages share (209)** -- "heart failure" in
+  "if you have severe heart failure" / "if you have ever had heart failure
+  or have problems". They are part of the change: joined to the row beside
+  them on each side (its text, place and severity rebuilt), and when that
+  leaves two rows touching on both documents, the two are one change and
+  are merged (core/completeness.py `unaccounted_rows`). Nothing else
+  around them is reported apart; a word with no row beside it gets a
+  deleted/inserted row of its own, as before.
+- **A whole one- or two-word line that moved (17)** -- "Total cholesterol"
+  moved across a table. Matched, like any moved text, when the pair
+  cannot be chance: a word of 4+ letters, and as many deleted as inserted
+  lines reading exactly so (paired in order; core/diff_engine.py
+  `_distinctive_short_row`, `TrustedPair`, shown green). A lone "and",
+  "All", "3" or "(n=157)" deleted here and inserted there is a deletion
+  and an insertion.
+
+The category, its chip and its comparator line are gone. Every word is
+still matched or listed (0 unaccounted on all pairs).
+
+Joining shared words to a change made a spelling slip of "severe heart
+failure" / "ever had heart failure" (the shared words made the letters
+alike). A misspelling is now judged on the words that differ, the
+words both sides share left out (at most 3 a side): word for word, or
+their letters joined when the text layer split a word ("cipro oxacin" /
+"ciprooxacsin"). Each must be a slip -- at least 3 letters, one letter
+added, lost, changed or swapped (two when the shorter spelling has 5+
+letters). "for" / "of", "dose" / "dosage", "severe" / "ever had" are
+wording; "fom" / "from", "anhydrase" / "anhydrse", "Состдв: Кажда" /
+"Состав: Каждая" stay misspellings. Checked in smoke TESTs 25 (case 7), 42 and 46.
+
+## 65. Outsert artwork sheets (FPL 2018 / outsert 8099813, 2025)
+
+Two 2-page artwork sheets of nine columns each. Fixes:
+
+- **The artwork box** (product name, code, colours, substrate, dates,
+  approvals -- a ruled table across four columns at the top of the sheet)
+  was read inside whichever column its middle was over, between the end of
+  one column and the start of the next. The two versions break their
+  columns at different words, so the box split the text on both sides
+  ("Table 7." / "V. No. : 01 CODE : 8099813 ... Table 8:"). A table that
+  spans two or more page columns with no text beside it, and none above
+  (or only a sheet label like "1.14.2.2") is now read first on the page
+  (or last, at the foot) -- core/pdf_extractor.py
+  `_page_edge_of_wide_table`. The two boxes are then compared field by
+  field: "CODE : 8067349" / "8099813", "25-01-2018" / "07-03-2025".
+- **The note under it** ("Note: Pharma code/ Bar code and adjacent text
+  must be visible on folded leaflet. These details ...") runs across a
+  column gutter and was cut up among the columns. Lines right under a
+  page-top box that run across a gutter are read with the box
+  (`_lines_under_box`); the note, identical in both, now matches.
+- **An underlined header** -- "Final Package Insert" and "Page 1 of 2"
+  with a line of typed underscores drawn over them -- read
+  "_F_in__a_l _P_a_c_k_a_g_e_". A run of "_" glyphs lying on letters of
+  its line is decoration and is dropped, all of it (core/mupdf_page.py
+  `_without_underline_glyphs`); underscores on their own are kept.
+- **Speed**: finding which words are inside rows tested each of the
+  9,000 words on a sheet against every row's boxes -- 27 million tests,
+  50s (768s on a busy machine). Rows carry their words; they are looked up
+  directly, boxes only for a row without them (core/completeness.py
+  `_covered`). The pair compares in about 11s again.
+
+Result: 771 rows -> 769, critical 437 -> 431, matched words 15,435 ->
+15,493; every word matched or listed. Sampled rows are real 2018 -> 2025
+edits ("doctor" -> "healthcare provider", "(CLcr" -> "(CrCl", "metformin,"
+-> "metformin HCl,", tables renumbered, "N=2633" -> "N=2,633" minor).
+Checked in smoke TEST 47.
+
+Known: on a PDF compared with a Word draft that has no artwork box, the
+box now sits at the top of its page, where the draft has other text; the
+comparison may set the box against that text as a "change" rather than
+listing it deleted -- every word is still reported.
+
+## 66. A Word draft against its merged two-sided outsert (Lurasidone 8108940)
+
+The Merge dialog orders "...Front.pdf" before "...Back.pdf" whichever is
+added first, merges them into one 2-page Suspect and compares with the
+draft (68 pages laid out by Word). Front-first and back-first merges give
+nearly the same result. Fixes:
+
+- **A table's arms read column by column** (core/pdf_extractor.py
+  `_complete_rows`): an unruled efficacy table with the study number beside
+  three arms -- "1 | Lurasidone (40 mg/day)* | 54.2 (8.8) | -9.4 (1.6) |
+  ..." -- lines 6.5pt apart, was joined into one row and read cell by cell:
+  three labels, three baselines, three changes, against the ruled Word
+  table read row by row (~30 rows of the same numbers). Lines that are
+  each a whole row (the same 3+ cells, each with its own label under the
+  first line's label, the first line perhaps led by a centred number) are
+  read line by line. A row whose cells wrap ("All Patients | -1.9" over
+  "(n=672)") is still read cell by cell.
+- **Text that only moved, found alone** (core/completeness.py
+  `_moved_alike`): a Contents entry the two layouts read in another order
+  ("2.1 Schizophrenia", "5.7 Hyperprolactinemia") is paired but not
+  confirmed by its neighbours. With no change beside it on either side,
+  the same words in order on both sides and a word of 4+ letters, it is
+  matched (TokenMap `trust`) -- not a critical deletion plus insertion.
+- **Sub/superscripts written two ways**: "α_{2C}" (one lowered run) and
+  "α₂ _{C}" (split in two) compare as the same text (spacing extra). A
+  word only raised/lowered differently -- "Cmax" / "Cₘₐₓ" -- is minor, in
+  a new "Sub/superscript" category; "2⁴" / "24" and "H₂O" / "H2O" stay
+  critical (`_is_script_only`).
+
+Result (front-first): 120 deviations -> 84 (72 critical), words matched
+98.4% -> 99.2%. Real findings it shows: the draft's item code "8108948" at
+the end of the Medication Guide against "8108940" printed on the outsert;
+"04/2026" / "4/2026"; the draft's manufacturer block printed twice (end of
+the PI and of the Medication Guide), the outsert's once; the artwork box.
+Still listed, by choice: stacked table headers a ruled Word table reads
+cell by cell ("Placebo (N=708) (%)") and the unruled outsert line by line
+("Placebo 20 mg/day ..." then "(N=708) (%) ...") -- the same words in
+another order, which would also be the look of two columns' numbers
+swapped. Checked in smoke TEST 48 (each part fails with its fix off).
+
+## 67. "Text to Text Samples" (16 pairs) -- reading artwork text as printed
+
+All 16 pairs in C:\Documents\Text to Text Samples run (one, sample 2, is
+refused as intended: its Suspect is a scan with no text layer). Every word
+of the other 15 is matched or listed. Fixes from them:
+
+- **Upside-down text** (core/mupdf_page.py): a foil prints every other row
+  turned half a turn; read as upright it came out backwards ("NOITUAC -
+  GURD" for "DRUG - CAUTION", "AIDNI"). Text running right to left is now
+  read as turned text, along its own direction.
+- **Turned text: lines, columns, word ends** (core/pdf_extractor.py
+  `_words_from_rotated_group`): lines are told apart at half the type
+  size (a fixed 3pt merged a foil's 3pt lines); a line is cut where a
+  column-sized gap opens along it, and the pieces gathered into columns --
+  three copies of a turned patient leaflet down an outsert were read as
+  one line, "start It start It start It". Word ends come from MuPDF's own
+  words: the glyph stream leaves spaces out, and a turned leaflet read as
+  105 run-together "words" ("ReadthePatientInformationthatcomeswith...")
+  now reads as 681.
+- **Text drawn twice** (`_without_overprints`): the same glyph, size and
+  place drawn again (an artwork slug, fake bold) read
+  "881155--0022--22002222..iinndddd"; it is read once.
+- **A superscript at full size** (`_mark_raised_digits`): a Word export
+  lifts the "2" of "kg/m2" without shrinking it ("30kg/m 2," against
+  "30kg/m²,"). Up to three digits, at the text's own size, raised 20-60% of
+  it right after a non-digit, are a superscript.
+
+Results, before -> after: Sample 5 66 -> 39 deviations (97.7% / 95.6%
+matched); Set 7 32 -> 18; Set 3 (foils) 58% -> 68% matched; Sample 6
+matched 83.8% / 77.1% -> 84.4% / 81.8%. Genuinely different pairs stay
+low by design: sample 4 (US Avastin PI vs Indian Abevmy insert, 2%),
+Sample 8 (generic draft vs ACTOPLUS MET RLD), Set 7's leaflet carries a
+patient leaflet its PI lacks. sample 1's Suspect really overprints
+"should" on "be monitored" -- reported. Known limits: letters spread by a
+Word table's "distributed" alignment ("D o n n é e s"); two foil columns
+2pt apart read across. Checked in smoke TEST 49.
+
+## 68. A click goes where the comparison paired the word -- nothing else
+
+Clicking a word used to take the other viewer to the word the comparison
+matched it with only when that match was in a run of 3+ words; otherwise
+the word's five-word phrase was looked up anywhere in the other document,
+and the viewer jumped there -- often the same wording in another
+paragraph, a pairing the comparison never made. A reviewer checking which
+word was matched to which saw something the comparison did not do.
+
+Now a click follows the comparison exactly (core/token_map.py
+`counterpart`, main.py `_on_viewer_clicked`):
+
+- A matched word (shown green -- `TokenMap.confirmed`) -> both words are
+  marked and the other viewer goes to the very word it was matched with.
+  The status bar says "Showing the word this one was matched with".
+- Any other word is in a difference row (every word is matched or listed)
+  -> that row is selected and both viewers go to it: the other document's
+  text, or the marker where it is missing there. This works with the
+  highlights hidden too: the row is found by its own words.
+- No phrase search, anywhere: Lock views scrolling keeps the two viewers
+  in step on matched words only.
+
+Checked in smoke TEST 46 (every word's click target is its confirmed
+partner or nothing) and GUI steps 15 and 33.
+
+## 69. Seven known gaps closed (OCR left out on purpose)
+
+- **Table headers stacked line by line** (core/pdf_extractor.py
+  `_table_header_lines`, `_continues_cells`, `_table_units_for`): a ruled
+  Word table reads its header cell by cell ("Placebo (N=708) (%)"), an
+  unruled artwork or an SPL's header grid rows read line by line
+  ("Placebo 20 40 ..." then "(N=708) (%) mg/day ..."), and every header
+  showed as deleted and inserted. A table's header -- the lines of two or
+  more cells directly above its first data row (one to three label cells,
+  then numbers only) -- now reads column by column wherever it is drawn:
+  over the label column too, with a heading set lower or centred beside
+  the rest ("Adverse Event Term"), a column whose heading runs to more
+  lines than its neighbours' ("(N=334)" under "Placebo"), and an SPL's
+  header grid rows (under a caption the grid draws as its first row).
+  Data rows never stack ("Nausea 5 11" / "Vomiting 3 4"): their cells are
+  numbers. A heading set across columns ("Mean Change from Baseline
+  (mg/dL)") is not one column's, and a dose row ("20   40   80") no longer
+  opens a zone as if it were section 20, cutting the header in two.
+  Numbers still compare position by position: two swapped columns are
+  reported. Lurasidone draft vs merged outsert: 161 -> 112 rows (critical
+  83 -> 40); SPL draft 228 -> 205 (critical 40 -> 28); no new rows on any
+  corpus pair. Limit: a header a Word page break splits (Sample 8, Table
+  10) stays apart on that side.
+- **One rating for a lost doubled letter** (core/diff_engine.py
+  `_rate_systematic_letter_loss`): "well" / "wel" was major while
+  "hallucinations" / "halucinations", the same lost "ll" glyph, was a
+  typo. With three or more such typos on the same side, a short word
+  losing that letter is a typo too -- never when what is left is a word
+  ("to", "of").
+- **Artwork box against a Word draft** (`_split_artwork`): when only one
+  side holds the artwork sheet's box, its fields are removed (or added) on
+  their own instead of "changed" into the draft's next words.
+- **Letter-spaced cells** (core/mupdf_page.py `_join_letter_spaced`):
+  Word's "distributed" alignment ("D o n n é e s") reads as the word;
+  atom labels of a structure ("O O N H S") stay apart.
+- **Turned text glued together** (`_words_from_rotated_line`): a word is
+  cut where the letter gap is several times the line's usual one
+  ("yourdoctoraboutyour").
+- **Foil columns** (`_peel_spanning_rows`, `_aligned_edge_bands`): a
+  title over two columns and an address under them crossed the gutter,
+  and the columns were read across ("Each Tamoxifen uncoated Citrate
+  tablet IP contains DRUG It is dangerous"). Up to three such lines at a
+  zone's top or bottom are set aside when what is left holds two columns.
+  A gutter of only 2pt (0.9pt word spacing) counts when the right
+  column's lines share one left edge and are set in a different size.
+  Set 3: 19 -> 15 rows, now the real differences ("Store below 25°C",
+  the added prescribing-information line).
+- **A footnote letter read into the next line** (`_mark_script_chars`):
+  a subscript's base is the glyph it overlaps most, never one with
+  another glyph stacked on it ("SₐD:" -> "SD:").
+
+Scanned PDFs (no text layer) are still refused with a message: OCR was
+left out at the user's request. Checked in smoke TEST 50 (TEST 37(c) now
+expects the header read column by column).

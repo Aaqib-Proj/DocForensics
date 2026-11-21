@@ -98,7 +98,7 @@ def document_kind(path: str) -> str:
     )
 
 
-def extract_document_words(path: str) -> list[Word]:
+def extract_document_words(path: str, crop: dict | None = None) -> list[Word]:
     """Single entry point: extract every Word from ``path``, whatever
     supported format it is.
 
@@ -117,11 +117,11 @@ def extract_document_words(path: str) -> list[Word]:
     """
     kind = document_kind(path)
     if kind == "pdf":
-        return _extract_pdf_words(path)
+        return _extract_pdf_words(path, crop=crop)
     if kind == "docx":
         pdf_path = layout_pdf_path(path)
         if pdf_path is not None:
-            return _extract_pdf_words(pdf_path, display_name=os.path.basename(path))
+            return _extract_pdf_words(pdf_path, display_name=os.path.basename(path), crop=crop)
         return _extract_docx_words(path)
     if kind == "pptx":
         return _extract_pptx_words(path)
@@ -162,14 +162,15 @@ def pdf_page_count(path: str) -> int:
 
 
 def extract_pdf_page_range(
-    path: str, first_page: int, last_page: int, display_name: str | None = None
+    path: str, first_page: int, last_page: int, display_name: str | None = None, crop: dict | None = None
 ) -> list[Word]:
     """Words of pages ``first_page``..``last_page`` of a PDF (for
     parallel extraction, see workers/extraction_cache.py). The chunk
-    that includes page 1 also performs the scanned-document check."""
+    that includes page 1 also performs the scanned-document check.
+    ``crop``: margins cut off per page (see `extract_words`)."""
     if first_page == 1 and is_scanned_pdf(path):
         raise ValueError(_scanned_message(display_name or os.path.basename(path)))
-    return extract_words(path, first_page, last_page)
+    return extract_words(path, first_page, last_page, crop=crop)
 
 
 def _scanned_message(name: str) -> str:
@@ -180,17 +181,18 @@ def _scanned_message(name: str) -> str:
     )
 
 
-def _extract_pdf_words(path: str, display_name: str | None = None) -> list[Word]:
+def _extract_pdf_words(path: str, display_name: str | None = None, crop: dict | None = None) -> list[Word]:
     if is_scanned_pdf(path):
         raise ValueError(_scanned_message(display_name or os.path.basename(path)))
-    return extract_words(path)
+    return extract_words(path, crop=crop)
 
 
-def extract_document_tokens(path: str) -> list[ComparisonToken]:
+def extract_document_tokens(path: str, crop: dict | None = None) -> list[ComparisonToken]:
     """``extract_document_words`` + ``build_comparison_tokens`` in one
     top-level call, so it can run in a worker process (see
-    workers/extraction_cache.py)."""
-    return build_comparison_tokens(extract_document_words(path))
+    workers/extraction_cache.py). ``crop``: margins cut off per page of
+    a PDF or a laid-out Word document (see `extract_words`)."""
+    return build_comparison_tokens(extract_document_words(path, crop=crop))
 
 
 def get_page_count(path: str) -> int:

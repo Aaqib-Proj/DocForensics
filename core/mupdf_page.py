@@ -41,6 +41,154 @@ from pdfplumber.utils.text import extract_words as _plumber_extract_words
 
 _REPLACEMENT_CHAR = "�"
 
+# The Symbol font's characters as Unicode. A PDF made from Word often
+# writes them as private-use codes (U+F000 + the font's own code): an
+# arrow in a table, "", against "↓" in the other version of
+# the same label -- the same arrow on both pages, read as a difference
+# 42 times. Only for a font named Symbol: other symbol fonts (Wingdings)
+# put different glyphs at the same codes.
+_SYMBOL_FONT_CHARS = dict(zip(
+    range(0x20, 0x7F),
+    " !∀#∃%&∋()∗+,−./0123456789:;<=>?"
+    "≅ΑΒΧΔΕΦΓΗΙϑΚΛΜΝΟ"
+    "ΠΘΡΣΤΥςΩΞΨΖ[∴]⊥_"
+    "‾αβχδεφγηιϕκλμνο"
+    "πθρστυϖωξψζ{|}∼",
+))
+_SYMBOL_FONT_CHARS.update({
+    0xA2: "′", 0xA3: "≤", 0xA4: "⁄", 0xA5: "∞", 0xA6: "ƒ", 0xAB: "↔",
+    0xAC: "←", 0xAD: "↑", 0xAE: "→", 0xAF: "↓", 0xB0: "°", 0xB1: "±",
+    0xB2: "″", 0xB3: "≥", 0xB4: "×", 0xB5: "∝", 0xB6: "∂", 0xB7: "•",
+    0xB8: "÷", 0xB9: "≠", 0xBA: "≡", 0xBB: "≈", 0xBC: "…", 0xD7: "⋅",
+})
+
+
+# Letters spread evenly across a cell ("D o n n é e s"): at least this
+# many in a row, gaps within this share of each other and under this many
+# type sizes (a short word spread over a wide cell: "d o s e").
+_SPREAD_MIN_LETTERS = 4
+_SPREAD_GAP_TOLERANCE = 0.15
+_SPREAD_MAX_GAP_EM = 2.5
+
+
+def _join_letter_spaced(words: list[dict]) -> list[dict]:
+    """``words`` with each run of single letters spread evenly along a
+    line -- a Word table cell set to "distributed" alignment, "D o n n é e
+    s" for "Données" -- joined into the word it spells. Only a word's
+    shape (a first letter, then lower-case letters) and only even spacing:
+    atom labels of a structure ("O O N H S") and other single capitals stay
+    apart."""
+    out: list[dict] = []
+    k = 0
+    while k < len(words):
+        run = [words[k]]
+        j = k + 1
+        while j < len(words) and _spread_letter(words[j]) and _spread_letter(run[-1]) and _same_line(run[-1], words[j]):
+            gaps = [b["x0"] - a["x1"] for a, b in zip(run, run[1:])]
+            gap = words[j]["x0"] - run[-1]["x1"]
+            size = run[-1]["bottom"] - run[-1]["top"]
+            if not 0 < gap < _SPREAD_MAX_GAP_EM * size or (gaps and abs(gap - sum(gaps) / len(gaps)) > _SPREAD_GAP_TOLERANCE * sum(gaps) / len(gaps) + 0.3):
+                break
+            run.append(words[j])
+            j += 1
+        letters = "".join(w["text"] for w in run)
+        if (len(run) >= _SPREAD_MIN_LETTERS and letters[1:].islower()
+                and all(w.get("upright", True) for w in run)):
+            out.append(_merged_word(run))
+            k = j
+        else:
+            out.append(words[k])
+            k += 1
+    return out
+
+
+def _spread_letter(word: dict) -> bool:
+    return len(word["text"]) == 1 and word["text"].isalpha()
+
+
+def _same_line(a: dict, b: dict) -> bool:
+    return abs(a["top"] - b["top"]) < 0.5 * (a["bottom"] - a["top"]) and b["x0"] > a["x0"]
+
+
+def _merged_word(run: list[dict]) -> dict:
+    merged = dict(run[0])
+    merged["text"] = "".join(w["text"] for w in run)
+    merged["x0"], merged["x1"] = run[0]["x0"], run[-1]["x1"]
+    merged["top"] = min(w["top"] for w in run)
+    merged["bottom"] = max(w["bottom"] for w in run)
+    for key in ("doctop",):
+        if key in merged:
+            merged[key] = min(w.get(key, w["top"]) for w in run)
+    if "chars" in merged:
+        merged["chars"] = [c for w in run for c in w.get("chars") or []]
+    return merged
+
+
+def _without_overprints(chars: list[dict]) -> list[dict]:
+    """``chars`` without a glyph drawn again on top of itself -- the same
+    character, size and place (within half a point). An artwork slug drawn
+    twice read "881155--0022--22002222..iinndddd" for "815-02-2022.indd"."""
+    seen: set[tuple] = set()
+    kept: list[dict] = []
+    for c in chars:
+        key = (c["text"], round(c["x0"] * 2), round(c["top"] * 2), round(float(c.get("size") or 0.0), 1))
+        if key in seen and not c["text"].isspace():
+            continue
+        seen.add(key)
+        kept.append(c)
+    return kept if len(kept) < len(chars) else chars
+
+
+def _without_underline_glyphs(chars: list[dict]) -> list[dict]:
+    """``chars`` without the "_" glyphs drawn over other text: a sheet
+    header "Final Package Insert" underlined by a line of underscores
+    typed across it read as "_F_in__a_l _P_a_c_k_a_g_e_". A run of
+    underscores lying on letters of its line is decoration, all of it; one
+    on its own (a rule, a blank to fill in) is kept."""
+    underscores = [k for k, c in enumerate(chars) if c["text"] == "_"]
+    if not underscores:
+        return chars
+    bucket = 10.0
+    by_x: dict[int, list[dict]] = {}
+    for c in chars:
+        if c["text"] not in ("_", " "):
+            for b in range(int(c["x0"] // bucket), int(c["x1"] // bucket) + 1):
+                by_x.setdefault(b, []).append(c)
+
+    def over_text(u: dict) -> bool:
+        height = u["bottom"] - u["top"]
+        for b in range(int(u["x0"] // bucket), int(u["x1"] // bucket) + 1):
+            for c in by_x.get(b, ()):
+                if (min(u["x1"], c["x1"]) - max(u["x0"], c["x0"]) > 0.3 * (u["x1"] - u["x0"])
+                        and min(u["bottom"], c["bottom"]) - max(u["top"], c["top"])
+                        > 0.5 * min(height, c["bottom"] - c["top"])):
+                    return True
+        return False
+
+    # The underscores of one line, drawn one after another, are one rule:
+    # when any of it lies on text, all of it is the underline.
+    runs: list[list[int]] = []
+    for k in underscores:
+        last = chars[runs[-1][-1]] if runs else None
+        if last is not None and runs[-1][-1] == k - 1 and abs(chars[k]["top"] - last["top"]) < 1.0:
+            runs[-1].append(k)
+        else:
+            runs.append([k])
+    drop = {k for run in runs if any(over_text(chars[k]) for k in run) for k in run}
+    if not drop:
+        return chars
+    return [c for k, c in enumerate(chars) if k not in drop]
+
+
+def _char_text(ucs: int, font: str) -> str:
+    """The text of one glyph: its Unicode, a Symbol-font private-use code
+    as the character it draws (see `_SYMBOL_FONT_CHARS`)."""
+    if ucs < 0:
+        return _REPLACEMENT_CHAR
+    if 0xF020 <= ucs <= 0xF0FF and "symbol" in font.lower():
+        return _SYMBOL_FONT_CHARS.get(ucs - 0xF000, chr(ucs))
+    return chr(ucs)
+
 # A path segment is kept for the table finder when it is exactly
 # horizontal or vertical, and for the gutter-rule check when it is
 # within this much of straight and at least this long (see
@@ -52,6 +200,7 @@ _LONG_RULE = 30.0
 class MuPdfPage:
     def __init__(self, page: fitz.Page) -> None:
         self._page = page
+        self._boxes: "_BoxIndex | None" = None
         rect = page.rect
         self.width = float(rect.width)
         self.height = float(rect.height)
@@ -94,8 +243,12 @@ class MuPdfPage:
             if self._rotated:
                 direction = fitz.Point(dx, dy) * rotation
                 dx, dy = direction.x, direction.y
-            # pdfminer's rule: upright unless turned a quarter or more.
-            upright = abs(dx) > 1e-6
+            # pdfminer's rule: upright unless turned a quarter or more --
+            # and not upside down: a foil prints every other row turned
+            # half a turn, and read as upright text "DRUG - CAUTION" came
+            # out "NOITUAC - GURD". Turned text is read along its own
+            # direction (core.pdf_extractor `_ordered_rotated_words`).
+            upright = dx > 1e-6
             a, b, c, d = dx, -dy, dy, dx
             span_chars = span["chars"]
             if self._rotated:
@@ -145,7 +298,7 @@ class MuPdfPage:
                         cur_ox, cur_oy = ox, oy + 0 * glyph_h
                     append(
                         {
-                            "text": chr(ucs) if ucs >= 0 else _REPLACEMENT_CHAR,
+                            "text": _char_text(ucs, font),
                             "x0": cur_x0,
                             "x1": cur_x1,
                             "top": cur_top,
@@ -191,7 +344,7 @@ class MuPdfPage:
 
                     append(
                         {
-                            "text": chr(cur_ucs) if cur_ucs >= 0 else _REPLACEMENT_CHAR,
+                            "text": _char_text(cur_ucs, font),
                             "x0": cur_x0,
                             "x1": cur_x1,
                             "top": cur_top,
@@ -228,13 +381,21 @@ class MuPdfPage:
         """
         want_chars = kwargs.get("return_chars", False)
         kwargs["return_chars"] = True
-        words = _plumber_extract_words(self.chars, **kwargs)
+        words = _plumber_extract_words(_without_underline_glyphs(_without_overprints(self.chars)), **kwargs)
         if words:
             words = _split_at_word_boxes(words, self._word_boxes())
+            words = _join_letter_spaced(words)
         if not want_chars:
             for word in words:
                 word.pop("chars", None)
         return words
+
+    def word_box_of(self, char: dict) -> int | None:
+        """Which of MuPDF's own words ``char`` lies in (an index), or None
+        -- MuPDF sees the word spaces the glyph stream leaves out."""
+        if self._boxes is None:
+            self._boxes = self._word_boxes()
+        return self._boxes.which(char, self._boxes.overlapping(char))
 
     def _word_boxes(self) -> "_BoxIndex":
         entries = self._page.get_text("words")
@@ -263,7 +424,9 @@ class MuPdfPage:
     def edges(self) -> list[dict]:
         if self._edges is None:
             self._read_drawings()
-            edges = [edge for rect in self._rects for edge in rect_to_edges(rect)]
+            edges = [
+                edge for rect in self._rects if not rect.get("highlight") for edge in rect_to_edges(rect)
+            ]
             edges.extend(dict(line, object_type="curve_edge") for line in self._lines)
             self._edges = edges
         return self._edges
@@ -293,6 +456,7 @@ class MuPdfPage:
             items = path.get("items")
             if not items:
                 continue
+            highlight_fill = _is_highlight_fill(path)
             for item in items:
                 kind = item[0]
                 if kind == "l" or kind == "c":
@@ -303,7 +467,10 @@ class MuPdfPage:
                     r = fitz.Rect(item[1]).normalize()
                     if to_view is not None:
                         r = r * to_view
-                    rects.append(self._rect_dict(r))
+                    rect = self._rect_dict(r)
+                    if highlight_fill and _HIGHLIGHT_MIN_SIDE < r.width and _HIGHLIGHT_MIN_SIDE < r.height <= _HIGHLIGHT_MAX_HEIGHT:
+                        rect["highlight"] = True
+                    rects.append(rect)
                     continue
                 elif kind == "qu":
                     q = fitz.Quad(item[1])
@@ -344,6 +511,30 @@ class MuPdfPage:
 
     def find_tables(self, table_settings: dict | None = None) -> list:
         return TableFinder(self, table_settings).tables
+
+
+# A text highlight (Word's highlighter, a reviewer's marked change) is a
+# rectangle filled -- not outlined -- in a pure highlighter color behind
+# one line of text. Its edges are not table rules: taken as rules they cut
+# a table's real columns into slivers ("4 doses of 2.5 mg/0.6 mL" across
+# three of them), the table was then rejected as a grid over flowing text,
+# and read line by line, every cell running into the next. Borders, which
+# Word draws as thin black filled rectangles, and cell shading (greys,
+# tints) are kept.
+_HIGHLIGHT_MIN_SIDE = 2.0  # thinner is a drawn rule
+_HIGHLIGHT_MAX_HEIGHT = 30.0  # one line of text, not a shaded block
+
+
+def _is_highlight_fill(path: dict) -> bool:
+    if path.get("type") != "f":
+        return False
+    fill = path.get("fill")
+    if not fill or len(fill) != 3:
+        return False
+    if not all(v <= 0.03 or v >= 0.97 for v in fill):
+        return False  # a tint or a grey: shading
+    levels = {round(v) for v in fill}
+    return len(levels) == 2  # not black, not white: yellow, green, cyan, pink, red, blue
 
 
 def _view_points(xs: list[float], ys: list[float], m: fitz.Matrix) -> tuple[list[float], list[float]]:

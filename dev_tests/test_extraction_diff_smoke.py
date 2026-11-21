@@ -23,10 +23,9 @@ Builds synthetic PDFs with PyMuPDF and asserts:
           soft hyphen, ligatures) and the hyphen-stitch rules (body
           text still stitches; table cells never do).
   TEST 8: out-of-order section matching -- a section moved to the
-          front is reported as ONE low-severity "reordered_section"
-          instead of critical removed/added noise, while genuine edits
-          inside it stay critical; identical / deleted / header-less
-          documents behave as before.
+          front is matched where it stands (no row, no removed/added
+          noise), while genuine edits inside it stay critical;
+          identical / deleted / header-less documents behave as before.
   TEST 10: the core/section_diff.py pipeline -- extract_reading_order
           reads a 3-column page column-major, build_section_map chunks
           by numbered headers (incl. subsections), and
@@ -743,7 +742,7 @@ def main() -> None:
     print()
     print("=" * 70)
     print("TEST 7: identical content in a different stream position")
-    print("        -> demoted to 'reorder', never a false 'critical' pair")
+    print("        -> matched where it stands: not a row at all")
     print("=" * 70)
     ok7 = True
 
@@ -751,33 +750,23 @@ def main() -> None:
         return Word(text=text, page=1, x0=0.0, top=top, x1=10.0, bottom=top + 10.0)
 
     # 'epsilon' exists once on each side, just at a different position
-    # (a wrap/order artifact). The diff engine must pair the removed +
-    # added copies into the lowest 'reorder' tier instead of flagging
-    # two critical disappearances/appearances.
+    # (a wrap/order artifact). Moving is not a difference: the two copies
+    # are paired with each other (matched), and nothing is reported.
     reorder_approved = build_comparison_tokens(
         [w(t, i * 20.0) for i, t in enumerate(["alpha", "beta", "gamma", "delta", "epsilon"])]
     )
     reorder_suspect = build_comparison_tokens(
         [w(t, i * 20.0) for i, t in enumerate(["alpha", "beta", "epsilon", "gamma", "delta"])]
     )
-    reorder_diffs = diff_documents(reorder_approved, reorder_suspect)
-    reordered = [d for d in reorder_diffs if d.kind == "reordered"]
-    criticals = [d for d in reorder_diffs if d.severity == "critical"]
-    # A move is reported ONCE, with both positions (one row whose two
-    # sides are "epsilon"), or -- older behaviour -- as two half-rows.
-    # Either way both copies must be accounted for as the move.
-    sides = sorted(
-        side for d in reordered for side in ("A", "S")
-        if (d.approved_text if side == "A" else d.suspect_text) == "epsilon"
-    )
-    if sides != ["A", "S"] or any(d.approved_text not in ("", "epsilon") or d.suspect_text not in ("", "epsilon") for d in reordered):
-        print(f"FAIL: moved 'epsilon' was not paired as two reorder items: {[(d.kind, d.approved_text, d.suspect_text) for d in reorder_diffs]}")
-        ok7 = False
-    elif criticals:
-        print(f"FAIL: moved 'epsilon' still produced critical items: {[(d.kind, d.approved_text, d.suspect_text) for d in criticals]}")
+    pairs7: list = []
+    reorder_diffs = diff_documents(reorder_approved, reorder_suspect, pairs7)
+    epsilon_paired = ("epsilon", "epsilon") in [(a.text, b.text) for a, b in pairs7]
+    if reorder_diffs or not epsilon_paired:
+        print(f"FAIL: moved 'epsilon' was reported or left unpaired: "
+              f"{[(d.kind, d.approved_text, d.suspect_text) for d in reorder_diffs]}, paired {epsilon_paired}")
         ok7 = False
     else:
-        print("PASS: identical text in a different position is paired and demoted to 'reorder'.")
+        print("PASS: identical text in a different position is matched, not reported.")
 
     # Control: a genuine one-word change must stay critical (never
     # demoted by the pairing pass).
@@ -792,12 +781,12 @@ def main() -> None:
         print("PASS: a genuine wording change stays 'critical' (control).")
 
     if ok7:
-        print("PASS: reorder-pairing pass.")
+        print("PASS: moved text is matched; a real change is still critical.")
 
     print()
     print("=" * 70)
     print("TEST 8: out-of-order section matching")
-    print("        -> moved section = one 'reordered_section', not a cascade")
+    print("        -> a moved section is matched where it stands; only edits are rows")
     print("=" * 70)
     ok8 = True
 
@@ -818,27 +807,19 @@ def main() -> None:
         deleted_sec, SECTIONS_4, drop="WARNINGS AND PRECAUTIONS"
     )
 
-    # Scenario A: moved AND edited -> the edit stays critical, the move
-    # is one reorder item, and NOTHING else (no removed/added noise).
+    # Scenario A: moved AND edited -> the edit stays critical and is the
+    # ONLY row: the move itself is not a difference (no removed/added
+    # noise, no "moved" row).
     moved_edited_diffs = run_pipeline(approved_sec, moved_edited_sec)
     criticals = [d for d in moved_edited_diffs if d.severity == "critical"]
-    moves = [d for d in moved_edited_diffs if d.kind == "reordered_section"]
-    noise = [
-        d for d in moved_edited_diffs
-        if d.kind in ("removed_in_suspect", "added_in_suspect")
-    ]
     ok_a = (
-        len(moved_edited_diffs) == 2
+        len(moved_edited_diffs) == 1
         and len(criticals) == 1
         and criticals[0].approved_text == "especially"
         and criticals[0].suspect_text == "very"
-        and len(moves) == 1
-        and moves[0].approved_text == "3 WARNINGS AND PRECAUTIONS"
-        and moves[0].severity == "reorder"
-        and not noise
     )
     if ok_a:
-        print("PASS: moved+edited section -> edit critical, move one 'reordered_section'.")
+        print("PASS: moved+edited section -> only the edit, critical.")
     else:
         print(
             f"FAIL: moved+edited section: "
@@ -854,11 +835,10 @@ def main() -> None:
     else:
         print("PASS: identical sectioned docs -> 0 diffs.")
 
-    # Scenario C (control): pure move, no edit -> one reorder item only.
+    # Scenario C (control): pure move, no edit -> nothing to report.
     moved_diffs = run_pipeline(approved_sec, moved_sec)
-    crit = [d for d in moved_diffs if d.severity == "critical"]
-    if len(moved_diffs) == 1 and moved_diffs[0].kind == "reordered_section" and not crit:
-        print("PASS: pure section move -> 1 'reordered_section', 0 criticals.")
+    if not moved_diffs:
+        print("PASS: pure section move -> 0 diffs.")
     else:
         print(f"FAIL: pure move: {[(d.kind, d.severity) for d in moved_diffs]}")
         ok8 = False
@@ -892,7 +872,7 @@ def main() -> None:
     print()
     print("=" * 70)
     print("TEST 9: wrapped headers + title-anchored matching + relocation")
-    print("        -> layout-interleaved content is 'reorder', not critical")
+    print("        -> layout-interleaved content is matched, not reported")
     print("=" * 70)
     ok9 = True
 
@@ -992,35 +972,27 @@ def main() -> None:
     b_to_a, _ua, _ub = _match_sections(
         _split_sections(ta_int), _split_sections(ta_ord)
     )
-    tail_diffs = diff_documents(ta_int, ta_ord)
-    criticals = [d for d in tail_diffs if d.severity == "critical"]
-    tail_reorders = [
-        d for d in tail_diffs
-        if d.kind == "reordered" and "eta theta iota kappa" in d.approved_text + d.suspect_text
-    ]
+    tail_pairs: list = []
+    tail_diffs = diff_documents(ta_int, ta_ord, tail_pairs)
+    paired_tail = [a.text for a, b in tail_pairs if a.text == b.text and a.text in ("eta", "theta", "iota", "kappa")]
     ok_b = (
         b_to_a.get(2) == 2  # suspect 2 DOSAGE -> approved 2 DOSAGE, NOT 5
         and b_to_a.get(3) == 5  # suspect 3 DOSAGE -> approved 5 (3 DOSAGE, last in stream)
         and b_to_a.get(4) == 3  # suspect 4 -> approved 4 CONTRAINDICATION
         and b_to_a.get(5) == 4  # suspect 5 -> approved 5 WARNINGS
-        and not criticals
-        # both sides of the relocated tail demoted: one row carrying both
-        # positions (a move is reported once), or two half-rows
-        and sum(
-            ("eta theta iota kappa" in d.approved_text) + ("eta theta iota kappa" in d.suspect_text)
-            for d in tail_reorders
-        ) == 2
+        and not tail_diffs  # the relocated tail is matched where it stands
+        and sorted(paired_tail).count("iota") >= 1 and "eta" in paired_tail and "theta" in paired_tail
     )
     if ok_b:
         print("PASS: contaminated chunks still match 2<->2 / 5<->5; "
-              "relocated tail demoted to 'reorder'.")
+              "the relocated tail is matched, not reported.")
     else:
-        print(f"FAIL: interleave: matches={b_to_a} criticals={[(d.kind, d.approved_text, d.suspect_text) for d in criticals]} "
-              f"reorders={[(d.approved_text, d.suspect_text) for d in tail_reorders]}")
+        print(f"FAIL: interleave: matches={b_to_a} rows={[(d.kind, d.approved_text, d.suspect_text) for d in tail_diffs]} "
+              f"paired tail={paired_tail}")
         ok9 = False
 
     if ok9:
-        print("PASS: wrapped headers + title-anchored matching + relocation demotion.")
+        print("PASS: wrapped headers + title-anchored matching + relocated text matched.")
 
     print()
     print("=" * 70)
@@ -1383,8 +1355,8 @@ def main() -> None:
     # reported case: a "Cardmember Agreement" print sheet combined with
     # an unrelated insert, read column-major in a different order than
     # the reference document. Title-anchored matching must still pair
-    # each section by its header text, and the reordered one must
-    # demote to 'reordered_section' rather than a critical cascade.
+    # each section by its header text, and the reordered one is matched
+    # where it stands rather than reported as a critical cascade.
     approved_unnumbered = [
         w14("CARDMEMBER", 10), w14("AGREEMENT", 10),
         w14("alpha", 24), w14("beta", 24), w14("gamma", 24),
@@ -1411,11 +1383,6 @@ def main() -> None:
     unnumbered_criticals = (
         [d for d in unnumbered_diffs if d.severity == "critical"] if unnumbered_diffs else None
     )
-    reordered_titles = (
-        {d.approved_text for d in unnumbered_diffs if d.kind == "reordered_section"}
-        if unnumbered_diffs
-        else set()
-    )
 
     if sections_app is None or sections_susp is None:
         print("FAIL: unnumbered headers were not detected -- section-based diffing never activated.")
@@ -1428,17 +1395,17 @@ def main() -> None:
         for d in unnumbered_criticals[:5]:
             print(f"    {d.kind}: {d.approved_text!r} -> {d.suspect_text!r}")
         ok14 = False
-    elif "ARBITRATION" not in reordered_titles:
+    elif unnumbered_diffs:
         print(
-            f"FAIL: expected 'ARBITRATION' to be reported as one reordered_section, "
-            f"got reordered titles: {reordered_titles!r}"
+            f"FAIL: the moved 'ARBITRATION' section should be matched where it stands, "
+            f"got rows: {[(d.kind, d.approved_text) for d in unnumbered_diffs]!r}"
         )
         ok14 = False
     else:
         print(
             "PASS: unnumbered headers ('CARDMEMBER AGREEMENT', 'INTEREST CHARGES', "
-            "'ARBITRATION') matched by title across a different relative order, "
-            "0 criticals, the moved section correctly demoted to 'reordered_section'."
+            "'ARBITRATION') matched by title across a different relative order; "
+            "the moved section is matched, not reported."
         )
 
     # Scenario B (false-positive guard): a document's own multi-line
@@ -1974,14 +1941,14 @@ def main() -> None:
     moved_diffs = run_tokens(lines_to_words(approved_lines), lines_to_words(suspect_lines))
     # The caption itself exists only in the suspect: that one is real.
     criticals = [d for d in moved_diffs if d.severity == "critical" and d.suspect_text != "Kidney Function Chart:"]
-    moved_rows = [d for d in moved_diffs if d.kind == "reordered" and "kidney disease" in d.approved_text]
+    moved_rows = [d for d in moved_diffs if "kidney disease" in d.approved_text + d.suspect_text]
     ok20 = True
-    if criticals or len(moved_rows) != 1:
+    if criticals or moved_rows:
         print(f"FAIL: moved section text: criticals={[(d.kind, d.approved_text[:40], d.suspect_text[:40]) for d in criticals]} "
-              f"moved rows={len(moved_rows)}")
+              f"rows for the moved text={len(moved_rows)}")
         ok20 = False
     else:
-        print("PASS: text split into a mispaired section is one 'moved' row, 0 criticals.")
+        print("PASS: text split into a mispaired section is matched, 0 rows for it, 0 criticals.")
     if any(d.kind == "reordered_section" and d.suspect_text.startswith("Kidney") for d in moved_diffs):
         print("FAIL: a content-only pairing was reported as a moved section.")
         ok20 = False
@@ -2513,20 +2480,6 @@ def main() -> None:
               f"{[(i.approved_text, i.suspect_text) for i in one_sided if not placed]}")
         ok24 = False
 
-    # A "section in a different order" row spans paired words: an area
-    # rematch leaves it be, and none of its words become "unpaired".
-    order_row = DiffItem(
-        index=0, kind="reordered_section", severity="reorder", approved_text="", suspect_text="",
-        approved_location=_location_of(rm_a), suspect_location=_location_of(rm_b),
-    )
-    with_order = rematch_areas(area_rows + [order_row], rm_a, rm_b, area_of(rm_a, dose[0]),
-                               area_of(rm_b, dose_edited[0]), area_map.partners())
-    if with_order.ok and order_row not in with_order.replaced and with_order.unpaired == 0:
-        print("PASS: a reordered-section row is left alone by an area rematch.")
-    else:
-        print(f"FAIL: reordered-section row replaced={order_row in with_order.replaced}, "
-              f"unpaired {with_order.unpaired}")
-        ok24 = False
 
     snap = area_map.snapshot()
     area_map.rebind(right.selected["approved"], right.selected["suspect"], right.pairs)
@@ -2543,93 +2496,159 @@ def main() -> None:
 
     print()
     print("=" * 70)
-    print("TEST 25: 'Moved' never swallows a real difference")
+    print("TEST 25: Moved text is matched -- and never swallows a real difference")
     print("=" * 70)
     ok25 = True
-    from core.diff_engine import _downgrade_relocated_runs
+    from core.completeness import unaccounted_rows as _unaccounted25
+    from core.token_map import TokenMap as _TM25
 
-    # A replacement is never relabelled as moved -- not two passages that
-    # merely share a few words (a real case: "Hold the" against "Fever -
-    # Itching one pre-filled"), and not the same passage with one word
-    # changed either: that one word IS the difference ("healthcare" ->
-    # "health" was hidden this way on a revised FPL). Moves are found by
-    # the moved-text pass, which reports the edits inside them separately.
-    unrelated = DiffItem(
-        index=0, kind="text_changed", severity="critical",
-        approved_text="Hold the syringe firmly",
-        suspect_text="Fever Itching one pre-filled",
-        approved_location=None, suspect_location=None,
-    )
-    same_text = DiffItem(
-        index=0, kind="text_changed", severity="critical",
-        approved_text="Hold the syringe firmly in one hand",
-        suspect_text="Hold the syringe gently in one hand",
-        approved_location=None, suspect_location=None,
-    )
-    one_word = DiffItem(
-        index=0, kind="text_changed", severity="critical",
-        approved_text="healthcare", suspect_text="health",
-        approved_location=None, suspect_location=None,
-    )
-    elsewhere_a = build_comparison_tokens(lines_to_words([
-        "Hold the syringe firmly in one hand", "Hold the syringe gently in one hand",
-        "health healthcare health",
-    ]))
-    elsewhere_b = build_comparison_tokens(lines_to_words([
-        "Hold the syringe gently in one hand", "Hold the syringe firmly in one hand",
-        "healthcare health healthcare",
-    ]))
-    rows = [same_text, one_word]
-    _downgrade_relocated_runs(rows, elsewhere_a, elsewhere_b)
-    if all(r.kind == "text_changed" and r.severity == "critical" for r in rows):
-        print("PASS: a replacement stays an edit even when both sides occur elsewhere.")
-    else:
-        print(f"FAIL: replacements demoted: {[(r.kind, r.severity, r.approved_text) for r in rows]}")
-        ok25 = False
+    def compare25(lines_a, lines_b):
+        ta25 = build_comparison_tokens(lines_to_words(lines_a))
+        tb25 = build_comparison_tokens(lines_to_words(lines_b))
+        pairs25: list = []
+        rows25 = diff_documents(ta25, tb25, pairs25)
+        return ta25, tb25, pairs25, rows25
 
-    # End to end: both documents contain every word of both passages
-    # somewhere, which is what used to trigger the demotion.
-    relocation_a = build_comparison_tokens(lines_to_words([
-        "Hold the syringe firmly", "Fever Itching one pre-filled syringe",
-    ]))
-    relocation_b = build_comparison_tokens(lines_to_words([
-        "Fever Itching one pre-filled", "Hold the syringe firmly in one hand",
-    ]))
-    rows = [unrelated]
-    _downgrade_relocated_runs(rows, relocation_a, relocation_b)
-    if rows[0].severity == "critical" and rows[0].kind == "text_changed":
-        print("PASS: a difference between unrelated passages stays a real difference.")
-    else:
-        print(f"FAIL: unrelated passages were demoted to {rows[0].kind}/{rows[0].severity}.")
-        ok25 = False
-
-    # A moved passage must still report what changed INSIDE it: the
-    # whole point of the category is relocation, never a quiet pass for
-    # the wording within.
+    intro = ["This leaflet describes the treatment of adult patients with spasticity."]
+    outro = ["Report any suspected adverse reaction to the national centre listed here."]
     long_para = [
         "The recommended starting dose is 4 mg given once daily in the evening.",
         "Doses may be increased gradually in increments of 2 mg to achieve the",
         "optimum balance of relief and the known adverse reactions of this drug.",
     ]
-    long_edited = [line.replace("is 4 mg", "is 8 mg") for line in long_para]
-    other_1 = ["This leaflet describes the treatment of adult patients with spasticity."]
-    other_2 = ["Report any suspected adverse reaction to the national centre listed here."]
-    moved_a = build_comparison_tokens(lines_to_words(other_1 + long_para + other_2))
-    moved_b = build_comparison_tokens(lines_to_words(other_1 + other_2 + long_edited))
-    moved_items = diff_documents(moved_a, moved_b)
-    dose_row = [
-        d for d in moved_items
-        if d.severity != "reorder" and "4" in d.approved_text.split() and "8" in d.suspect_text.split()
-    ]
-    if len(dose_row) == 1:
-        print("PASS: a dosage change inside a paragraph that moved is still reported.")
+
+    # 1. A paragraph that only moved: matched, nothing reported.
+    ta, tb, pairs, rows = compare25(intro + long_para + outro, intro + outro + long_para)
+    paired_words = sum(1 for x, y in pairs if x.text == y.text)
+    if not rows and paired_words == len(ta):
+        print("PASS: a paragraph that only moved is matched word for word, no row.")
     else:
-        print("FAIL: the dosage change inside the moved paragraph was not reported: "
-              f"{[(d.severity, d.approved_text[:20], d.suspect_text[:20]) for d in moved_items]}")
+        print(f"FAIL: moved paragraph: rows {[(d.kind, d.approved_text[:30]) for d in rows]}, "
+              f"paired {paired_words}/{len(ta)}")
+        ok25 = False
+
+    # 2. An edit inside the moved paragraph is reported, at its own severity
+    #    -- and is the only row.
+    long_edited = [line.replace("is 4 mg", "is 8 mg") for line in long_para]
+    ta, tb, pairs, rows = compare25(intro + long_para + outro, intro + outro + long_edited)
+    if [(d.severity, d.approved_text, d.suspect_text) for d in rows] == [("critical", "4", "8")]:
+        print("PASS: a dosage change inside a paragraph that moved is the one row, critical.")
+    else:
+        print(f"FAIL: edit inside moved text: {[(d.severity, d.approved_text[:20], d.suspect_text[:20]) for d in rows]}")
+        ok25 = False
+
+    # 3. A sentence printed twice in one document and once in the other:
+    #    the second copy is a real deletion, even though the same words are
+    #    elsewhere -- that copy is already matched.
+    warning = ["Do not drive or operate machinery until you know how this medicine affects you."]
+    ta, tb, pairs, rows = compare25(intro + warning + long_para + warning + outro, intro + warning + long_para + outro)
+    deleted = [d for d in rows if d.kind == "removed_in_suspect"]
+    if len(rows) == 1 and deleted and deleted[0].severity == "critical" and "operate machinery" in deleted[0].approved_text:
+        print("PASS: the second copy of a repeated sentence, deleted, is reported -- not called moved.")
+    else:
+        print(f"FAIL: deleted repeat: {[(d.kind, d.severity, d.approved_text[:30]) for d in rows]}")
+        ok25 = False
+
+    # 4. Moved AND re-cased: one row setting the two places side by side,
+    #    rated as the change it is (capitalization), not two criticals and
+    #    not nothing.
+    ta, tb, pairs, rows = compare25(
+        intro + ["KEEP OUT OF THE REACH OF CHILDREN"] + long_para + outro,
+        intro + long_para + ["Keep out of the reach of children"] + outro,
+    )
+    if (len(rows) == 1 and rows[0].kind == "text_changed" and rows[0].severity == "major"
+            and rows[0].approved_location and rows[0].suspect_location):
+        print("PASS: text moved and re-cased is one capitalization row with both places.")
+    else:
+        print(f"FAIL: moved+re-cased: {[(d.kind, d.severity, d.approved_text, d.suspect_text) for d in rows]}")
+        ok25 = False
+
+    # 5. A short phrase shared by two DIFFERENT sentences is not a move:
+    #    both sentences stay reported whole.
+    ta, tb, pairs, rows = compare25(
+        intro + ["Monitor the blood pressure of the patient every week."] + long_para + outro,
+        intro + long_para + ["Reduce the dose of the patient with kidney disease."] + outro,
+    )
+    removed = " ".join(d.approved_text for d in rows if d.kind == "removed_in_suspect")
+    added = " ".join(d.suspect_text for d in rows if d.kind == "added_in_suspect")
+    if "blood pressure of the patient" in removed and "dose of the patient with" in added:
+        print("PASS: a phrase shared by two different sentences is not paired as moved.")
+    else:
+        print(f"FAIL: shared phrase: {[(d.kind, d.approved_text, d.suspect_text) for d in rows]}")
+        ok25 = False
+
+    # 6. A replacement is never undone by the move pass, even when both of
+    #    its sides occur elsewhere: "firmly" and "gently" traded places
+    #    between two DIFFERENT sentences -- two real edits. (Two identical
+    #    lines that only swapped order are a move: nothing to report.)
+    ta, tb, pairs, rows = compare25(
+        ["Hold the syringe firmly in one hand.", "Shake the pen gently before each use."],
+        ["Hold the syringe gently in one hand.", "Shake the pen firmly before each use."],
+    )
+    edits = {(d.approved_text, d.suspect_text) for d in rows if d.kind == "text_changed" and d.severity == "critical"}
+    if ("firmly", "gently") in edits and ("gently", "firmly") in edits:
+        print("PASS: a replacement stays an edit even when both sides occur elsewhere.")
+    else:
+        print(f"FAIL: replacements: {[(d.kind, d.severity, d.approved_text, d.suspect_text) for d in rows]}")
+        ok25 = False
+
+    # 7. A one- or two-word row that moved is matched (shown green) when the
+    #    pair cannot be chance -- a real word, the only such row deleted and
+    #    the only such row inserted; a lone "and" moved stays two rows.
+    ta, tb, pairs, rows = compare25(
+        intro + ["Total cholesterol"] + long_para + outro,
+        intro + long_para + ["Total cholesterol"] + outro,
+    )
+    map25 = _TM25(ta, tb, pairs)
+    listed = _unaccounted25(rows, map25, len(rows))
+    total25 = [k for k, t in enumerate(ta) if t.text in ("Total", "cholesterol")]
+    ta2, tb2, pairs2, rows2 = compare25(intro + ["and"] + long_para + outro, intro + long_para + ["and"] + outro)
+    map25b = _TM25(ta2, tb2, pairs2)
+    rows2 = rows2 + _unaccounted25(rows2, map25b, len(rows2))
+    if (not rows and not listed and all(map25.confirmed("approved", k) for k in total25)
+            and sorted(d.kind for d in rows2) == ["added_in_suspect", "removed_in_suspect"]):
+        print("PASS: a distinctive two-word move is matched; a lone 'and' moved is a deletion and an insertion.")
+    else:
+        print(f"FAIL: short moves: rows {[(d.kind, d.approved_text) for d in rows]}, "
+              f"listed {[(d.kind, d.approved_text) for d in listed]}, 'and' {[(d.kind, d.approved_text, d.suspect_text) for d in rows2]}")
+        ok25 = False
+
+    # 8. Re-cased words more than a few words apart inside a moved passage,
+    #    and an edit at its start: the stretches between and before are
+    #    compared too -- two capitalization changes and the deleted words,
+    #    not every word of them as critical insertions and deletions.
+    howto_a = ["Know the medicines you take and keep a list of them",
+               "How should I take Sildenafil tablets? • Take or give Sildenafil",
+               "tablets exactly as your healthcare provider tells you to every day"]
+    howto_b = [line.replace("Sildenafil", "sildenafil") for line in howto_a]
+    howto_a[0] = howto_a[0].replace("you take", "you or your child take")
+    long_intro = intro * 3
+    long_outro = outro * 3
+    ta, tb, pairs, rows = compare25(long_intro + long_outro + howto_a, long_intro + howto_b + long_outro)
+    if sorted((d.kind, d.severity, d.approved_text, d.suspect_text) for d in rows) == [
+            ("removed_in_suspect", "critical", "or your child", "")] + [
+            ("text_changed", "major", "Sildenafil", "sildenafil")] * 2:
+        print("PASS: edits apart inside moved text are each their own row, nothing else.")
+    else:
+        print(f"FAIL: re-cased inside moved text: {[(d.kind, d.severity, d.approved_text, d.suspect_text) for d in rows]}")
+        ok25 = False
+
+    # 9. A phrase in two moved sentences goes to the copy it matches
+    #    longest: the sentence present in both is matched whole, not
+    #    reported deleted because the other sentence took its first words.
+    risk_a = ["the worsening of your physical condition. It is not known if sildenafil tablets are safe and effective.",
+              "are pregnant or plan to become pregnant. It is not known if sildenafil tablets will harm your unborn baby."]
+    risk_b = ["exercise and lung testing. It is not known if Sildenafil tablets are safe and effective.", risk_a[1]]
+    ta, tb, pairs, rows = compare25(long_intro + long_outro + risk_a, long_intro + risk_b + long_outro)
+    if rows and not any("harm" in d.approved_text + d.suspect_text or "pregnant" in d.approved_text + d.suspect_text
+                        for d in rows):
+        print("PASS: a phrase in two moved sentences is matched with the copy it matches longest.")
+    else:
+        print(f"FAIL: longest copy: {[(d.kind, d.approved_text, d.suspect_text) for d in rows]}")
         ok25 = False
 
     if ok25:
-        print("PASS: 'Moved' classification.")
+        print("PASS: moved text is matched; every real difference around and inside it is reported.")
 
     print()
     print("=" * 70)
@@ -2970,7 +2989,7 @@ def main() -> None:
 
     print()
     print("=" * 70)
-    print("TEST 30: 'Moved' is only claimed for text that really is elsewhere")
+    print("TEST 30: text counts as moved only when it really is elsewhere")
     print("=" * 70)
     ok30 = True
     moved_a = ["Patients should not take this medicine with alcohol.",
@@ -2995,10 +3014,8 @@ def main() -> None:
               "Keep out of reach and sight of children always."]
     rows30b = diff_documents(build_comparison_tokens(lines_to_words(swap_a)),
                              build_comparison_tokens(lines_to_words(swap_b)))
-    moved_rows = [d for d in rows30b if d.kind == "reordered"]
-    if (len(rows30b) == 1 and moved_rows and moved_rows[0].approved_text and moved_rows[0].suspect_text
-            and moved_rows[0].approved_location and moved_rows[0].suspect_location):
-        print("PASS: a sentence that truly moved is one 'moved' row showing both positions.")
+    if not rows30b:
+        print("PASS: a sentence that truly moved is matched where it stands -- no row.")
     else:
         print(f"FAIL: moved sentence: {[(d.kind, d.approved_text, d.suspect_text) for d in rows30b]}")
         ok30 = False
@@ -3013,7 +3030,7 @@ def main() -> None:
         print(f"FAIL: added legal status: {[(d.severity, d.kind, d.suspect_text) for d in rows30c]}")
         ok30 = False
     if ok30:
-        print("PASS: 'Moved' only for text that is really elsewhere.")
+        print("PASS: text counts as moved only when it really is elsewhere.")
 
     print()
     print("=" * 70)
@@ -3443,7 +3460,8 @@ def main() -> None:
             lines = []
             if header:
                 lines.append("Draft Labeling Text 1.14.1.3")
-            lines.append(body_repeat or f"Body text unique to page number {page} here.")
+            names = ["one", "two", "three", "four", "five", "six"]
+            lines.append(body_repeat or f"Body text unique to page number {names[page - 1]} here.")
             lines.append(f"More body content follows on page {['one', 'two', 'three', 'four', 'five', 'six'][page - 1]}.")
             if footer:
                 lines.append(f"Page {page} of {pages}")
@@ -3465,13 +3483,22 @@ def main() -> None:
     else:
         print(f"FAIL: furniture found {found}, header kept {texts.count('Draft Labeling Text')}x")
         ok35 = False
-    both = drop_repeated_furniture(draft, page_tokens(6))
+    # Both documents repeat it: set aside in both, the first copy of each
+    # kept -- their copies fall wherever each document's pages break.
+    other_draft = page_tokens(6)
+    both_a = drop_repeated_furniture(draft, other_draft)
+    both_b = drop_repeated_furniture(other_draft, draft)
+    both_ok = all(
+        sorted(found) == ["Draft Labeling Text 1.14.1.3", "Page 1 of 6"]
+        and " ".join(t.text for t in kept).count("Draft Labeling Text") == 1
+        for kept, found in (both_a, both_b)
+    )
     long_line = "This full width paragraph line repeats at the top of every single page of the file"
     repeated_body = drop_repeated_furniture(page_tokens(5, header=False, footer=False, body_repeat=long_line))
-    if not both[1] and not repeated_body[1] and len(page_tokens(2)) == len(drop_repeated_furniture(page_tokens(2))[0]):
-        print("PASS: kept when the other document repeats it too, for long body lines, and for 2-page documents.")
+    if both_ok and not repeated_body[1] and len(page_tokens(2)) == len(drop_repeated_furniture(page_tokens(2))[0]):
+        print("PASS: set aside in both when both repeat it; kept for long body lines and 2-page documents.")
     else:
-        print(f"FAIL: furniture removed wrongly: both-sides {both[1]}, body {repeated_body[1]}")
+        print(f"FAIL: furniture: both-sides {both_a[1]} / {both_b[1]}, body {repeated_body[1]}")
         ok35 = False
 
     names = ["Leaflet 8108575 Back.pdf", "Leaflet 8108575 Front.pdf", "part10.pdf", "part2.pdf", "frontier.pdf"]
@@ -3691,13 +3718,16 @@ def main() -> None:
         print(f"FAIL: wrapped labels read {read37(up_rows)!r} / {read37(down_rows)!r}")
         ok37 = False
 
-    # (c) A header stacked in columns on a shared line grid.
+    # (c) A header stacked in columns on a shared line grid: every line of
+    #     it, down to the first data row, read column by column -- as the
+    #     ruled Word table's cells ("Lurasidone hydrochloride tablets 40
+    #     mg/day") and an SPL's header grid rows are (TEST 50).
     stacked = [phrase("Lurasidone", 300, 380) + phrase("Lurasidone", 420, 380),
                phrase("hydrochloride tablets", 300, 391) + phrase("hydrochloride tablets", 420, 391),
                phrase("Placebo", 200, 402) + phrase("40 mg/day", 300, 402) + phrase("80 mg/day", 420, 402),
                phrase("All Patients", 90, 416) + [cw("+0.10", 200, 416), cw("+0.75", 300, 416), cw("+1.20", 420, 416)],
                phrase("Females", 90, 430) + [cw("+0.70", 200, 430), cw("+0.60", 300, 430), cw("+4.40", 420, 430)]]
-    want37 = ("Lurasidone hydrochloride tablets Lurasidone hydrochloride tablets Placebo 40 mg/day 80 mg/day "
+    want37 = ("Placebo Lurasidone hydrochloride tablets 40 mg/day Lurasidone hydrochloride tablets 80 mg/day "
               "All Patients +0.10 +0.75 +1.20 Females +0.70 +0.60 +4.40")
     if read37(stacked) == want37:
         print("PASS: a stacked header reads column by column; its data rows stay rows.")
@@ -3786,6 +3816,882 @@ def main() -> None:
         ok38 = False
     if ok38:
         print("PASS: the Find bar finds words and sentences where they are drawn.")
+
+    print()
+    print("=" * 70)
+    print("TEST 39: Tables are read cell by cell -- highlighted, or inside another table")
+    print("=" * 70)
+    ok39 = True
+
+    def grid(page, x0, y0, col_edges, row_edges):
+        """Word-style borders: thin black filled rectangles."""
+        for x in col_edges:
+            page.draw_rect(fitz.Rect(x, y0 + row_edges[0], x + 0.5, y0 + row_edges[-1]), color=None, fill=(0, 0, 0))
+        for y in row_edges:
+            page.draw_rect(fitz.Rect(x0 + col_edges[0] - x0, y0 + y, col_edges[-1] + 0.5, y0 + y + 0.5),
+                           color=None, fill=(0, 0, 0))
+
+    def cell_text(page, x, y, lines):
+        for k, line in enumerate(lines):
+            page.insert_text((x, y + 11 * k), line, fontsize=9)
+
+    # (a) A highlighted table: yellow highlight boxes behind cell text are
+    #     not table rules; the wrapped cells are still read cell by cell.
+    hl_pdf = os.path.join(tmp, "t39_highlight.pdf")
+    hdoc = fitz.open()
+    hp = hdoc.new_page(width=420, height=300)
+    cols, rows = [40, 160, 270, 380], [0, 30, 60, 90]
+    grid(hp, 40, 40, cols, rows)
+    for (r, c), lines in {
+        (0, 0): ["Doses per Vial"], (0, 1): ["Strength"], (0, 2): ["NDC"],
+        (1, 0): ["4 doses of 2.5 mg/0.6", "mL"], (1, 1): ["10 mg/2.4 mL (4.17", "mg/mL)"], (1, 2): ["0002-4052-11"],
+        (2, 0): ["4 doses of 5 mg/0.6", "mL"], (2, 1): ["20 mg/2.4 mL (8.33", "mg/mL)"], (2, 2): ["0002-4057-11"],
+    }.items():
+        x, y = cols[c] + 4, 40 + rows[r] + 11
+        if r and c < 2:  # highlight the changed values, Word style: filled, no outline
+            hp.draw_rect(fitz.Rect(x - 1, y - 9, x + 70, y + 3), color=None, fill=(1, 1, 0), overlay=False)
+        cell_text(hp, x, y, lines)
+    hdoc.save(hl_pdf)
+    hdoc.close()
+    hl_read = " ".join(w.text for w in extract_words(hl_pdf))
+    want_hl = ("Doses per Vial Strength NDC 4 doses of 2.5 mg/0.6 mL 10 mg/2.4 mL (4.17 mg/mL) 0002-4052-11 "
+               "4 doses of 5 mg/0.6 mL 20 mg/2.4 mL (8.33 mg/mL) 0002-4057-11")
+    if hl_read == want_hl:
+        print("PASS: highlight boxes are not table rules; wrapped cells read cell by cell.")
+    else:
+        print(f"FAIL: highlighted table read {hl_read!r}")
+        ok39 = False
+
+    # (b) A table nested in a cell of another (a side-by-side document:
+    #     "RLD Label | Proposed Label" with a table in the first cell) is
+    #     read cell by cell, row by row -- as the same table standing alone.
+    nest_pdf = os.path.join(tmp, "t39_nested.pdf")
+    ndoc = fitz.open()
+    npage = ndoc.new_page(width=560, height=320)
+    grid(npage, 30, 30, [30, 300, 530], [0, 20, 200, 230])
+    cell_text(npage, 34, 44, ["RLD Label"])
+    cell_text(npage, 304, 44, ["Proposed Label"])
+    cell_text(npage, 34, 66, ["Table 1: Adverse Reactions"])
+    icols, irows = [36, 120, 200, 290], [0, 36, 52, 68]
+    grid(npage, 36, 78, icols, irows)
+    for (r, c), lines in {
+        (0, 0): ["Adverse", "Reaction"], (0, 1): ["Placebo", "(N=235)", "%"], (0, 2): ["MOUNJARO", "5 mg", "(N=237)"],
+        (1, 0): ["Nausea"], (1, 1): ["4"], (1, 2): ["12"],
+        (2, 0): ["Diarrhea"], (2, 1): ["9"], (2, 2): ["12"],
+    }.items():
+        cell_text(npage, icols[c] + 3, 78 + irows[r] + 10, lines)
+    cell_text(npage, 34, 168, ["Note: Percentages reflect the number of patients."])
+    cell_text(npage, 304, 66, ["Proposed text stays in its own cell."])
+    cell_text(npage, 34, 244, ["Last RLD line"])
+    cell_text(npage, 304, 244, ["Last proposed line"])
+    ndoc.save(nest_pdf)
+    ndoc.close()
+    nest_read = " ".join(w.text for w in extract_words(nest_pdf))
+    want_nest = ("RLD Label Proposed Label Table 1: Adverse Reactions Adverse Reaction Placebo (N=235) % "
+                 "MOUNJARO 5 mg (N=237) Nausea 4 12 Diarrhea 9 12 Note: Percentages reflect the number of patients. "
+                 "Proposed text stays in its own cell. Last RLD line Last proposed line")
+    # What the viewer outlines (View > Show Table Cells): the same tables,
+    # with how each is read.
+    nest_layout: dict = {}
+    extract_words(nest_pdf, table_layout=nest_layout)
+    statuses = sorted(t["status"] for t in nest_layout.get(1, []))
+    nested_parent = [t["parent"] for t in nest_layout.get(1, []) if t["status"] == "nested"]
+    if statuses != ["nested", "table"] or nested_parent != [0]:
+        print(f"FAIL: table layout for the viewer {statuses} parents {nested_parent}")
+        ok39 = False
+    if nest_read == want_nest:
+        print("PASS: a table inside a table's cell is read cell by cell, its caption and note in place.")
+    else:
+        print(f"FAIL: nested table read {nest_read!r}")
+        ok39 = False
+
+    # (c) A word before a label/value list's label column is read with the
+    #     label ("New code | Revised: February 2026"), not after the values.
+    def lw(text, x, top=100.0):
+        return {"text": text, "x0": x, "x1": x + 5.0 * len(text), "top": top, "bottom": top + 12.0}
+    lv_rows = [[lw("New", 18), lw("code", 43), lw("Revised:", 213), lw("February", 258), lw("2026", 304)]]
+    lv_read = " ".join(w["text"] for line in _order_label_value_zone(lv_rows, [(54.0, 68.0), (81.0, 292.0)])
+                       for w in line)
+    if lv_read == "New code Revised: February 2026":
+        print("PASS: a word left of the label column is read with the label.")
+    else:
+        print(f"FAIL: label/value line read {lv_read!r}")
+        ok39 = False
+    if ok39:
+        print("PASS: tables are read cell by cell, highlighted or nested.")
+
+    print()
+    print("=" * 70)
+    print("TEST 40: A crop is applied before the page is read; merged header cells")
+    print("=" * 70)
+    ok40 = True
+
+    def ruled_table(page, cols, rows, cells, span_header=False):
+        """Ruled grid (thin lines) with text; a spanning first-row cell
+        over columns 1..end when span_header."""
+        for x_i, x in enumerate(cols):
+            top = rows[1] if span_header and 1 < x_i < len(cols) - 1 else rows[0]
+            page.draw_line((x, top), (x, rows[-1]))
+        for y in rows:
+            page.draw_line((cols[0], y), (cols[-1], y))
+        for (r, c), text in cells.items():
+            page.insert_text((cols[c] + 4, rows[r] + 14), text, fontsize=9)
+
+    # (a) A side-by-side page cropped to its first two columns: the third
+    #     column's words are gone before reading, and the table the viewer
+    #     outlines is the kept part (3 rows x 2 columns), still a table.
+    sbs_pdf = os.path.join(tmp, "t40_sbs.pdf")
+    sdoc = fitz.open()
+    spage = sdoc.new_page(width=500, height=200)
+    ruled_table(spage, [20, 160, 300, 480], [20, 40, 60, 80], {
+        (0, 0): "Reaction", (0, 1): "Placebo", (0, 2): "Notation",
+        (1, 0): "Nausea", (1, 1): "4", (1, 2): "changed",
+        (2, 0): "Diarrhea", (2, 1): "9", (2, 2): "deleted",
+    })
+    sdoc.save(sbs_pdf)
+    sdoc.close()
+    crop40 = {1: (0.0, 200.0, 0.0, 300.0)}  # keep x <= 300: drop the Notation column
+    layout40: dict = {}
+    kept_words = " ".join(w.text for w in extract_words(sbs_pdf, table_layout=layout40, crop=crop40))
+    t40 = layout40.get(1, [{}])[0]
+    shape40 = (len(t40.get("cells", [])), max((len(r) for r in t40.get("cells", [])), default=0))
+    if (kept_words == "Reaction Placebo Nausea 4 Diarrhea 9" and t40.get("status") == "table"
+            and shape40 == (3, 2) and t40["bbox"][2] <= 300.5):
+        print("PASS: cropped words are gone before reading; the table outlined is the kept part, read cell by cell.")
+    else:
+        print(f"FAIL: crop read {kept_words!r}, table {t40.get('status')} {shape40} {t40.get('bbox')}")
+        ok40 = False
+    from core.document_extractor import extract_document_tokens as _edt40
+    if " ".join(t.text for t in _edt40(sbs_pdf, crop=crop40)) != kept_words:
+        print("FAIL: extract_document_tokens does not pass the crop on")
+        ok40 = False
+
+    # (b) A header cell spanning several columns is one cell: its words
+    #     cross the column edges of the rows below without the table
+    #     being taken for a grid drawn over flowing text.
+    span_pdf = os.path.join(tmp, "t40_span.pdf")
+    pdoc = fitz.open()
+    ppage = pdoc.new_page(width=500, height=200)
+    ruled_table(ppage, [20, 120, 200, 280, 360, 440], [20, 52, 72, 92], {
+        (0, 0): "Reaction", (0, 1): "Lurasidone hydrochloride tablets, all doses combined, in",
+        (1, 0): "Nausea", (1, 1): "4", (1, 2): "5", (1, 3): "6", (1, 4): "7",
+        (2, 0): "Vomiting", (2, 1): "1", (2, 2): "2", (2, 3): "3", (2, 4): "4",
+    }, span_header=True)
+    ppage.insert_text((124, 46), "the placebo-controlled adolescent studies combined", fontsize=9)
+    pdoc.save(span_pdf)
+    pdoc.close()
+    span_layout: dict = {}
+    span_read = " ".join(w.text for w in extract_words(span_pdf, table_layout=span_layout))
+    span_status = [t["status"] for t in span_layout.get(1, [])]
+    if span_status == ["table"] and span_read.startswith(
+        "Reaction Lurasidone hydrochloride tablets, all doses combined, in the placebo-controlled adolescent "
+        "studies combined Nausea 4 5 6 7 Vomiting 1 2 3 4"
+    ):
+        print("PASS: a header cell spanning columns does not make the table 'flowing text'.")
+    else:
+        print(f"FAIL: spanning header table {span_status}: {span_read!r}")
+        ok40 = False
+    if ok40:
+        print("PASS: crops are applied before reading; merged header cells keep a table a table.")
+
+    print()
+    print("=" * 70)
+    print("TEST 41: A word one text layer splits is matched, not lost between the two")
+    print("=" * 70)
+    from core.token_map import TokenMap as _TokenMap41
+
+    def toks41(text):
+        return build_comparison_tokens(lines_to_words([text]))
+
+    def pairing41(a_text, b_text):
+        ta41, tb41 = toks41(a_text), toks41(b_text)
+        found41: list = []
+        rows41 = diff_documents(ta41, tb41, found41)
+        partners41 = _TokenMap41(ta41, tb41, found41).partners()
+        return rows41, partners41
+
+    # Arabic drawn in pieces on one side ("القل ب." / "القلب."): no row,
+    # and every word on both sides has a partner (it shows as matched).
+    rows_split, partners_split = pairing41(
+        "اذا كانوا مصابين بمرض في القل ب. حالات حساسة للهرمونات",
+        "اذا كانوا مصابين بمرض في القلب. حالات حساسة للهرمونات",
+    )
+    # A real change after the split part: the split part is paired, the
+    # changed words are not.
+    rows_mixed, partners_mixed = pairing41(
+        "Warnings and Precautions (5.2)] . 2.3 Concomitant Use with",
+        "Warnings and Precautions (5.2)]. 2.4 Recommendations for Use with",
+    )
+    # A space lost next to a number is a reported spacing difference: it
+    # stays unpaired, under its own highlight.
+    rows_digit, partners_digit = pairing41("Take 100 mg daily", "Take 100mg daily")
+    ok41 = (
+        not rows_split and all(p >= 0 for side in partners_split.values() for p in side)
+        and rows_mixed and partners_mixed["approved"][3] >= 0 and partners_mixed["approved"][4] >= 0
+        and partners_mixed["approved"][5] < 0
+        and len(rows_digit) == 1 and partners_digit["approved"][1] < 0 and partners_digit["suspect"][1] < 0
+    )
+    if ok41:
+        print("PASS: a split word is matched; a changed word is not; a spacing difference stays a difference.")
+    else:
+        print(f"FAIL: split rows {len(rows_split)} partners {partners_split}; mixed {partners_mixed}; "
+              f"digit rows {len(rows_digit)} partners {partners_digit}")
+
+    print()
+    print("=" * 70)
+    print("TEST 42: Every word is matched or listed -- never neither")
+    print("=" * 70)
+    ok42 = True
+    from core.completeness import FURNITURE_NOTE, _covered, furniture_rows, unaccounted_rows
+    from core.page_furniture import drop_repeated_furniture as _drop42, furniture_repeats
+    from core.token_map import APPROVED as _A42, SUSPECT as _S42, TokenMap as _TM42
+
+    def four_pages(path, header, body):
+        doc42 = fitz.open()
+        for n in range(4):
+            page42 = doc42.new_page(width=400, height=300)
+            if header:
+                page42.insert_text((40, 30), "Draft Labeling Text 1.14.1.3", fontsize=8)
+            for k, line in enumerate(body[n]):
+                page42.insert_text((40, 80 + 14 * k), line, fontsize=10)
+        doc42.save(path)
+        doc42.close()
+
+    body_a = [["Take one tablet daily with food.", "Store below 25 C."], ["Do not crush the tablet."],
+              ["Keep out of reach of children."], ["Discard unused tablets."]]
+    body_b = [["Take one tablet twice daily with food.", "Store below 25 C."], ["Do not crush the tablet."],
+              ["Keep out of reach of children."], ["Return unused tablets."]]
+    a42, b42 = os.path.join(tmp, "t42_a.pdf"), os.path.join(tmp, "t42_b.pdf")
+    four_pages(a42, True, body_a)
+    four_pages(b42, False, body_b)
+    every_a, every_b = extract_document_tokens(a42), extract_document_tokens(b42)
+    # The worker's steps (workers/diff_worker.py), in order.
+    repeats_a = furniture_repeats(every_a, every_b)
+    kept_a, _f = _drop42(every_a, every_b)
+    kept_b, _f = _drop42(every_b, every_a)
+    found42: list = []
+    rows42 = diff_documents(kept_a, kept_b, found42)
+    map42 = _TM42(kept_a, kept_b, found42)
+    rows42 = rows42 + furniture_rows(repeats_a, _A42, len(rows42))
+    rows42 = rows42 + unaccounted_rows(rows42, map42, len(rows42))
+    furniture42 = [r for r in rows42 if FURNITURE_NOTE in r.approved_text]
+    unaccounted = 0
+    for side42, every42 in ((_A42, every_a), (_S42, every_b)):
+        matched42 = {id(t) for k, t in enumerate(map42.tokens(side42)) if map42.partners()[side42][k] >= 0}
+        covered42 = _covered(rows42, every42, side42)
+        unaccounted += sum(1 for k, t in enumerate(every42) if id(t) not in matched42 and k not in covered42)
+    if unaccounted == 0 and len(furniture42) == 1 and "3 more copies" in furniture42[0].approved_text:
+        print("PASS: every word of both documents is matched or in a row; the 3 header repeats are one row.")
+    else:
+        print(f"FAIL: {unaccounted} words unaccounted; furniture rows {[r.approved_text for r in furniture42]}")
+        ok42 = False
+
+    # A word the comparison leaves out of every row is given a row of its own.
+    ta42 = build_comparison_tokens(lines_to_words(["take the tablets with water"]))
+    tb42 = build_comparison_tokens(lines_to_words(["take the capsules with milk"]))
+    partial = _TM42(ta42, tb42, [(ta42[0], tb42[0]), (ta42[1], tb42[1]), (ta42[3], tb42[3])])
+    safety = unaccounted_rows([], partial, 0)  # no rows at all: the four unpaired words are unaccounted
+    texts42 = sorted((r.kind, r.approved_text or r.suspect_text) for r in safety)
+    want42 = [("added_in_suspect", "capsules"), ("added_in_suspect", "milk"),
+              ("removed_in_suspect", "tablets"), ("removed_in_suspect", "water")]
+    if texts42 == want42 and all(r.severity == "critical" for r in safety):
+        print("PASS: words neither matched nor listed become rows of their own.")
+    else:
+        print(f"FAIL: safety-net rows {texts42}")
+        ok42 = False
+
+    # A short match is confirmed (green) only in a small gap between solid
+    # matches: "tablet" between one-word edits is; "and" shared by two
+    # different sentences is a coincidence -- part of the change it sits in.
+    head42, tail42 = "Store the tablets below 25 C in a dry place.", "Keep out of reach of children at all times."
+    dense_a = build_comparison_tokens(lines_to_words([head42, "take one tablet twice daily with food.", tail42]))
+    dense_b = build_comparison_tokens(lines_to_words([head42, "take ONE tablet daily with food!", tail42]))
+    found_d: list = []
+    rows_d = diff_documents(dense_a, dense_b, found_d)
+    map_d = _TM42(dense_a, dense_b, found_d)
+    tablet_d = next(k for k, t in enumerate(dense_a) if t.text == "tablet")
+    far_a = build_comparison_tokens(lines_to_words([
+        head42, "Swallow each tablet whole with a full glass of water and never chew or crush it during treatment", tail42]))
+    far_b = build_comparison_tokens(lines_to_words([
+        head42, "Dissolve the contents of one sachet completely in juice and drink the mixture straight after preparing it", tail42]))
+    found_f: list = []
+    rows_f = diff_documents(far_a, far_b, found_f)
+    map_f = _TM42(far_a, far_b, found_f)
+    and_f = next(k for k, t in enumerate(far_a) if t.text == "and")
+    extra_f = unaccounted_rows(rows_f, map_f, len(rows_f))
+    and_listed = any("and" in r.approved_text.split() for r in rows_f + extra_f)
+    paired_and = map_f.partners()["approved"][and_f] >= 0
+    if (map_d.confirmed("approved", tablet_d) and not map_f.confirmed("approved", and_f)
+            and and_listed and (not paired_and or not map_f.confirmed("suspect", map_f.partners()["approved"][and_f]))):
+        print("PASS: a short match between small edits is confirmed; a coincidental one is listed, not green.")
+    else:
+        print(f"FAIL: tablet confirmed {map_d.confirmed('approved', tablet_d)}, 'and' confirmed "
+              f"{map_f.confirmed('approved', and_f)} paired {paired_and} listed {and_listed}")
+        ok42 = False
+    if ok42:
+        print("PASS: every word is matched or listed.")
+
+    print()
+    print("=" * 70)
+    print("TEST 43: A missing line is marked where it belongs in the other document")
+    print("=" * 70)
+    ok43 = True
+    from core.completeness import place_insertion_points
+    from core.token_map import TokenMap as _TM43
+
+    # The contents list sits on page 4 of the Original and page 1 of the
+    # Suspect, at a different height: the same coordinates on the Suspect
+    # are unrelated text. "2.2 ..." is missing from the Suspect.
+    contents_a = ["1 INDICATIONS AND USAGE", "2 DOSAGE AND ADMINISTRATION",
+                  "2.1 Recommended Dosage in Adults", "2.2 Recommended Dosage in Pediatric Patients",
+                  "3 DOSAGE FORMS AND STRENGTHS", "4 CONTRAINDICATIONS"]
+    contents_b = [line for line in contents_a if not line.startswith("2.2")]
+    words_a43 = lines_to_words(["Hearing loss has been reported in patients taking this medicine."] * 6 + contents_a, page=4)
+    words_b43 = lines_to_words(contents_b + ["Hearing loss has been reported in patients taking this medicine."] * 6, page=1)
+    ta43, tb43 = build_comparison_tokens(words_a43), build_comparison_tokens(words_b43)
+    found43: list = []
+    rows43 = diff_documents(ta43, tb43, found43)
+    map43 = _TM43(ta43, tb43, found43)
+    missing43 = [d for d in rows43 if d.kind == "removed_in_suspect" and "Pediatric" in d.approved_text]
+    for d in missing43:
+        d.suspect_caret = None  # as the rows the worker adds afterwards arrive
+    place_insertion_points(rows43, map43)
+    adults_b = next(w for w in words_b43 if w.text == "Adults")
+    if (len(missing43) == 1 and missing43[0].suspect_caret is not None
+            and missing43[0].suspect_caret.page == 1
+            and abs(missing43[0].suspect_caret.bbox[1] - adults_b.top) < 1
+            and missing43[0].suspect_caret.bbox[0] >= adults_b.x1 - 1):
+        print("PASS: a line missing from the Suspect is marked right after the line before it there.")
+    else:
+        caret43 = missing43[0].suspect_caret if missing43 else None
+        print(f"FAIL: missing line rows {[d.approved_text for d in missing43]}, caret "
+              f"{caret43 and (caret43.page, caret43.bbox)}; 'Adults' at {(adults_b.page, adults_b.x1, adults_b.top)}")
+        ok43 = False
+
+    # Nothing confirmed before it: the mark goes right before the partner
+    # of the first confirmed match after it.
+    lead_a = build_comparison_tokens(lines_to_words(["Draft labeling text"] + contents_b, page=2))
+    lead_b = build_comparison_tokens(lines_to_words(contents_b, page=1))
+    found43b: list = []
+    rows43b = diff_documents(lead_a, lead_b, found43b)
+    lead_rows = [d for d in rows43b if d.kind == "removed_in_suspect"]
+    for d in lead_rows:
+        d.suspect_caret = None
+    place_insertion_points(rows43b, _TM43(lead_a, lead_b, found43b))
+    first_b = lead_b[0]
+    if (lead_rows and all(d.suspect_caret is not None and d.suspect_caret.page == 1
+                          and abs(d.suspect_caret.bbox[1] - first_b.bbox[1]) < 1 for d in lead_rows)):
+        print("PASS: a line missing at the very start is marked before the first matched line.")
+    else:
+        print(f"FAIL: leading line rows {[(d.approved_text, d.suspect_caret and d.suspect_caret.bbox) for d in lead_rows]}")
+        ok43 = False
+    if ok43:
+        print("PASS: one-sided rows are marked where they belong in the other document.")
+
+    print()
+    print("=" * 70)
+    print("TEST 44: Dashes typed into text are reported; ruled headings are not")
+    print("=" * 70)
+    ok44 = True
+    from core.diff_engine import category_of as _category44
+
+    # The four dashes typed into a Word draft (sample 2): "OF------" was
+    # read as "OF" and matched; the others were minor "Hyphenation".
+    plain44 = ["HIGHLIGHTS OF PRESCRIBING INFORMATION",
+               "These highlights do not include all the information needed to use RIVAROXABAN",
+               "Initial U.S. Approval: 2011",
+               "WARNING: PREMATURE DISCONTINUATION OF RIVAROXABAN INCREASES THE RISK"]
+    typed44 = ["HIGHLIGHTS OF PRESCRIBING INFORMATION-",
+               "These highlights do not include all the information needed to use-- RIVAROXABAN",
+               "Initial U.S. Approval: 2011-",
+               "WARNING: PREMATURE DISCONTINUATION OF------ RIVAROXABAN INCREASES THE RISK"]
+    rows44 = diff_documents(build_comparison_tokens(lines_to_words(plain44)),
+                            build_comparison_tokens(lines_to_words(typed44)))
+    got44 = sorted((d.approved_text, d.suspect_text, d.severity, _category44(d)) for d in rows44)
+    want44 = sorted([("INFORMATION", "INFORMATION-", "major", "punctuation"),
+                     ("use", "use--", "major", "punctuation"),
+                     ("2011", "2011-", "major", "punctuation"),
+                     ("OF", "OF------", "major", "punctuation")])
+    if got44 == want44:
+        print("PASS: dashes typed after words are major punctuation rows, not minor hyphenation.")
+    else:
+        print(f"FAIL: typed dashes: {got44}")
+        ok44 = False
+
+    # A dash typed at a line end, before a lowercase word, looks like a
+    # word broken in two -- but "INFORMATIONneeded" is printed nowhere and
+    # "INFORMATION needed" is: the dash is text, the same change.
+    broke44 = diff_documents(build_comparison_tokens(lines_to_words(["OF PRESCRIBING INFORMATION", "needed to use it"])),
+                             build_comparison_tokens(lines_to_words(["OF PRESCRIBING INFORMATION-", "needed to use it"])))
+    if [(d.approved_text, d.suspect_text) for d in broke44] == [("INFORMATION needed", "INFORMATION-needed")]:
+        print("PASS: a dash typed at a line end before a lowercase word is reported, not read as a word break.")
+    else:
+        print(f"FAIL: dash at line end: {[(d.approved_text, d.suspect_text, d.severity, _category44(d)) for d in broke44]}")
+        ok44 = False
+
+    # A sign put in front of a number changes its value.
+    sign44 = diff_documents(build_comparison_tokens(lines_to_words(["mean change 1.4 from baseline"])),
+                            build_comparison_tokens(lines_to_words(["mean change -1.4 from baseline"])))
+    if [(d.severity, _category44(d)) for d in sign44] == [("critical", "punctuation")]:
+        print("PASS: '1.4' -> '-1.4' is critical.")
+    else:
+        print(f"FAIL: sign: {[(d.approved_text, d.suspect_text, d.severity, _category44(d)) for d in sign44]}")
+        ok44 = False
+
+    # The same rule set apart from its word is the same change.
+    spaced44 = diff_documents(build_comparison_tokens(lines_to_words(["DISCONTINUATION OF RIVAROXABAN INCREASES"])),
+                              build_comparison_tokens(lines_to_words(["DISCONTINUATION OF ------ RIVAROXABAN INCREASES"])))
+    if [(d.severity, d.suspect_text) for d in spaced44] == [("major", "------")]:
+        print("PASS: a dash run typed apart from the word is a major row too.")
+    else:
+        print(f"FAIL: spaced dash run: {[(d.kind, d.severity, d.suspect_text) for d in spaced44]}")
+        ok44 = False
+
+    # Rules framing a heading -- any length, solid or spaced, a heading
+    # wrapped over two lines, a rule alone on its line -- are still left out.
+    ruled_a = ["------------- DRUG INTERACTIONS -------------", "Avoid combined P-gp inhibitors (7.2)",
+               "------ DOSAGE FORMS AND", "STRENGTHS ------", "Tablets: 5 mg", "----------------------------"]
+    ruled_b = ["---DRUG INTERACTIONS---", "Avoid combined P-gp inhibitors (7.2)",
+               "-----------DOSAGE FORMS AND STRENGTHS-----------", "Tablets: 5 mg"]
+    if not diff_documents(build_comparison_tokens(lines_to_words(ruled_a)),
+                          build_comparison_tokens(lines_to_words(ruled_b))):
+        print("PASS: rules framing headings are left out, whatever their length.")
+    else:
+        print("FAIL: ruled headings gave rows")
+        ok44 = False
+    if ok44:
+        print("PASS: dashes are compared as text everywhere but around ruled headings.")
+
+    print()
+    print("=" * 70)
+    print("TEST 45: Two versions of an FDA label (RLD 2017 / 2024) -- reading and pairing")
+    print("=" * 70)
+    ok45 = True
+    from core.diff_engine import is_formatting_extra as _extra45
+    from core.mupdf_page import _char_text
+    from core.page_furniture import drop_repeated_furniture as _drop45
+    from core.pdf_extractor import _detect_column_bands as _bands45, _merge_label_strips
+
+    # (a) Three running lines stacked at the top of every page (a stamp
+    # over a second stamp line over "Page N of M"), and a footer BOTH
+    # documents repeat, their pages breaking at different words: every
+    # repeat set aside on both sides, each first copy kept whole.
+    def stamped(pages, words_per_page, footer):
+        body = ["w" + chr(97 + k % 26) + chr(97 + k // 26 % 26) for k in range(pages * words_per_page)]
+        out = []
+        for page in range(1, pages + 1):
+            lines = ["This label may not be the latest approved by FDA.",
+                     "For current labeling information, please visit fda.gov",
+                     f"Page {page} of {pages}"] if footer == "Reference ID: 4198886" else [f"Page {page} of {pages}"]
+            chunk = body[(page - 1) * words_per_page: page * words_per_page]
+            lines += [" ".join(chunk[i:i + 8]) for i in range(0, len(chunk), 8)] + [footer]
+            for row, line in enumerate(lines):
+                x = 60.0
+                for text in line.split():
+                    out.append(Word(text=text, page=page, x0=x, top=20.0 + row * 14, x1=x + 6 * len(text),
+                                    bottom=32.0 + row * 14))
+                    x += 6 * len(text) + 4
+        return build_comparison_tokens(out)
+
+    old45, new45 = stamped(6, 40, "Reference ID: 4198886"), stamped(5, 48, "Reference ID: 5405221")
+    kept_old, found_old = _drop45(old45, new45)
+    kept_new, found_new = _drop45(new45, old45)
+    text_old, text_new = " ".join(t.text for t in kept_old), " ".join(t.text for t in kept_new)
+    rows45 = diff_documents(kept_old, kept_new)
+    stacked_ok = (
+        len(found_old) == 4 and len(found_new) == 2
+        and text_old.count("Reference ID") == 1 and text_new.count("Reference ID") == 1
+        and "This label may not be the latest approved by FDA." in text_old
+        and not any(t.startswith("w") and len(t) == 3 for d in rows45 for t in (d.approved_text + " " + d.suspect_text).split())
+    )
+    if stacked_ok:
+        print("PASS: stacked running lines and a footer both repeat are set aside; the body compares clean.")
+    else:
+        print(f"FAIL: furniture {found_old} / {found_new}; rows {[(d.approved_text[:30], d.suspect_text[:30]) for d in rows45]}")
+        ok45 = False
+
+    # (b) Section numbers hanging left of a Contents list are not a column.
+    def row_of(*spans):
+        return [{"text": t, "x0": x0, "x1": x1, "top": 0.0, "bottom": 10.0} for t, x0, x1 in spans]
+
+    toc_rows = [row_of((n, 36, 40.5), ("HEADING", 54, 120), ("7.4", 342, 353), ("Drugs", 360, 400)) for n in "1234567"]
+    sign_rows = [row_of(("Operator/Dev.", 466, 494), ("Name", 140, 200), ("Signed", 510, 600)) for _ in range(5)]
+    merged_toc = _merge_label_strips([(10.0, 42.0), (52.0, 289.0), (323.0, 523.0)], toc_rows)
+    kept_sign = _merge_label_strips([(130.0, 454.0), (465.0, 495.0), (501.0, 608.0)], sign_rows)
+    if len(merged_toc) == 2 and merged_toc[0][0] == 10.0 and len(kept_sign) == 3:
+        print("PASS: a strip of section numbers joins its headings; a narrow strip of words stays apart.")
+    else:
+        print(f"FAIL: label strips {merged_toc} / {kept_sign}")
+        ok45 = False
+
+    # (c) An arrow written as a Symbol-font private-use code is the arrow.
+    if (_char_text(0xF0AF, "SymbolMT"), _char_text(0xF0AD, "Symbol"), _char_text(0xF0AF, "Wingdings")) == (
+            "↓", "↑", ""):
+        print("PASS: Symbol-font arrows read as the arrows they draw (Wingdings left alone).")
+    else:
+        print("FAIL: Symbol-font characters not mapped")
+        ok45 = False
+
+    # (d) A soft hyphen drawn on its own is no (empty) word.
+    soft = os.path.join(tmp, "t45_soft.pdf")
+    doc45 = fitz.open()
+    page45 = doc45.new_page(width=300, height=200)
+    page45.insert_text((40, 60), "soluble in N,N", fontsize=10)
+    page45.insert_text((112, 60), "­", fontsize=10, fontname="cour")
+    page45.insert_text((40, 74), "dimethylformamide and water", fontsize=10)
+    doc45.save(soft)
+    doc45.close()
+    if all(w.text.strip() for w in extract_words(soft)):
+        print("PASS: a soft hyphen drawn on its own makes no empty word.")
+    else:
+        print("FAIL: an empty word was read")
+        ok45 = False
+
+    # (e) A cross-reference that recurs everywhere is not "moved" across
+    # the document: the sentence it closes, deleted, is reported whole.
+    filler = lambda tag: [f"{tag} filler line number {w} of the body text here" for w in
+                          ("one", "two", "three", "four", "five", "six", "seven", "eight")]
+    xref = "[see Boxed Warning and Warnings and Precautions (5.1)]."
+    a45 = filler("a") + [f"Fluid retention may lead to heart failure {xref}"] + filler("b") + \
+        [f"Monitor patients for signs of failure {xref}"]
+    b45 = [f"Reduce the dose in patients with edema {xref}"] + filler("a") + filler("b") + \
+        [f"Monitor patients for signs of failure {xref}"]
+    rows45e = diff_documents(build_comparison_tokens(lines_to_words(a45)), build_comparison_tokens(lines_to_words(b45)))
+    deleted45 = " ".join(d.approved_text for d in rows45e if d.kind == "removed_in_suspect")
+    if "Fluid retention" in deleted45 and "Boxed Warning" in deleted45:
+        print("PASS: a recurring cross-reference is not paired across the document.")
+    else:
+        print(f"FAIL: boilerplate moved: {[(d.kind, d.approved_text[:40], d.suspect_text[:40]) for d in rows45e]}")
+        ok45 = False
+
+    # (f) A full-width line in a 3-line block is not cut into columns at the
+    # space a short line and a page number leave free.
+    line1 = [(t, 89 + 40 * i, 89 + 40 * i + 36) for i, t in enumerate("Acute or chronic metabolic acidosis including diabetic ketoacidosis see Warnings and".split())]
+    block = [row_of(("Page", 512, 531), ("7", 533, 538), ("of", 540, 547), ("40", 549, 558)), row_of(*line1),
+             row_of(("Precautions", 89, 153), ("(5.2)].", 156, 190))]
+    if len(_bands45(block, 89.0, 558.0, min_gutter=12.0)) == 1:
+        print("PASS: a full-width line in a short block stays one line.")
+    else:
+        print(f"FAIL: short block split: {_bands45(block, 89.0, 558.0, min_gutter=12.0)}")
+        ok45 = False
+    if ok45:
+        print("PASS: the label-version fixes hold.")
+
+    print()
+    print("=" * 70)
+    print("TEST 46: Words two rewritten passages share belong to the change")
+    print("=" * 70)
+    ok46 = True
+    from core.completeness import unaccounted_rows as _unacc46
+    from core.diff_engine import CATEGORY_LABELS as _labels46
+    from core.token_map import TokenMap as _TM46
+    head46 = "Store the tablets below 25 C in a dry place away from light."
+    tail46 = "Keep out of reach of children at all times and in the carton."
+    a46 = build_comparison_tokens(lines_to_words([
+        head46, "Patients with severe heart failure must stop treatment immediately", tail46]))
+    b46 = build_comparison_tokens(lines_to_words([
+        head46, "Doctors should check whether heart failure develops during long courses", tail46]))
+    found46: list = []
+    rows46 = diff_documents(a46, b46, found46)
+    map46 = _TM46(a46, b46, found46)
+    rows46 = rows46 + _unacc46(rows46, map46, len(rows46))
+    whole_a = any("severe heart failure must" in d.approved_text for d in rows46)
+    whole_b = any("whether heart failure develops" in d.suspect_text for d in rows46)
+    if whole_a and whole_b and "unconfirmed" not in _labels46 and all(d.kind != "unconfirmed_match" for d in rows46):
+        print("PASS: 'heart failure' shared by two rewritten sentences is part of the change, not a row apart.")
+    else:
+        print(f"FAIL: shared words: {[(d.kind, d.approved_text, d.suspect_text) for d in rows46]}")
+        ok46 = False
+    # A click goes where the comparison paired the word -- its confirmed
+    # partner -- and nowhere else: "heart failure", paired by chance and
+    # part of the change, has no click target; every green word has its own.
+    jumps = [map46.counterpart("approved", k)[0] for k in range(len(a46))]
+    paired = [map46.partners()["approved"][k] if map46.confirmed("approved", k) else None for k in range(len(a46))]
+    heart = next(k for k, t in enumerate(a46) if t.text == "heart")
+    if jumps == paired and jumps[heart] is None:
+        print("PASS: a click jumps only to the word the comparison matched, never by phrase.")
+    else:
+        print(f"FAIL: click targets differ from the comparison's pairs ('heart' -> {jumps[heart]})")
+        ok46 = False
+
+    print()
+    print("=" * 70)
+    print("TEST 47: An outsert's artwork box, its note, and an underlined header")
+    print("=" * 70)
+    # Three columns; a ruled box (product name, code, date) across the top
+    # of columns 2-3, a note under it running across their gutter, and a
+    # header underlined with typed underscores.
+    sheet = os.path.join(tmp, "t47_outsert.pdf")
+    doc47 = fitz.open()
+    page47 = doc47.new_page(width=900, height=600)
+    vocab = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
+    for c, (x0, _x1) in enumerate([(40, 290), (320, 570), (600, 850)]):
+        for row in range(30):
+            page47.insert_text((x0, (150 if c else 60) + row * 13),
+                               f"col{c} line{row} " + " ".join(vocab[(row + c) % 5:(row + c) % 5 + 5]), fontsize=8)
+    page47.draw_rect(fitz.Rect(320, 40, 850, 100), width=0.8)
+    page47.draw_line((320, 70), (850, 70), width=0.8)
+    page47.draw_line((585, 40), (585, 100), width=0.8)
+    for x, y, text in ((325, 58, "PRODUCT NAME : Example Tablets"), (590, 58, "CODE : 1234567"),
+                       (325, 88, "DATE : 01-01-2025"), (590, 88, "Approved By Quality")):
+        page47.insert_text((x, y), text, fontsize=8)
+    note47 = "Note: Pharma code and adjacent text must be visible on the folded leaflet in full view."
+    page47.insert_text((320, 115), note47, fontsize=8)
+    page47.insert_text((40, 20), "Final Package Insert", fontsize=9)
+    page47.insert_text((38, 21), "_" * 30, fontsize=9)
+    doc47.save(sheet)
+    doc47.close()
+    read47 = [w.text for w in extract_words(sheet)]
+    box_first = read47[:3] == ["PRODUCT", "NAME", ":"] and read47.index("Quality") < read47.index("col1")
+    note_whole = " ".join(read47[read47.index("Note:"):read47.index("Note:") + len(note47.split())]) == note47
+    header_clean = {"Final", "Package", "Insert"} <= set(read47) and not any("_" in w for w in read47)
+    if box_first and note_whole and header_clean:
+        print("PASS: the box is read first, its note whole after it, the underlined header as words.")
+    else:
+        print(f"FAIL: box first {box_first}, note whole {note_whole}, header clean {header_clean}: {read47[:24]}")
+
+    print()
+    print("=" * 70)
+    print("TEST 48: A Word draft against its merged two-sided outsert")
+    print("=" * 70)
+    ok48 = True
+    from core.diff_engine import _is_script_only, category_of as _cat48
+    from core.pdf_extractor import _read_lines as _read48
+    from core.completeness import unaccounted_rows as _unacc48
+    from core.token_map import TokenMap as _TM48
+
+    def cell48(text, x, top, size=6.0):
+        return {"text": text, "x0": x, "x1": x + size * 0.55 * len(text), "top": top, "bottom": top + size}
+
+    # (a) A study number centred beside its three arms, each arm a whole row
+    # (no ruling between them): read row by row, as the ruled table is.
+    # The outsert's own words (x0, x1, top): lines 6.5pt apart, 6pt high.
+    def line48(top, *cells):
+        return [{"text": t, "x0": a, "x1": b, "top": top, "bottom": top + 6.0} for t, a, b in cells]
+
+    arms = [
+        line48(1035.2, ("1", 823.4, 826.4), ("Lurasidone", 847.5, 873.8), ("hydrochloride", 875.3, 907.9),
+               ("(40", 909.4, 917.4), ("mg/day)*", 918.9, 941.6),
+               ("54.2", 960.4, 970.9), ("(8.8)", 972.4, 983.9), ("-9.4", 1033.0, 1042.5), ("(1.6)", 1044.0, 1055.5),
+               ("-5.6", 1097.5, 1107.0), ("(-9.8,-1.4)", 1108.5, 1133.0)),
+        line48(1041.7, ("Lurasidone", 847.5, 873.8), ("hydrochloride", 875.3, 907.9), ("(120", 909.4, 920.4),
+               ("mg/day)*", 921.9, 944.6), ("52.7", 960.4, 970.9),
+               ("(7.6)", 972.4, 983.9), ("-11.0", 1031.5, 1044.0), ("(1.6)", 1045.5, 1057.0),
+               ("-6.7", 1096.0, 1105.5), ("(-11.0,-2.5)", 1107.0, 1134.5)),
+        line48(1048.2, ("Placebo", 847.5, 866.1), ("54.7", 960.4, 970.9), ("(8.1)", 972.4, 983.9),
+               ("-3.8", 1033.0, 1042.5), ("(1.6)", 1044.0, 1055.5), ("--", 1113.2, 1117.2)),
+    ]
+    arms_read = " ".join(w["text"] for _top, words in _read48(arms, rtl=False) for w in words)
+    if "54.2 (8.8) -9.4 (1.6) -5.6 (-9.8,-1.4) Lurasidone hydrochloride (120 mg/day)* 52.7" in arms_read:
+        print("PASS: arms beside a centred study number are read row by row.")
+    else:
+        print(f"FAIL: arms read {arms_read!r}")
+        ok48 = False
+
+    # (b) A Contents entry two layouts read in another order is matched,
+    # not a deletion and an insertion; a lone "and" is not.
+    toc_a = ["1 INDICATIONS AND USAGE", "2.1 Schizophrenia", "Keep this list of sections close at hand",
+             "5 WARNINGS", "Read the whole leaflet before you start"]
+    toc_b = ["1 INDICATIONS AND USAGE", "Keep this list of sections close at hand", "2.1 Schizophrenia",
+             "5 WARNINGS", "Read the whole leaflet before you start"]
+    ta48 = build_comparison_tokens(lines_to_words(toc_a))
+    tb48 = build_comparison_tokens(lines_to_words(toc_b))
+    found48: list = []
+    rows48 = diff_documents(ta48, tb48, found48)
+    map48 = _TM48(ta48, tb48, found48)
+    rows48 = rows48 + _unacc48(rows48, map48, len(rows48))
+    if not any("Schizophrenia" in d.approved_text + d.suspect_text for d in rows48):
+        print("PASS: a Contents entry read in another order is matched.")
+    else:
+        print(f"FAIL: contents entry listed: {[(d.kind, d.approved_text, d.suspect_text) for d in rows48]}")
+        ok48 = False
+
+    # (c) Subscripts written two ways are one; a lost subscript on letters is
+    # minor; on a number it is not.
+    one48 = diff_documents(build_comparison_tokens(lines_to_words(["receptor α_{2C} affinity"])),
+                           build_comparison_tokens(lines_to_words(["receptor α₂ _{C} affinity"])))
+    cmax48 = diff_documents(build_comparison_tokens(lines_to_words(["mean Cmax was higher"])),
+                            build_comparison_tokens(lines_to_words(["mean Cₘₐₓ was higher"])))
+    if (all(d.severity == "minor" and _cat48(d) == "spacing" for d in one48)
+            and [(d.severity, _cat48(d)) for d in cmax48] == [("minor", "script")]
+            and not _is_script_only("H₂O", "H2O")):
+        print("PASS: one subscript written two ways is spacing; Cmax / C-max lowered is minor; H2O is not.")
+    else:
+        print(f"FAIL: scripts {[(d.severity, _cat48(d)) for d in one48]} / {[(d.severity, _cat48(d)) for d in cmax48]}")
+        ok48 = False
+    if ok48:
+        print("PASS: a merged outsert reads and pairs like its draft.")
+
+    print()
+    print("=" * 70)
+    print("TEST 49: Artwork text drawn twice, raised at full size, upside down, in turned panels")
+    print("=" * 70)
+    ok49 = True
+    sheet49 = os.path.join(tmp, "t49_artwork.pdf")
+    doc49 = fitz.open()
+    page49 = doc49.new_page(width=600, height=800)
+    for _ in range(2):  # a slug drawn twice, one copy on the other
+        page49.insert_text((40, 40), "Job 815-02-2022.indd printed twice", fontsize=8)
+    page49.insert_text((40, 80), "IMC > 30kg/m", fontsize=11)
+    x49 = 40 + fitz.get_text_length("IMC > 30kg/m", fontsize=11)
+    page49.insert_text((x49, 77), "2", fontsize=11)  # raised, not smaller
+    page49.insert_text((x49 + fitz.get_text_length("2", fontsize=11), 80), ", triglycerides", fontsize=11)
+    page49.insert_text((300, 140), "DRUG CAUTION keep away", fontsize=8, rotate=180)  # a foil row upside down
+    for y49 in (300, 450, 600):  # three copies of a turned panel down the sheet
+        page49.insert_text((60, y49), "It is rare when you first start", fontsize=6, rotate=90)
+    doc49.save(sheet49)
+    doc49.close()
+    read49 = " ".join(w.text for w in extract_words(sheet49))
+    checks49 = {
+        "drawn twice read once": "Job 815-02-2022.indd printed twice" in read49 and read49.count("815-02-2022") == 1,
+        "raised 2 a superscript": "30kg/m²," in read49,
+        "upside down read the right way": "DRUG CAUTION keep away" in read49 and "NOITUAC" not in read49,
+        "turned panels each whole": read49.count("It is rare when you first start") == 3,
+    }
+    if all(checks49.values()):
+        print("PASS: drawn twice, raised, upside down and turned panels all read as printed.")
+    else:
+        print(f"FAIL: {[k for k, v in checks49.items() if not v]} -- read {read49!r}")
+        ok49 = False
+
+    print()
+    print("=" * 70)
+    print("TEST 50: Foil columns, table headers, letter-spaced cells, lost letters, artwork boxes")
+    print("=" * 70)
+    from core.mupdf_page import _join_letter_spaced
+    from core.pdf_extractor import _aligned_edge_bands, _peel_spanning_rows, _read_lines, _split_into_zones
+
+    def w50(text, x, top, h, cw=1.6):
+        return {"text": text, "x0": x, "x1": x + cw * len(text), "top": top, "bottom": top + h}
+
+    def line50(text, x, top, h, cw=1.6, gap=0.9):
+        out = []
+        for part in text.split():
+            out.append(w50(part, x, top, h, cw))
+            x = out[-1]["x1"] + gap
+        return out
+
+    # (a) A foil's two columns of tiny type between a title over both and
+    #     an address line under them; (b) the same 2pt apart -- found by
+    #     the right column's common left edge and its smaller type. Text of
+    #     one size with a 2pt gap is not split.
+    left50 = ["Each uncoated tablet", "Tamoxifen Citrate IP", "equivalent to 20 mg", "Dosage: As directed",
+              "by the Physician", "Store in a cool place", "Protect from light."]
+    right50 = ["KEEP OUT OF REACH", "SCHEDULE G DRUG", "It is dangerous to", "take this preparation",
+               "except under medical", "supervision. Warning:", "To be sold against"]
+
+    def foil50(right_x, right_h):
+        rows = [line50("Tamoxifen Citrate Tablets IP 20 mg", 106, 70, 6.0, cw=3.0)]
+        for k, (a, b) in enumerate(zip(left50, right50)):
+            rows.append(line50(a, 106, 80 + 4.2 * k, 3.4) + line50(b, right_x, 80.3 + 4.2 * k, right_h))
+        rows.append(line50("Verna Indl. Estate, Goa 403 722 INDIA", 127, 80 + 4.2 * 7, 3.4))
+        return rows
+
+    left_end50 = max(w["x1"] for row in foil50(300, 2.9)[1:-1] for w in row if w["x0"] < 200)
+    wide50 = _peel_spanning_rows([foil50(left_end50 + 6.0, 2.9)])
+    narrow50 = _peel_spanning_rows([foil50(left_end50 + 2.0, 2.9)])
+    same_size50 = _aligned_edge_bands(foil50(left_end50 + 2.0, 3.4)[1:-1])
+    checks50 = {
+        "title, columns, address": [len(part) for part, _b in wide50] == [1, 7, 1]
+        and len(wide50[1][1] or []) == 2,
+        "2pt gutter by edge and size": [len(part) for part, _b in narrow50] == [1, 7, 1]
+        and len(narrow50[1][1] or []) == 2,
+        "one size is not split": same_size50 is None,
+    }
+
+    # (c) A table header -- unruled, stacked line by line, over the label
+    #     column too -- reads column by column, as ruled cells do; its data
+    #     rows stay rows, and a dose row is not a section heading.
+    def cells50(cells, top, h=9.0):
+        out = []
+        for text, x in cells:
+            out += line50(text, x, top, h, cw=5.0, gap=3.0)
+        return out
+
+    def read50(lines):
+        return [" ".join(w["text"] for w in words) for _top, words in _read_lines(lines, rtl=False)]
+
+    header50 = [
+        cells50([("Laboratory", 84), ("Placebo", 155), ("Lurasidone", 230), ("Lurasidone", 330)], 198),
+        cells50([("Parameter", 84), ("(N=708)", 155), ("hydrochloride", 222), ("hydrochloride", 322)], 211),
+        cells50([("20", 250), ("40", 350)], 224),
+        cells50([("mg/day", 240), ("mg/day", 340)], 237),
+        cells50([("(N=71)", 240), ("(N=487)", 338)], 250),
+        cells50([("Serum", 84)], 264),
+        cells50([("Creatinine", 84), ("2%", 165), ("1%", 250), ("2%", 350)], 277),
+    ]
+    data50 = [
+        cells50([("Body System", 84), ("Placebo", 155), ("20 mg", 230), ("40 mg", 300)], 100),
+        cells50([("Nausea", 84), ("5", 165), ("11", 250), ("10", 320)], 120),
+        cells50([("Vomiting", 84), ("3", 165), ("4", 250), ("5", 320)], 129),
+        cells50([("Dizziness", 84), ("2", 165), ("6", 250), ("7", 320)], 138),
+    ]
+    shifts50 = [
+        cells50([("Total Cholesterol", 75), ("5.3%", 168), ("13.8%", 228), ("6.2%", 297)], 453),
+        cells50([("(≥240 mg/dL)", 80), ("(30/571)", 162), ("(8/58)", 228), ("(25/402)", 292)], 462.5),
+        cells50([("Triglycerides", 81), ("10.1%", 166), ("14.3%", 228), ("10.8%", 295)], 472),
+        cells50([("(≥200 mg/dL)", 80), ("(53/526)", 162), ("(7/49)", 228), ("(41/379)", 292)], 481.5),
+    ]
+    doses50 = [cells50([("Lurasidone hydrochloride", 230)], 90),
+               cells50([("20", 250), ("40", 320), ("80", 390)], 100),
+               cells50([("mg/day", 240), ("mg/day", 310), ("mg/day", 380)], 110)]
+    checks50.update({
+        "header by columns": " ".join(read50(header50)) == (
+            "Laboratory Parameter Placebo (N=708) Lurasidone hydrochloride 20 mg/day (N=71) "
+            "Lurasidone hydrochloride 40 mg/day (N=487) Serum Creatinine 2% 1% 2%"),
+        "data rows stay rows": read50(data50)[1:] == ["Nausea 5 11 10", "Vomiting 3 4 5", "Dizziness 2 6 7"],
+        "fractions are data": len(read50(shifts50)) == 4,
+        "dose row no heading": len(_split_into_zones(doses50)) == 1,
+    })
+
+    # (d) A Word cell set to "distributed" reads as its word; atom labels
+    #     of a structure stay apart.
+    spread50 = [w50(ch, 100 + 6 * k, 50, 8.0, cw=3.0) for k, ch in enumerate("Données")]
+    atoms50 = [w50(ch, 100 + 6 * k, 80, 8.0, cw=3.0) for k, ch in enumerate("OONHS")]
+    checks50["letter-spaced joined"] = (
+        [w["text"] for w in _join_letter_spaced(spread50)] == ["Données"]
+        and len(_join_letter_spaced(atoms50)) == 5
+    )
+
+    # (e) A text layer that drops "ll" everywhere: a short word losing it
+    #     ("well" / "wel") is rated like the long ones, as noise -- but
+    #     only on that evidence.
+    def words50(text):
+        out, x = [], 40.0
+        for part in text.split():
+            out.append(Word(text=part, page=1, x0=x, top=40, x1=x + 6 * len(part), bottom=52))
+            x += 6 * len(part) + 4
+        return out
+
+    loss_rows50 = diff_documents(
+        build_comparison_tokens(words50("The patient felt well and the hallucinations stopped. A full supply "
+                                        "will follow. The parallel trials collapsed early. Allergic reactions were rare.")),
+        build_comparison_tokens(words50("The patient felt wel and the halucinations stopped. A ful supply "
+                                        "wil follow. The paralel trials colapsed early. Alergic reactions were rare.")),
+    )
+    lone_rows50 = diff_documents(build_comparison_tokens(words50("The patient felt well today.")),
+                                 build_comparison_tokens(words50("The patient felt wel today.")))
+    checks50["lost letters one rating"] = (
+        len(loss_rows50) == 7 and {r.severity for r in loss_rows50} == {"typo"}
+        and [r.severity for r in lone_rows50] == ["major"]
+    )
+
+    # (f) An outsert's artwork box against the draft: the box is removed
+    #     on its own, not "changed" into the draft's next words.
+    box50 = "PRODUCT NAME : Lurasidone Tablets COUNTRY : US ITEM : Outsert"
+    art50 = words50(box50 + " FDA-Approved Patient Labeling Read this Medication Guide")
+    for w in art50[:len(box50.split())]:
+        w.artwork = True
+    art_rows50 = diff_documents(
+        build_comparison_tokens(art50),
+        build_comparison_tokens(words50("Medication Guide FDA-Approved Patient Labeling Read this Medication Guide")),
+    )
+    checks50["artwork box removed"] = [(r.kind, r.approved_text, r.suspect_text) for r in art_rows50] == [
+        ("removed_in_suspect", box50, ""), ("added_in_suspect", "", "Medication Guide")]
+    if all(checks50.values()):
+        print("PASS: foil columns, stacked headers, spread letters, lost letters and artwork boxes all read right.")
+    else:
+        print(f"FAIL: {[k for k, v in checks50.items() if not v]}")
 
     print()
     print(f"(test PDFs written to {tmp} if you want to open them manually)")

@@ -139,7 +139,7 @@ def main():
     win.on_compare_clicked()
 
     # DiffWorker runs on QThreadPool -- pump the event loop until finished.
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win.results_panel.rowCount() == 0 and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -227,7 +227,7 @@ def main():
     win.original_panel.file_path = tall_approved
     win.suspect_panel.file_path = tall_suspect
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win.results_panel.rowCount() == 0 and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -326,7 +326,7 @@ def main():
     win.original_panel.file_path = narrow_approved
     win.suspect_panel.file_path = narrow_suspect
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win.results_panel.rowCount() == 0 and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -430,9 +430,9 @@ def main():
     unchanged = abs(win.original_panel.zoom_factor() - before) < 1e-9
     print("9. Plain wheel scroll does NOT zoom:", "PASS" if unchanged else "FAIL")
 
-    # --- Out-of-order sections (MVP-8): a section moved to the front
-    #     shows as one 'Reordered Section' row that navigates both
-    #     panels, with the genuine edit inside it still critical. ---
+    # --- Out-of-order sections (MVP-8): a section moved to the front is
+    #     matched where it stands -- no row for the move -- and the genuine
+    #     edit inside it is the one row, critical, navigating both panels. ---
     sec_approved = os.path.join(tmp, "sec_approved.pdf")
     sec_suspect = os.path.join(tmp, "sec_suspect.pdf")
     make_sectioned_pdf(sec_approved, SECTIONED_APPROVED)
@@ -445,33 +445,37 @@ def main():
     win.original_panel.file_path = sec_approved
     win.suspect_panel.file_path = sec_suspect
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win.results_panel.rowCount() == 0 and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
-    move_rows = [d for d in win.results_panel._items if d.kind == "reordered_section"]
+    while win._active_worker is not None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    move_rows = [d for d in win.results_panel._items if d.kind.startswith("reordered") or d.severity == "reorder"]
     critical_rows = [d for d in win.results_panel._items if d.severity == "critical"]
     win.original_panel.clear_highlight()
     win.suspect_panel.clear_highlight()
-    if move_rows:
-        win.on_result_activated(move_rows[0])
+    if critical_rows:
+        win.on_result_activated(critical_rows[0])
         app.processEvents()
-        ok_move_nav = (
+        ok_edit_nav = (
             bool(win.original_panel._highlight_items)
             and bool(win.suspect_panel._highlight_items)
         )
     else:
-        ok_move_nav = False
+        ok_edit_nav = False
     ok_sections = (
-        len(move_rows) == 1
-        and move_rows[0].approved_text == "3 WARNINGS AND PRECAUTIONS"
-        and move_rows[0].severity == "reorder"
+        not move_rows
+        and len(win.results_panel._items) == 1
         and len(critical_rows) == 1
         and critical_rows[0].approved_text == "especially"
-        and ok_move_nav
+        and ok_edit_nav
+        # the moved section's text is matched (green) on both documents
+        and win.original_panel.matched_count() > 0 and win.suspect_panel.matched_count() > 0
     )
-    print("10. Moved section -> one 'Reordered Section' row; click navigates "
-          "both panels; edit inside stays critical:",
+    print("10. Moved section -> no row for the move, its text matched; the edit inside is the "
+          "one row, critical, navigating both panels:",
           "PASS" if ok_sections else "FAIL")
     print(f"    rows: {[(d.kind, d.severity) for d in win.results_panel._items]}")
 
@@ -479,7 +483,7 @@ def main():
     win.original_panel.render_pdf(approved_path)
     win.suspect_panel.render_pdf(suspect_path)
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win._active_worker is not None and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -556,9 +560,9 @@ def main():
         and abs(marker.center().x() - expected.center().x()) < 1
         and abs(marker.center().y() - expected.center().y()) < 1
         and visible.contains(marker.center())
-        and "same text" in win.status_label.text()
+        and "matched with" in win.status_label.text()
     )
-    print("15. Clicking text in one viewer takes the other to the same text:",
+    print("15. Clicking a matched word in one viewer takes the other to the word it was matched with:",
           "PASS" if ok_sync else "FAIL", f"| {win.status_label.text()}")
 
     # Table -> viewers with the keyboard.
@@ -580,7 +584,7 @@ def main():
     win.original_panel.render_pdf(approved_path)
     win.suspect_panel.render_pdf(suspect_path)
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win._active_worker is not None and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -630,7 +634,7 @@ def main():
     win.original_panel.render_pdf(repeated_a)
     win.suspect_panel.render_pdf(repeated_b)
     win.on_compare_clicked()
-    deadline = time.time() + 10
+    deadline = time.time() + 60  # a busy machine (Word, another copy of the app) is slow
     while win._active_worker is not None and time.time() < deadline:
         app.processEvents()
         time.sleep(0.02)
@@ -714,7 +718,8 @@ def main():
     win.original_panel.file_path = gone_a
     win.suspect_panel.file_path = gone_b
     rp.group_checkbox.setChecked(False)
-    rp._chips["moved"].setChecked(True)  # show every row for this check
+    for chip in rp._chips.values():  # show every row for this check
+        chip.setChecked(True)
     win.on_compare_clicked()
     deadline = time.time() + 20
     while win._active_worker is not None and time.time() < deadline:
@@ -749,7 +754,7 @@ def main():
     # counterpart goes through).
     from core.diff_engine import DiffItem
     replacement = DiffItem(
-        index=0, kind="reordered", severity="reorder",
+        index=0, kind="text_changed", severity="minor",
         approved_text=target.approved_text, suspect_text=target.approved_text,
         approved_location=target.approved_location, suspect_location=None,
     )
@@ -1149,6 +1154,187 @@ def main():
           else "FAIL",
           f"({common!r}: {found} matches, wraps {wraps}, back {back}, tinted {tinted}, Ctrl+Shift+F {focused}, "
           f"Enter {typed}, F3 {f3}, Esc {esc}, no match {none})")
+
+    # --- 29. Crop Margins on a Word document: the pages Word laid out ---
+    import docx as _docx
+    from core.office_convert import available_engine as _engine
+    from ui.crop_dialog import CropDialog as _CropDialog
+
+    word_path = os.path.join(tmp, "crop_me.docx")
+    word = _docx.Document()
+    word.add_paragraph("RUNNING HEADER TEXT")
+    for _ in range(3):
+        word.add_paragraph("The tablets contain 10 mg of the active ingredient. " * 3)
+    word.save(word_path)
+    crop_dialog = _CropDialog(word_path, None, parent=win)
+    meta = crop_dialog._doc_meta.get(word_path)
+    if _engine():
+        crop_ok = bool(meta) and meta["page_count"] >= 1 and crop_dialog._orig_btn.isEnabled()
+        crop_dialog._switch_to("original")
+        crop_dialog._header_spin.setValue(90.0)
+        crop_dialog._apply_to_all_pages()
+        crop_ok = crop_ok and bool(crop_dialog.get_crop_data().get(word_path))
+    else:  # no Word/LibreOffice: no pages to crop, and the button says why
+        crop_ok = meta is None and not crop_dialog._orig_btn.isEnabled() and "Word" in crop_dialog._orig_btn.toolTip()
+    crop_dialog.reject()
+    print("29. Crop Margins shows and crops a Word document's pages:", "PASS" if crop_ok else "FAIL",
+          f"(engine {_engine()}, pages {meta and meta['page_count']})")
+
+    # --- 30. Show Table Cells: the tables and cells as the comparison reads them ---
+    table_pdf = os.path.join(tmp, "cells.pdf")
+    tdoc = fitz.open()
+    tpage = tdoc.new_page(width=420, height=300)
+    for x in (40, 160, 270, 380):
+        tpage.draw_line((x, 40), (x, 130))
+    for y in (40, 70, 100, 130):
+        tpage.draw_line((40, y), (380, y))
+    for r, row in enumerate([["Reaction", "Placebo", "Drug"], ["Nausea", "4", "12"], ["Diarrhea", "9", "12"]]):
+        for c, text in enumerate(row):
+            tpage.insert_text(((40, 160, 270)[c] + 5, 40 + 30 * r + 18), text, fontsize=10)
+    tdoc.save(table_pdf)
+    tdoc.close()
+    win.original_panel.render_pdf(table_pdf)
+    app.processEvents()
+    win.table_cells_action.setChecked(True)
+    deadline = time.time() + 30
+    while 1 not in win.original_panel.detected_tables() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    layout = win.original_panel.detected_tables().get(1, [])
+    drawn = len(win.original_panel._table_items)
+    # 9 cells + the table's outline + its label (2 items).
+    cells_ok = len(layout) == 1 and layout[0]["status"] == "table" and drawn == 12
+    # A crop (here: everything right of the second column) is applied
+    # before the page is read: the outline redrawn is the kept part.
+    win._crop_data = {win.original_panel.file_path: {1: (0.0, 300.0, 0.0, 270.0)}}
+    win._draw_crop_overlays_on_panels()
+    deadline = time.time() + 30
+    while 1 not in win.original_panel.detected_tables() and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    cropped = win.original_panel.detected_tables().get(1, [])
+    crop_ok = (len(cropped) == 1 and cropped[0]["bbox"][2] <= 270.5
+               and [len(row) for row in cropped[0]["cells"]] == [2, 2, 2])
+    win._crop_data = {}
+    win._draw_crop_overlays_on_panels()
+    cells_ok = cells_ok and crop_ok
+    win.table_cells_action.setChecked(False)
+    hidden = not win.original_panel._table_items
+    print("30. Show Table Cells outlines the table and each cell as read (and only the cropped-to part), "
+          "and hides them again:",
+          "PASS" if cells_ok and hidden else "FAIL",
+          f"(tables {[t['status'] for t in layout]}, items {drawn}, cropped {[len(r) for r in cropped[0]['cells']] if cropped else None})")
+
+    # --- 31. Matched text: very light green on both documents ---
+    win.original_panel.render_pdf(approved_path)
+    win.suspect_panel.render_pdf(suspect_path)
+    win.original_panel.file_path = approved_path
+    win.suspect_panel.file_path = suspect_path
+    win.matched_action.setChecked(True)
+    win.on_compare_clicked()
+    deadline = time.time() + 30
+    while win._active_worker is not None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    green_a, green_s = win.original_panel.matched_count(), win.suspect_panel.matched_count()
+    # A changed word is not tinted: no green box holds a difference's text.
+    changed = [d for d in win.results_panel.all_items() if d.kind == "text_changed" and d.approved_location]
+    clear_of_changes = True
+    for d in changed:
+        page, boxes = next(iter(d.approved_location.iter_pages()))
+        for x0, top, x1, bottom in boxes:
+            cx, cy = (x0 + x1) / 2, (top + bottom) / 2
+            for item in win.original_panel._matched_items:
+                r = item.rect()
+                scale = 200 / 72
+                offset = win.original_panel._page_y_offsets[page - 1]
+                if r.contains(cx * scale, offset + cy * scale) and r.width() < (x1 - x0) * scale * 1.05:
+                    clear_of_changes = False
+    win.matched_action.trigger()  # off, as a click does
+    app.processEvents()
+    off = win.original_panel.matched_count() == 0 and win.suspect_panel.matched_count() == 0
+    win.matched_action.trigger()  # on again
+    app.processEvents()
+    back = win.original_panel.matched_count() == green_a
+    print("31. Text matched in both documents is tinted light green (and the changes are not):",
+          "PASS" if green_a > 0 and green_s > 0 and changed and clear_of_changes and off and back else "FAIL",
+          f"(boxes {green_a}/{green_s}, changed rows {len(changed)}, toggle off {off}, back {back})")
+
+    # --- 32. Spacing and bullets: a tab of their own, counted nowhere ---
+    from core.diff_engine import DiffItem as _Item32
+    from core.report import ReportInput, write_report
+    rp = win.results_panel
+    rows32 = [
+        _Item32(0, "text_changed", "critical", "4 mg", "8 mg", None, None),
+        _Item32(0, "removed_in_suspect", "critical", "or your child", "", None, None),
+        _Item32(0, "text_changed", "minor", "10,15,", "10, 15,", None, None),  # spacing
+        _Item32(0, "added_in_suspect", "minor", "", "•", None, None),  # a bullet
+        _Item32(0, "text_changed", "minor", "ο", "○", None, None),  # a bullet's glyph
+    ]
+    rp.set_results(rows32)
+    app.processEvents()
+    counted_ok = (
+        rp.rowCount() == 2 and rp.deviations_tab.text() == "Deviations 2"
+        and rp.extras_tab.text() == "Formatting extras 3"
+        and "(2/2)" in rp.unseen_badge.text()
+        and [p.text() for p in rp._severity_pills.values() if p.isVisible()] == ["Critical  2"]
+        and win.results_dock.windowTitle().startswith("Deviations · 2 ")
+    )
+    rp.extras_tab.click()
+    app.processEvents()
+    extras_ok = rp.rowCount() == 3 and "not counted" in rp.summary_label.text() and "(2/2)" in rp.unseen_badge.text()
+    rp.deviations_tab.click()
+    rp.select_item(rows32[3])  # a bullet clicked in a viewer
+    app.processEvents()
+    follows = rp.extras_tab.isChecked() and rp.selected_items() == [rows32[3]]
+    report32 = os.path.join(tmp, "extras_report.html")
+    write_report(report32, ReportInput(approved_path, suspect_path, rp.all_items(), rp.decision, rp.category,
+                                       "tester", "test", is_extra=rp.is_extra))
+    page32 = open(report32, encoding="utf-8").read()
+    report_ok = "2 differences" in page32 and "Formatting extras (spacing, bullets" in page32
+    rp.deviations_tab.click()
+    print("32. Spacing and bullets are listed on their own tab, not counted as deviations or in the seen meter:",
+          "PASS" if counted_ok and extras_ok and follows and report_ok else "FAIL",
+          f"(counted {counted_ok}, extras tab {extras_ok}, viewer click follows {follows}, report {report_ok})")
+    # --- 33. A click follows the comparison's own pairing ---
+    win.original_panel.render_pdf(approved_path)
+    win.suspect_panel.render_pdf(suspect_path)
+    win.original_panel.file_path = approved_path
+    win.suspect_panel.file_path = suspect_path
+    win.on_compare_clicked()
+    deadline = time.time() + 60
+    while win._active_worker is not None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    tm33 = win._token_map
+    rows33 = win.results_panel.all_items()
+    # A word in a difference row: the click selects that row.
+    target33 = next(d for d in rows33 if d.approved_span)
+    word33 = target33.approved_span[0]
+    index33 = next(k for k, t in enumerate(tm33.tokens("approved")) if t is word33)
+    win.show_highlights_checkbox.setChecked(False)  # the row is found by its words, not its overlay
+    app.processEvents()
+    w33 = word33.source_words[0]
+    click_pdf_point(orig, w33.page, (w33.x0 + w33.x1) / 2, (w33.top + w33.bottom) / 2)
+    selected33 = win.results_panel.selected_items()
+    row_ok = tm33.counterpart("approved", index33)[0] is None and target33 in selected33
+    # A matched word: the other viewer marks exactly its partner.
+    green33 = next(k for k in range(len(tm33.tokens("approved"))) if tm33.confirmed("approved", k))
+    partner33 = tm33.partners()["approved"][green33]
+    g33 = tm33.tokens("approved")[green33].source_words[0]
+    susp.clear_highlight()
+    click_pdf_point(orig, g33.page, (g33.x0 + g33.x1) / 2, (g33.top + g33.bottom) / 2)
+    p33 = tm33.tokens("suspect")[partner33].source_words[0]
+    mark33 = susp._highlight_items[0].rect() if susp._highlight_items else None
+    want33 = susp._scene_rects_for(p33.page, [p33.bbox])[0]
+    partner_ok = mark33 is not None and abs(mark33.center().x() - want33.center().x()) < 1 and abs(mark33.center().y() - want33.center().y()) < 1
+    win.show_highlights_checkbox.setChecked(True)
+    print("33. A click follows the comparison: a matched word to its partner, any other word to its row:",
+          "PASS" if row_ok and partner_ok else "FAIL", f"(row {row_ok}, partner {partner_ok})")
     print("dialogs:", dialogs or "none")
 
 

@@ -47,6 +47,10 @@ class Tokens:
     reorder: tuple[str, str]
     success: str
     danger: str
+    # The two documents' role colors (text color, tinted background), so
+    # "Original" and "Suspect" are told apart at a glance everywhere.
+    original: tuple[str, str] = ("#1d4ed8", "#e6efff")
+    suspect: tuple[str, str] = ("#0f766e", "#dcf3ef")
 
     def severity(self, name: str) -> tuple[str, str]:
         return getattr(self, name, self.typo)
@@ -54,34 +58,36 @@ class Tokens:
 
 LIGHT_TOKENS = Tokens(
     dark=False,
-    window="#f6f5f2",
-    surface="#fcfbf8",
-    surface_alt="#f1efea",
-    hover="#ebe8e1",
-    border="#dcd8cf",
-    border_strong="#c4bfb4",
-    text="#1f2328",
-    muted="#656d76",
-    accent="#0969da",
-    accent_hover="#0860c7",
+    window="#f3f5f8",
+    surface="#ffffff",
+    surface_alt="#f8fafc",
+    hover="#eef2f7",
+    border="#e2e7ee",
+    border_strong="#c8d0db",
+    text="#111827",
+    muted="#64748b",
+    accent="#2563eb",
+    accent_hover="#1d4ed8",
     accent_text="#ffffff",
-    accent_subtle="#dbe9fb",
-    canvas="#e3e0d9",
-    page_border="#c9c4b9",
-    critical=("#cf222e", "#fbe3e4"),
-    major=("#bc4c00", "#fbe7d8"),
-    minor=("#9a6700", "#f8edc8"),
-    typo=("#57606a", "#e9e8e4"),
-    reorder=("#8250df", "#ece4fb"),
-    success="#1a7f37",
-    danger="#cf222e",
+    accent_subtle="#e6efff",
+    canvas="#e6eaf0",
+    page_border="#cfd6e0",
+    critical=("#c81e1e", "#fde8e8"),
+    major=("#b54708", "#fef0e1"),
+    minor=("#8a6100", "#fcf3d2"),
+    typo=("#475569", "#eef1f5"),
+    reorder=("#6d28d9", "#f1e9ff"),
+    success="#15803d",
+    danger="#c81e1e",
+    original=("#1d4ed8", "#e6efff"),
+    suspect=("#0f766e", "#dcf3ef"),
 )
 
 DARK_TOKENS = Tokens(
     dark=True,
-    window="#0d1117",
-    surface="#151b23",
-    surface_alt="#1b222c",
+    window="#0e131a",
+    surface="#151b24",
+    surface_alt="#19202a",
     hover="#212a36",
     border="#2a313c",
     border_strong="#3d4450",
@@ -100,6 +106,8 @@ DARK_TOKENS = Tokens(
     reorder=("#bc8cff", "#2b2143"),
     success="#3fb950",
     danger="#ff7b72",
+    original=("#79a8ff", "#1b2c4d"),
+    suspect=("#4fd1c5", "#13332f"),
 )
 
 
@@ -125,8 +133,11 @@ class _ThemeManager(QObject):
             dark = self.mode == DARK
         self.tokens = DARK_TOKENS if dark else LIGHT_TOKENS
         app.setStyle(QStyleFactory.create("Fusion"))
-        if "Segoe UI" in QFontDatabase.families():
-            app.setFont(QFont("Segoe UI", 9))
+        families = QFontDatabase.families()
+        for family in ("Segoe UI Variable Text", "Segoe UI"):
+            if family in families:
+                app.setFont(QFont(family, 9))
+                break
         app.setPalette(_palette(self.tokens))
         app.setStyleSheet(_stylesheet(self.tokens, _check_mark_path(self.tokens)))
         self.changed.emit()
@@ -213,12 +224,20 @@ def _stylesheet(t: Tokens, check_mark: str) -> str:
     QMenu::item:disabled {{ color: {t.muted}; }}
     QMenu::separator {{ height: 1px; background: {t.border}; margin: 4px 6px; }}
 
-    QToolBar {{ background: {t.window}; border: none; border-bottom: 1px solid {t.border};
-               padding: 5px 8px; spacing: 6px; }}
-    QToolBar::separator {{ width: 1px; background: {t.border}; margin: 4px 6px; }}
+    QToolBar {{ background: {t.surface}; border: none; border-bottom: 1px solid {t.border};
+               padding: 6px 10px; spacing: 2px; }}
+    QToolBar::separator {{ width: 1px; background: {t.border}; margin: 6px 8px; }}
+    QToolBar QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: 6px;
+        padding: 5px 9px; color: {t.text}; }}
+    QToolBar QToolButton:hover {{ background: {t.hover}; border-color: transparent; }}
+    QToolBar QToolButton:pressed {{ background: {t.border}; }}
+    QToolBar QToolButton:checked {{ background: {t.accent_subtle}; color: {t.accent}; border-color: transparent; }}
+    QToolBar QToolButton:disabled {{ background: transparent; color: {t.border_strong}; }}
+    QLabel#brandName {{ font-weight: 700; font-size: 10.5pt; color: {t.text}; }}
+    QLabel#brandSub {{ color: {t.muted}; font-size: 8pt; }}
 
     QPushButton, QToolButton {{
-        background: {t.surface}; color: {t.text}; border: 1px solid {t.border};
+        background: {t.surface}; color: {t.text}; border: 1px solid {t.border_strong};
         border-radius: 6px; padding: 4px 12px; min-height: 18px;
     }}
     QPushButton:hover, QToolButton:hover {{ background: {t.hover}; border-color: {t.border_strong}; }}
@@ -232,18 +251,38 @@ def _stylesheet(t: Tokens, check_mark: str) -> str:
 
     QPushButton#primary, QToolButton#primary {{
         background: {t.accent}; color: {t.accent_text}; border-color: {t.accent}; font-weight: 600;
-        padding: 4px 16px;
+        padding: 5px 16px;
     }}
+    QPushButton#accept {{ color: {t.success}; }}
+    QPushButton#accept:hover {{ border-color: {t.success}; }}
+    QPushButton#reject {{ color: {t.danger}; }}
+    QPushButton#reject:hover {{ border-color: {t.danger}; }}
+    QPushButton#accept:disabled, QPushButton#reject:disabled {{ color: {t.muted}; }}
+    QLineEdit QToolButton {{ background: transparent; border: none; padding: 0; margin: 0; min-height: 0; }}
     QPushButton#primary:hover, QToolButton#primary:hover {{ background: {t.accent_hover}; border-color: {t.accent_hover}; }}
     QPushButton#primary:disabled, QToolButton#primary:disabled {{
         background: {t.window}; color: {t.muted}; border-color: {t.border};
     }}
 
     QToolButton[chip="true"] {{
-        border-radius: 11px; padding: 2px 10px; background: {t.surface}; color: {t.muted};
+        border-radius: 12px; padding: 3px 11px; background: {t.surface}; color: {t.muted};
+        border: 1px solid {t.border};
     }}
-    QToolButton[chip="true"]:checked {{ background: {t.accent_subtle}; border-color: {t.accent}; color: {t.text}; }}
-    QToolButton[chip="true"]:disabled {{ background: {t.window}; border-color: {t.border}; color: {t.muted}; }}
+    QToolButton[chip="true"]:hover {{ border-color: {t.border_strong}; color: {t.text}; }}
+    QToolButton[chip="true"]:checked {{ background: {t.accent_subtle}; border-color: {t.accent_subtle};
+        color: {t.accent}; font-weight: 600; }}
+    QToolButton[chip="true"]:checked:hover {{ border-color: {t.accent}; }}
+    QToolButton[chip="true"]:disabled {{ background: transparent; border-color: {t.border}; color: {t.border_strong};
+        font-weight: 400; }}
+    QToolButton[tab="true"] {{
+        background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0;
+        color: {t.muted}; padding: 3px 10px 4px; font-weight: 600;
+    }}
+    QToolButton[tab="true"]:hover {{ color: {t.text}; background: transparent; }}
+    QToolButton[tab="true"]:checked {{ color: {t.text}; border-bottom-color: {t.accent}; background: transparent; }}
+    QToolButton[tab="true"]:disabled {{ color: {t.border_strong}; }}
+    QToolButton[link="true"] {{ background: transparent; border: none; color: {t.accent}; padding: 3px 6px; }}
+    QToolButton[link="true"]:hover {{ text-decoration: underline; background: transparent; }}
     QToolButton[nav="true"] {{ font-size: 13pt; padding: 0 8px; }}
 
     QLineEdit, QSpinBox, QComboBox {{
@@ -266,21 +305,24 @@ def _stylesheet(t: Tokens, check_mark: str) -> str:
 
     QTableWidget, QTableView {{
         background: {t.surface}; alternate-background-color: {t.surface_alt};
-        border: 1px solid {t.border}; border-radius: 6px; gridline-color: {t.border};
-        selection-background-color: {t.accent_subtle}; selection-color: {t.text};
+        border: 1px solid {t.border}; border-radius: 8px; gridline-color: {t.border};
+        selection-background-color: {t.accent_subtle}; selection-color: {t.text}; outline: 0;
     }}
-    QTableWidget::item {{ padding: 5px 8px; border: none; }}
+    QTableWidget::item {{ padding: 5px 10px; border: none; }}
+    QTableWidget::item:hover {{ background: {t.hover}; }}
+    QTableWidget::item:selected {{ background: {t.accent_subtle}; color: {t.text}; }}
+    QHeaderView {{ background: {t.surface}; border: none; }}
     QHeaderView::section {{
-        background: {t.surface_alt}; color: {t.muted}; font-weight: 600;
-        border: none; border-bottom: 1px solid {t.border}; border-right: 1px solid {t.border};
-        padding: 6px 8px;
+        background: {t.surface}; color: {t.muted}; font-weight: 600; font-size: 8pt;
+        border: none; border-bottom: 1px solid {t.border}; padding: 7px 10px;
     }}
+    QHeaderView::section:hover {{ color: {t.text}; }}
 
     QDockWidget {{ color: {t.text}; }}
-    QDockWidget::title {{ background: {t.window}; padding: 6px 10px; border-top: 1px solid {t.border};
+    QDockWidget::title {{ background: {t.surface}; padding: 8px 12px; border-top: 1px solid {t.border};
         border-bottom: 1px solid {t.border}; text-align: left; }}
 
-    QStatusBar {{ background: {t.window}; border-top: 1px solid {t.border}; color: {t.muted}; }}
+    QStatusBar {{ background: {t.surface}; border-top: 1px solid {t.border}; color: {t.muted}; }}
     QStatusBar QLabel {{ padding: 2px 8px; }}
     QStatusBar::item {{ border: none; }}
     QProgressBar {{ background: {t.surface_alt}; border: 1px solid {t.border}; border-radius: 3px;
@@ -304,8 +346,14 @@ def _stylesheet(t: Tokens, check_mark: str) -> str:
 
     QLabel#muted {{ color: {t.muted}; }}
     QLabel#panelTitle {{ color: {t.muted}; font-weight: 600; font-size: 8pt; letter-spacing: 1px; }}
+    QLabel#panelTitle[role="original"] {{ color: {t.original[0]}; background: {t.original[1]};
+        border-radius: 4px; padding: 1px 7px; }}
+    QLabel#panelTitle[role="suspect"] {{ color: {t.suspect[0]}; background: {t.suspect[1]};
+        border-radius: 4px; padding: 1px 7px; }}
     QLabel#fileName {{ font-weight: 600; font-size: 10pt; }}
     QLabel#note {{ color: {t.major[0]}; }}
+    QLabel#sectionTitle {{ color: {t.muted}; font-weight: 600; font-size: 8pt; letter-spacing: 1px; }}
+    QLabel#summaryTitle {{ font-weight: 700; font-size: 10pt; }}
     QWidget#panelHeader {{ background: {t.surface}; border-bottom: 1px solid {t.border}; }}
-    QWidget#panelNav {{ background: {t.window}; border-bottom: 1px solid {t.border}; }}
+    QWidget#panelNav {{ background: {t.surface}; border-bottom: 1px solid {t.border}; }}
     """

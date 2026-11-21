@@ -186,12 +186,13 @@ import multiprocessing
 import os
 import sys
 
-from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThreadPool, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon, QKeySequence
+from PySide6.QtCore import QSettings, QSize, QStandardPaths, Qt, QThreadPool, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -201,6 +202,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -210,8 +212,8 @@ from core.office_convert import available_engine
 from core.rematch import RematchContext, rematch_areas, rematch_item
 from core.report import ReportInput, write_report
 from core.review_store import ReviewStore
-from core.token_map import APPROVED, CONTEXT, SUSPECT, TokenMap
-from ui import theme
+from core.token_map import APPROVED, SUSPECT, TokenMap
+from ui import icons, theme
 from ui.document_panel import DocumentPanel
 from ui.results_panel import ACCEPTED, REJECTED, ResultsPanel
 from ui.crop_dialog import CropDialog
@@ -245,6 +247,9 @@ _SHORTCUTS = [
     ("Zoom with the trackpad or wheel", "Pinch / Ctrl+Wheel"),
     ("Lock views", "Ctrl+L"),
     ("Show highlights", "Ctrl+H"),
+    ("Show matched text (light green)", "Ctrl+G"),
+    ("Show table cells (as the comparison reads them)", "Ctrl+T"),
+    ("Crop margins", "Ctrl+M"),
     ("Find in list", "Ctrl+F"),
     ("Search the last used viewer's document", "Ctrl+Shift+F"),
     ("Next / previous match in the document", "Enter / Shift+Enter in its Find bar, or F3 / Shift+F3"),
@@ -426,7 +431,7 @@ class MainWindow(QMainWindow):
             tip="Merge multiple split files into the Original document",
         )
         self.compare_action = self._action("&Compare", self.on_compare_clicked, "F5")
-        self.crop_action = self._action("Crop &Margins (Header/Footer/Sides)...", self.on_crop_clicked, "Ctrl+H")
+        self.crop_action = self._action("Crop &Margins (Header/Footer/Sides)...", self.on_crop_clicked, "Ctrl+M")
         self.export_action = self._action(
             "&Export Report...", self._export_report, "Ctrl+E",
             tip="Save every difference with its review decision, both files' SHA-256 "
@@ -500,6 +505,19 @@ class MainWindow(QMainWindow):
             tip="Make the difference highlights blink.",
         )
         self.blink_checkbox.setEnabled(False)  # enabled after a comparison
+        self.matched_action = self._action(
+            "Show &Matched Text", self._redraw_matched, "Ctrl+G", checkable=True,
+            tip="Tint in very light green the text found the same in both documents, "
+                "so what differs stands out.",
+        )
+        self.matched_action.setChecked(self.settings.value("matched_text", True, bool))
+        self.matched_action.toggled.connect(lambda on: self.settings.setValue("matched_text", on))
+        self.table_cells_action = self._action(
+            "Show &Table Cells", self._on_table_cells_toggled, "Ctrl+T", checkable=True,
+            tip="Outline every table and cell as the comparison reads them: blue = read cell by "
+                "cell, purple = a table inside another table's cell, grey dashes = a grid found "
+                "but read as ordinary text.",
+        )
         self.toggle_deviations_action = self.results_dock.toggleViewAction()
         self.toggle_deviations_action.setText("&Deviation List")
         self.toggle_deviations_action.setShortcut(QKeySequence("Ctrl+D"))
@@ -551,7 +569,10 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addActions([self.find_in_document_action, self.find_next_action, self.find_previous_action])
         view_menu.addSeparator()
-        view_menu.addActions([self.lock_checkbox, self.show_highlights_checkbox, self.blink_checkbox])
+        view_menu.addActions([
+            self.lock_checkbox, self.show_highlights_checkbox, self.matched_action, self.blink_checkbox,
+            self.table_cells_action,
+        ])
         view_menu.addSeparator()
         view_menu.addAction(self.toggle_deviations_action)
         view_menu.addAction(self.comparator_action)
@@ -574,22 +595,79 @@ class MainWindow(QMainWindow):
         help_menu = bar.addMenu("&Help")
         help_menu.addActions([self.shortcuts_action, self.about_action])
 
+    def _icon_actions(self) -> None:
+        """Icons for the menu and toolbar actions (redrawn per theme)."""
+        for action, name in (
+            (self.open_original_action, "folder"), (self.open_suspect_action, "folder"),
+            (self.merge_original_action, "merge"), (self.merge_suspect_action, "merge"),
+            (self.compare_action, "compare"), (self.crop_action, "crop"), (self.export_action, "export"),
+            (self.prev_action, "chevron-left"), (self.next_action, "chevron-right"),
+            (self.accept_action, "check"), (self.reject_action, "x"), (self.reset_action, "reset"),
+            (self.find_action, "filter"), (self.find_in_document_action, "search"),
+            (self.find_next_action, "chevron-down"), (self.find_previous_action, "chevron-up"),
+            (self.rematch_action, "rematch"), (self.rematch_areas_action, "area"),
+            (self.undo_rematch_action, "undo"), (self.lock_checkbox, "lock"),
+            (self.show_highlights_checkbox, "eye"), (self.blink_checkbox, "blink"),
+            (self.table_cells_action, "table"), (self.matched_action, "match"),
+            (self.zoom_in_action, "zoom-in"), (self.zoom_out_action, "zoom-out"), (self.fit_action, "fit-width"),
+        ):
+            icons.bind(action, name)
+
+    def _brand(self) -> QWidget:
+        """App mark and name at the start of the toolbar."""
+        brand = QWidget()
+        layout = QHBoxLayout(brand)
+        layout.setContentsMargins(2, 0, 14, 0)
+        layout.setSpacing(8)
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        logo_path = os.path.join(base_dir, "assets", "icon.png")
+        if os.path.exists(logo_path):
+            logo = QLabel()
+            ratio = self.devicePixelRatioF() or 1.0
+            pixmap = QPixmap(logo_path).scaled(
+                round(26 * ratio), round(26 * ratio),
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+            )
+            pixmap.setDevicePixelRatio(ratio)
+            logo.setPixmap(pixmap)
+            layout.addWidget(logo)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        name = QLabel("DocForensics")
+        name.setObjectName("brandName")
+        sub_name = QLabel("Analyzer")
+        sub_name.setObjectName("brandSub")
+        names.addWidget(name)
+        names.addWidget(sub_name)
+        layout.addLayout(names)
+        return brand
+
     def _build_toolbar(self) -> None:
+        self._icon_actions()
         toolbar = QToolBar("Main", self)
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.setIconSize(QSize(17, 17))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        toolbar.addWidget(self._brand())
 
         self.compare_button = QPushButton("Compare")
         self.compare_button.setObjectName("primary")
+        self.compare_button.setToolTip("Compare the Original and Suspect documents (F5)")
+        self.compare_button.setIconSize(QSize(16, 16))
+        icons.bind(self.compare_button, "compare", "accent_text")
         self.compare_button.clicked.connect(self.on_compare_clicked)
         toolbar.addWidget(self.compare_button)
 
         self.crop_button = QPushButton("Crop Margins")
         self.crop_button.setEnabled(False)
-        self.crop_button.setToolTip("Define header, footer, and side margin regions to exclude from comparison.")
+        self.crop_button.setToolTip(
+            "Define header, footer, and side margin regions to exclude from comparison (Ctrl+M)."
+        )
+        self.crop_button.setIconSize(QSize(16, 16))
+        icons.bind(self.crop_button, "crop")
         self.crop_button.clicked.connect(self.on_crop_clicked)
         toolbar.addWidget(self.crop_button)
 
@@ -598,20 +676,25 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.next_action)
         for action in (self.prev_action, self.next_action):
             toolbar.widgetForAction(action).setProperty("flat", True)
-        self.prev_action.setText("\u2039 Previous")
-        self.next_action.setText("Next \u203a")
+        self.prev_action.setIconText("Previous")
+        self.next_action.setIconText("Next")
         toolbar.addSeparator()
         for action, label in ((self.rematch_action, "Rematch"), (self.rematch_areas_action, "Rematch Areas")):
             toolbar.addAction(action)
             toolbar.widgetForAction(action).setProperty("flat", True)
             action.setIconText(label)
         toolbar.addSeparator()
-        for action in (self.lock_checkbox, self.show_highlights_checkbox, self.blink_checkbox):
+        for action in (
+            self.lock_checkbox, self.show_highlights_checkbox, self.matched_action, self.blink_checkbox,
+            self.table_cells_action,
+        ):
             toolbar.addAction(action)
             toolbar.widgetForAction(action).setProperty("flat", True)
         self.lock_checkbox.setIconText("Lock views")
         self.show_highlights_checkbox.setIconText("Highlights")
         self.blink_checkbox.setIconText("Blink")
+        self.table_cells_action.setIconText("Table Cells")
+        self.matched_action.setIconText("Matched")
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -620,8 +703,10 @@ class MainWindow(QMainWindow):
         reviewer_label.setObjectName("muted")
         toolbar.addWidget(reviewer_label)
         self.reviewer_edit = QLineEdit()
-        self.reviewer_edit.setFixedWidth(160)
+        self.reviewer_edit.setFixedWidth(170)
         self.reviewer_edit.setPlaceholderText("Your name")
+        reviewer_icon = self.reviewer_edit.addAction(icons.icon("user", "muted"), QLineEdit.ActionPosition.LeadingPosition)
+        theme.manager().changed.connect(lambda: reviewer_icon.setIcon(icons.icon("user", "muted")))
         self.reviewer_edit.setToolTip("Name recorded with every Accept/Reject decision.")
         toolbar.addWidget(self.reviewer_edit)
 
@@ -718,7 +803,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(" \u2194 ".join(names) + f" \u2014 {APP_NAME}" if names else APP_NAME)
 
     def _update_review_actions(self) -> None:
-        total = len(self.results_panel.all_items())
+        # Formatting extras (spacing, bullets, header/footer repeats) are
+        # listed apart and not counted.
+        total = len(self.results_panel.counted_items())
         unique = self.results_panel.unique_item_count()
         self.results_dock.setWindowTitle(f"Deviations · {total} ({unique} unique)" if total else "Deviations")
         self.toggle_deviations_action.setText(f"&Deviation List ({total} · {unique} unique)" if total else "&Deviation List")
@@ -775,6 +862,9 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self._update_compare_enabled()
         self._start_extraction(path)
+        for panel in (self.original_panel, self.suspect_panel):
+            if panel.file_path == path:
+                panel.set_crop((self._crop_data or {}).get(path, {}))
 
     def _on_document_loading(self, path: str) -> None:
         self._token_map = None
@@ -873,6 +963,10 @@ class MainWindow(QMainWindow):
         if dialog.exec() == CropDialog.DialogCode.Accepted:
             self._crop_data = dialog.get_crop_data()
             self._draw_crop_overlays_on_panels()
+            # Start reading the kept part now, so Compare need not wait.
+            for path, crop in self._crop_data.items():
+                if crop:
+                    self.extraction_cache.extraction_for(path, crop=crop)
             if self._crop_data:
                 n_orig = len(self._crop_data.get(self.original_panel.file_path or "", {}))
                 n_susp = len(self._crop_data.get(self.suspect_panel.file_path or "", {}))
@@ -885,6 +979,9 @@ class MainWindow(QMainWindow):
 
     def _draw_crop_overlays_on_panels(self) -> None:
         """Draw semi-transparent red crop overlays on the main document panels."""
+        for panel in (self.original_panel, self.suspect_panel):
+            # The table outlines are worked out from the kept part too.
+            panel.set_crop((self._crop_data or {}).get(panel.file_path or "", {}))
         if self.original_panel.file_path:
             self.original_panel.draw_crop_overlays(
                 self._crop_data.get(self.original_panel.file_path, {})
@@ -919,14 +1016,21 @@ class MainWindow(QMainWindow):
         self._blink_timer.stop()
         self.original_panel.clear_overlays()
         self.suspect_panel.clear_overlays()
+        self.original_panel.clear_matched()
+        self.suspect_panel.clear_matched()
 
         approved_path = self.original_panel.file_path
         suspect_path = self.suspect_panel.file_path
         worker = DiffWorker(
             approved_path,
             suspect_path,
-            approved_extraction=self.extraction_cache.extraction_for(approved_path),
-            suspect_extraction=self.extraction_cache.extraction_for(suspect_path),
+            # Each document read with its own crop (none: the whole page).
+            approved_extraction=self.extraction_cache.extraction_for(
+                approved_path, crop=self._crop_data.get(approved_path) if self._crop_data else None
+            ),
+            suspect_extraction=self.extraction_cache.extraction_for(
+                suspect_path, crop=self._crop_data.get(suspect_path) if self._crop_data else None
+            ),
             crop_data=self._crop_data if self._crop_data else None,
         )
         worker.signals.found.connect(self.on_differences_found)
@@ -996,6 +1100,7 @@ class MainWindow(QMainWindow):
                     items=panel.all_items(),
                     decision_of=panel.decision,
                     category_of=panel.category,
+                    is_extra=panel.is_extra,
                     reviewer=panel.reviewer,
                     app_version=APP_VERSION,
                     warnings=panel.warnings(),
@@ -1013,7 +1118,7 @@ class MainWindow(QMainWindow):
         if self._active_worker is None:
             return  # the comparison already finished or was cancelled
         self.results_panel.append_results(found)
-        total = len(self.results_panel.all_items())
+        total = len(self.results_panel.counted_items())
         noun = "difference" if total == 1 else "differences"
         self.status_label.setText(f"Comparing... {total} {noun} so far.")
 
@@ -1026,6 +1131,7 @@ class MainWindow(QMainWindow):
         self._rematch_context = None  # rebuilt lazily for these documents
         self._map_undo = []
         self.results_panel.set_token_map(result.token_map)
+        self._redraw_matched()
         self._update_compare_enabled()
         self._blink_visible = True
         self._refresh_busy()
@@ -1033,6 +1139,8 @@ class MainWindow(QMainWindow):
         # have been accepted, rejected or viewed.
         self.results_panel.set_results(results, keep_review=True)
         self.results_panel.set_warnings(result.warnings)
+        if result.warnings and self.results_dock.height() < _DOCK_HEIGHT:
+            self.resizeDocks([self.results_dock], [_DOCK_HEIGHT], Qt.Orientation.Vertical)
         self._review_key = result.review_key
         restored = (
             self.results_panel.restore_review(self._review_store.load(self._review_key))
@@ -1040,11 +1148,14 @@ class MainWindow(QMainWindow):
         )
         self.export_action.setEnabled(True)
         if results:
-            noun = "difference" if len(results) == 1 else "differences"
-            critical = sum(1 for d in results if d.severity == "critical")
+            counted = self.results_panel.counted_items()
+            extras = len(results) - len(counted)
+            noun = "difference" if len(counted) == 1 else "differences"
+            critical = sum(1 for d in counted if d.severity == "critical")
             unique = self.results_panel.unique_item_count()
             self.status_label.setText(
-                f"{len(results)} {noun} found ({unique} unique) \u00b7 {critical} critical."
+                f"{len(counted)} {noun} found ({unique} unique) \u00b7 {critical} critical."
+                + (f" {extras} formatting extra(s) (spacing, bullets, header/footer repeats) listed apart." if extras else "")
                 + (f" Restored {restored} earlier decision(s) for these files." if restored else "")
                 + (
                     f" Repeated page headers/footers compared once: {'; '.join(result.furniture)}."
@@ -1073,6 +1184,15 @@ class MainWindow(QMainWindow):
             self._blink_timer.stop()
         if result.serious_warning:
             self._show_coverage_warning(result.warnings)
+
+    def _redraw_matched(self, *_args) -> None:
+        """The light-green "same in both" tint, from the current word
+        pairing (redrawn after a comparison and every rematch or undo)."""
+        for panel, side in ((self.original_panel, APPROVED), (self.suspect_panel, SUSPECT)):
+            if self._token_map is None or not self.matched_action.isChecked():
+                panel.clear_matched()
+            else:
+                panel.draw_matched(self._token_map.matched_boxes(side))
 
     def _redraw_overlays(self) -> None:
         """Highlight on the documents exactly the differences the list
@@ -1255,6 +1375,24 @@ class MainWindow(QMainWindow):
             finally:
                 self._syncing_views = False
 
+    def _on_table_cells_toggled(self, shown: bool) -> None:
+        for panel in (self.original_panel, self.suspect_panel):
+            panel.set_table_cells_visible(shown)
+        if not shown:
+            self.status_label.setText("Table cells hidden.")
+            return
+        without = [
+            panel._title for panel in (self.original_panel, self.suspect_panel)
+            if panel.file_path and not panel.table_cells_available()
+        ]
+        note = (
+            f" {' and '.join(without)}: no fixed pages to analyze (approximate layout)." if without else ""
+        )
+        self.status_label.setText(
+            "Table cells: blue = read cell by cell, purple = a table inside another table's cell, "
+            "grey dashes = found but read as ordinary text." + note
+        )
+
     def _on_lock_toggled(self, locked: bool) -> None:
         if locked:
             self._match_zoom(self._active_panel)
@@ -1305,17 +1443,18 @@ class MainWindow(QMainWindow):
             self._syncing_views = False
 
     def _on_viewer_clicked(self, panel: DocumentPanel, page: int, x: float, y: float) -> None:
-        """A click on a page.
+        """A click on a page -- following the comparison's own pairing,
+        nothing else, so a reviewer sees exactly which word was matched
+        to which.
 
-        * Text that exists in the other document (matched by the
-          comparison, or found there by its surrounding phrase): both
-          words are marked and the other viewer goes to it. A word found
-          only by its phrase that lies in a highlighted difference also
-          selects that row.
-        * Otherwise, a highlighted difference under the click selects
-          its row and navigates both viewers to it.
-        * Otherwise the other viewer stays where it is -- it is never
-          sent to unrelated text -- and the status bar says why.
+        * A matched word (shown green): both words are marked and the
+          other viewer goes to the word it was matched with.
+        * Any other word is in a difference row: that row is selected and
+          both viewers go to it -- the other document's text, or where it
+          is missing there -- highlights shown or not.
+        * Never to the same phrase found elsewhere: a click once jumped to
+          a similar paragraph the comparison had not paired, which showed
+          a reviewer a match that was never made.
         """
         self._active_panel = panel
         other = self._other(panel)
@@ -1334,11 +1473,12 @@ class MainWindow(QMainWindow):
             return
 
         index = self._token_map.token_at(side, page, x, y)
-        other_index, kind = (None, None) if index is None else self._token_map.counterpart(side, index)
+        other_index, _kind = (None, None) if index is None else self._token_map.counterpart(side, index)
 
         if other_index is None:
-            if item is not None:
-                self._activate_from_viewer(item, panel)
+            row = self._row_of_word(side, index) if index is not None else None
+            if row is not None or item is not None:
+                self._activate_from_viewer(row or item, panel)
                 return
             self.original_panel.clear_highlight()
             self.suspect_panel.clear_highlight()
@@ -1361,12 +1501,17 @@ class MainWindow(QMainWindow):
         there = self._token_map.location(self._side(other), other_index)
         if there is not None:
             other.highlight_location(there, style="sync")
-        message = f"Showing the same text in the {self._title(other)}"
-        if kind == CONTEXT:
-            message += " (found by its surrounding words; the comparison paired this passage differently)"
-        if kind == CONTEXT and item is not None and self.results_panel.select_item(item):
-            message += "; its flagged difference is selected below"
-        self.status_label.setText(message + ".")
+        self.status_label.setText(f"Showing the word this one was matched with in the {self._title(other)}.")
+
+    def _row_of_word(self, side: str, index: int) -> DiffItem | None:
+        """The difference row holding word ``index`` of ``side`` (by the
+        row's own words), or None."""
+        token = self._token_map.tokens(side)[index]
+        for item in self.results_panel.all_items():
+            span = item.approved_span if side == APPROVED else item.suspect_span
+            if span and any(t is token for t in span):
+                return item
+        return None
 
     def _on_viewer_double_clicked(
         self, panel: DocumentPanel, page: int, x: float, y: float
@@ -1428,6 +1573,7 @@ class MainWindow(QMainWindow):
         self._map_undo.append(None)  # the word pairing is left as it was
         self._diff_results = self.results_panel.all_items()
         self._redraw_overlays()
+        self._redraw_matched()
         shown = bool(replacements) and self.results_panel.select_item(replacements[0])
         if replacements and not shown:
             self.status_label.setText(
@@ -1449,6 +1595,7 @@ class MainWindow(QMainWindow):
             self._token_map.restore(snapshot)
         self._diff_results = self.results_panel.all_items()
         self._redraw_overlays()
+        self._redraw_matched()
         if item is not None:
             self.results_panel.select_item(item)
         self.status_label.setText("Rematch undone -- the differences are back as they were.")
@@ -1493,6 +1640,7 @@ class MainWindow(QMainWindow):
         self._clear_areas(quiet=True)
         self._diff_results = self.results_panel.all_items()
         self._redraw_overlays()
+        self._redraw_matched()
         shown = bool(replacements) and self.results_panel.select_item(replacements[0])
         message = result.message
         if replacements and not shown:

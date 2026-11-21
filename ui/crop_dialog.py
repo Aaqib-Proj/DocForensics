@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ui import theme
+
 logger = logging.getLogger(__name__)
 
 RENDER_DPI_SCALE = 200 / 72
@@ -59,129 +61,52 @@ _HANDLE_BG_BRUSH = QBrush(QColor(198, 40, 40, 230))
 _HANDLE_BORDER_PEN = QPen(QColor(255, 255, 255, 210), 1)
 _HANDLE_BORDER_PEN.setCosmetic(True)
 
-_DIALOG_STYLE = """
-    QDialog {
-        background-color: #1e1e1e;
-        color: #e0e0e0;
-    }
-    QLabel {
-        color: #e0e0e0;
-        font-size: 13px;
-    }
-    QPushButton {
-        background-color: #2d2d30;
-        color: #f0f0f0;
-        border: 1px solid #3e3e42;
-        border-radius: 5px;
-        padding: 5px 12px;
-        font-size: 12px;
-    }
-    QPushButton:hover {
-        background-color: #3e3e42;
-        border-color: #007acc;
-    }
-    QPushButton:pressed {
-        background-color: #007acc;
-        color: white;
-    }
-    QPushButton:disabled {
-        background-color: #252526;
-        color: #656565;
-        border-color: #2d2d30;
-    }
-    QDoubleSpinBox {
-        background-color: #252526;
-        color: #ffffff;
-        border: 1px solid #3e3e42;
-        border-radius: 4px;
-        padding: 3px 6px;
-        font-size: 12px;
-        font-weight: bold;
-    }
-    QDoubleSpinBox:focus {
-        border-color: #007acc;
-    }
-    QGraphicsView {
-        border: 1px solid #3e3e42;
-        border-radius: 4px;
-        background-color: #141414;
-    }
+# Styles follow the app theme (ui/theme.py): the dialog used to be dark
+# whatever the theme, and stood out from everything else in light mode.
+# Why a loaded document has no pages here.
+_NOT_CROPPABLE = (
+    "This document has no fixed pages to crop: a PowerPoint or Excel file, or a "
+    "Word document shown in its approximate layout because neither Microsoft Word "
+    "nor LibreOffice is installed."
+)
+
+
+def _dialog_style(t) -> str:
+    return f"""
+    QDoubleSpinBox {{ font-weight: 600; }}
+    QGraphicsView {{ border: 1px solid {t.border}; border-radius: 6px; background-color: {t.canvas}; }}
 """
 
-_ACTIVE_DOC_BTN = """
-    QPushButton {
-        background-color: #007acc;
-        color: white;
-        border: 2px solid #0098ff;
-        border-radius: 6px;
-        padding: 7px 18px;
-        font-weight: bold;
-        font-size: 13px;
-    }
+
+def _active_doc_btn(t) -> str:
+    return f"""
+    QPushButton {{ background-color: {t.accent}; color: {t.accent_text}; border: 1px solid {t.accent};
+        border-radius: 6px; padding: 6px 16px; font-weight: 600; }}
 """
 
-_INACTIVE_DOC_BTN = """
-    QPushButton {
-        background-color: #2d2d30;
-        color: #aaaaaa;
-        border: 1px solid #3e3e42;
-        border-radius: 6px;
-        padding: 7px 18px;
-        font-size: 13px;
-    }
-    QPushButton:hover {
-        background-color: #3e3e42;
-        color: white;
-    }
+
+def _inactive_doc_btn(t) -> str:
+    return f"""
+    QPushButton {{ background-color: {t.surface}; color: {t.muted}; border: 1px solid {t.border_strong};
+        border-radius: 6px; padding: 6px 16px; }}
+    QPushButton:hover {{ background-color: {t.hover}; color: {t.text}; }}
 """
 
-_APPLY_ALL_BTN_STYLE = """
-    QPushButton {
-        background-color: #2e7d32;
-        color: white;
-        border: 1px solid #388e3c;
-        border-radius: 6px;
-        padding: 7px 18px;
-        font-weight: bold;
-        font-size: 12px;
-    }
-    QPushButton:hover {
-        background-color: #388e3c;
-    }
-    QPushButton:pressed {
-        background-color: #1b5e20;
-    }
+
+def _apply_all_btn(t) -> str:
+    return f"""
+    QPushButton {{ background-color: {t.success}; color: #ffffff; border: 1px solid {t.success};
+        border-radius: 6px; padding: 6px 16px; font-weight: 600; }}
+    QPushButton:hover {{ background-color: {t.success}; border-color: {t.text}; }}
 """
 
-_CLEAR_BTN_STYLE = """
-    QPushButton {
-        background-color: #424242;
-        color: #ef9a9a;
-        border: 1px solid #616161;
-        border-radius: 4px;
-        padding: 4px 8px;
-        font-size: 11px;
-    }
-    QPushButton:hover {
-        background-color: #c62828;
-        color: white;
-        border-color: #d32f2f;
-    }
-"""
 
-_DONE_BTN_STYLE = """
-    QPushButton {
-        background-color: #007acc;
-        color: white;
-        border: 1px solid #0098ff;
-        border-radius: 6px;
-        padding: 8px 24px;
-        font-weight: bold;
-        font-size: 13px;
-    }
-    QPushButton:hover {
-        background-color: #1f8ad2;
-    }
+def _clear_btn(t) -> str:
+    return f"""
+    QPushButton {{ background-color: transparent; color: {t.danger}; border: 1px solid {t.border_strong};
+        border-radius: 6px; padding: 4px 8px; }}
+    QPushButton:hover {{ background-color: {t.danger}; color: #ffffff; border-color: {t.danger}; }}
+    QPushButton:disabled {{ color: {t.border_strong}; background-color: transparent; }}
 """
 
 
@@ -404,7 +329,7 @@ class CropDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Crop Margins (Header / Footer / Sides)")
-        self.setStyleSheet(_DIALOG_STYLE)
+        self.setStyleSheet(_dialog_style(theme.tokens()))
         self.setMinimumSize(980, 720)
         if parent:
             self.resize(min(1280, parent.width() - 20), min(900, parent.height() - 20))
@@ -457,13 +382,23 @@ class CropDialog(QDialog):
             return None
         if os.path.isfile(path) and path.lower().endswith(".pdf"):
             return path
+        # A Word document is shown and compared through the PDF Word (or
+        # LibreOffice) laid it out as: crop that same PDF, so the margins
+        # drawn here are the ones the comparison and the viewer use. (This
+        # used to import a helper that did not exist, the error was
+        # swallowed, and no Word document could be cropped.)
         try:
-            from core.document_extractor import _ensure_pdf_available
-            converted = _ensure_pdf_available(path)
+            from core.document_extractor import document_kind, layout_pdf_path
+            from core.office_convert import cached_pdf_path
+
+            if document_kind(path) != "docx":
+                return None  # PowerPoint/Excel have no fixed pages to crop
+            cached = cached_pdf_path(path)
+            converted = cached if os.path.isfile(cached) else layout_pdf_path(path)
             if converted and os.path.isfile(converted):
                 return converted
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 -- shown as "cannot crop" below
+            logger.exception("CropDialog: could not lay out %s", path)
         return None
 
     def _load_doc_metadata(self, path: str) -> None:
@@ -543,12 +478,16 @@ class CropDialog(QDialog):
 
         if not self._original_path or self._original_path not in self._doc_meta:
             self._orig_btn.setEnabled(False)
+            if self._original_path:
+                self._orig_btn.setToolTip(_NOT_CROPPABLE)
         else:
             cnt = self._doc_meta[self._original_path]["page_count"]
             self._orig_btn.setText(f"Original ({cnt} pgs)")
 
         if not self._suspect_path or self._suspect_path not in self._doc_meta:
             self._susp_btn.setEnabled(False)
+            if self._suspect_path:
+                self._susp_btn.setToolTip(_NOT_CROPPABLE)
         else:
             cnt = self._doc_meta[self._suspect_path]["page_count"]
             self._susp_btn.setText(f"Suspect ({cnt} pgs)")
@@ -610,7 +549,7 @@ class CropDialog(QDialog):
 
         # Header Crop Spinbox
         h_label = QLabel("<b>Header:</b>")
-        h_label.setStyleSheet("color: #ff8a80;")
+        h_label.setStyleSheet(f"color: {theme.tokens().danger}; font-weight: 600;")
         self._header_spin = QDoubleSpinBox()
         self._header_spin.setRange(0.0, 5000.0)
         self._header_spin.setDecimals(1)
@@ -622,7 +561,7 @@ class CropDialog(QDialog):
         self._clear_h_btn = QPushButton("✕")
         self._clear_h_btn.setToolTip("Reset Header crop to 0 pt")
         self._clear_h_btn.setFixedWidth(28)
-        self._clear_h_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_h_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_h_btn.clicked.connect(self._clear_header)
 
         margins_bar.addWidget(h_label)
@@ -632,7 +571,7 @@ class CropDialog(QDialog):
 
         # Footer Crop Spinbox
         f_label = QLabel("<b>Footer:</b>")
-        f_label.setStyleSheet("color: #ff8a80;")
+        f_label.setStyleSheet(f"color: {theme.tokens().danger}; font-weight: 600;")
         self._footer_spin = QDoubleSpinBox()
         self._footer_spin.setRange(0.0, 5000.0)
         self._footer_spin.setDecimals(1)
@@ -644,7 +583,7 @@ class CropDialog(QDialog):
         self._clear_f_btn = QPushButton("✕")
         self._clear_f_btn.setToolTip("Reset Footer crop to 0 pt")
         self._clear_f_btn.setFixedWidth(28)
-        self._clear_f_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_f_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_f_btn.clicked.connect(self._clear_footer)
 
         margins_bar.addWidget(f_label)
@@ -654,7 +593,7 @@ class CropDialog(QDialog):
 
         # Left Crop Spinbox
         l_label = QLabel("<b>Left:</b>")
-        l_label.setStyleSheet("color: #ff8a80;")
+        l_label.setStyleSheet(f"color: {theme.tokens().danger}; font-weight: 600;")
         self._left_spin = QDoubleSpinBox()
         self._left_spin.setRange(0.0, 5000.0)
         self._left_spin.setDecimals(1)
@@ -666,7 +605,7 @@ class CropDialog(QDialog):
         self._clear_l_btn = QPushButton("✕")
         self._clear_l_btn.setToolTip("Reset Left side crop to 0 pt")
         self._clear_l_btn.setFixedWidth(28)
-        self._clear_l_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_l_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_l_btn.clicked.connect(self._clear_left)
 
         margins_bar.addWidget(l_label)
@@ -676,7 +615,7 @@ class CropDialog(QDialog):
 
         # Right Crop Spinbox
         r_label = QLabel("<b>Right:</b>")
-        r_label.setStyleSheet("color: #ff8a80;")
+        r_label.setStyleSheet(f"color: {theme.tokens().danger}; font-weight: 600;")
         self._right_spin = QDoubleSpinBox()
         self._right_spin.setRange(0.0, 5000.0)
         self._right_spin.setDecimals(1)
@@ -688,7 +627,7 @@ class CropDialog(QDialog):
         self._clear_r_btn = QPushButton("✕")
         self._clear_r_btn.setToolTip("Reset Right side crop to 0 pt")
         self._clear_r_btn.setFixedWidth(28)
-        self._clear_r_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_r_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_r_btn.clicked.connect(self._clear_right)
 
         margins_bar.addWidget(r_label)
@@ -700,7 +639,7 @@ class CropDialog(QDialog):
         self._tip_label = QLabel(
             "💡 <b>Drag the red dotted lines</b> (or use spinboxes) to set Header, Footer, and Side crops."
         )
-        self._tip_label.setStyleSheet("color: #90caf9; font-size: 12px;")
+        self._tip_label.setStyleSheet(f"color: {theme.tokens().accent};")
         margins_bar.addWidget(self._tip_label, stretch=1)
 
         layout.addLayout(margins_bar)
@@ -720,7 +659,7 @@ class CropDialog(QDialog):
         action_bar.setSpacing(10)
 
         self._apply_all_btn = QPushButton("✓ Apply to All Pages")
-        self._apply_all_btn.setStyleSheet(_APPLY_ALL_BTN_STYLE)
+        self._apply_all_btn.setStyleSheet(_apply_all_btn(theme.tokens()))
         self._apply_all_btn.setToolTip("Apply these margin crops (Header, Footer, Left, Right) to all pages in this document.")
         self._apply_all_btn.clicked.connect(self._apply_to_all_pages)
 
@@ -728,12 +667,12 @@ class CropDialog(QDialog):
         self._apply_page_btn.clicked.connect(self._apply_to_current_page)
 
         self._clear_page_btn = QPushButton("Clear This Page")
-        self._clear_page_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_page_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_page_btn.setToolTip("Clear all 4 margin crops on the current page.")
         self._clear_page_btn.clicked.connect(self._clear_current_page)
 
         self._clear_all_btn = QPushButton("Clear All Pages")
-        self._clear_all_btn.setStyleSheet(_CLEAR_BTN_STYLE)
+        self._clear_all_btn.setStyleSheet(_clear_btn(theme.tokens()))
         self._clear_all_btn.setToolTip("Clear all margin crops across all pages of this document.")
         self._clear_all_btn.clicked.connect(self._clear_all_crops)
 
@@ -749,7 +688,7 @@ class CropDialog(QDialog):
         cancel_btn.setFixedWidth(80)
 
         self._done_btn = QPushButton("Done - Save Crops")
-        self._done_btn.setStyleSheet(_DONE_BTN_STYLE)
+        self._done_btn.setObjectName("primary")
         self._done_btn.clicked.connect(self.accept)
 
         action_bar.addWidget(cancel_btn)
@@ -789,11 +728,11 @@ class CropDialog(QDialog):
     def _switch_to(self, which: str) -> None:
         self._active_doc = which
         if which == "original":
-            self._orig_btn.setStyleSheet(_ACTIVE_DOC_BTN)
-            self._susp_btn.setStyleSheet(_INACTIVE_DOC_BTN)
+            self._orig_btn.setStyleSheet(_active_doc_btn(theme.tokens()))
+            self._susp_btn.setStyleSheet(_inactive_doc_btn(theme.tokens()))
         else:
-            self._orig_btn.setStyleSheet(_INACTIVE_DOC_BTN)
-            self._susp_btn.setStyleSheet(_ACTIVE_DOC_BTN)
+            self._orig_btn.setStyleSheet(_inactive_doc_btn(theme.tokens()))
+            self._susp_btn.setStyleSheet(_active_doc_btn(theme.tokens()))
 
         path = self._current_path()
         if not path or path not in self._doc_meta:

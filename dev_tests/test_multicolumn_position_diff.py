@@ -206,9 +206,10 @@ class TestMulticolumnAndPositionAgnosticDiff(unittest.TestCase):
         self.assertEqual(len(dose_diffs), 1)
         self.assertEqual(dose_diffs[0].severity, "critical")
 
-        # Moved sections must be flagged as reorder/reordered_section
-        reordered = [d for d in diffs if d.severity == "reorder"]
-        self.assertTrue(len(reordered) >= 1)
+        # Moved sections are not a difference: matched where they stand, no
+        # "moved" rows -- only the edit above is reported for them.
+        moved = [d for d in diffs if d.severity == "reorder" or d.kind.startswith("reordered")]
+        self.assertEqual(moved, [])
 
     def test_multicolumn_proof_with_nested_label_value_tables(self):
         """Test a 2-column proof sheet containing an insert column next to an agreement with
@@ -492,12 +493,11 @@ class TestMulticolumnAndPositionAgnosticDiff(unittest.TestCase):
         susp_tokens = build_comparison_tokens(susp_words)
         diffs = diff_documents(app_tokens, susp_tokens)
 
-        # There should be 0 critical differences; the moved section is reported as reordered_section
+        # There should be 0 critical differences; the moved section is matched, not reported
         criticals = [d for d in diffs if d.severity == "critical"]
         self.assertEqual(len(criticals), 0, f"Expected 0 critical diffs for moved section, got: {criticals}")
-        reordered = [d for d in diffs if d.kind == "reordered_section"]
-        reordered = [d for d in diffs if d.kind == "reordered_section"]
-        self.assertTrue(len(reordered) >= 1, "Expected reordered_section for relocated Billing Rights")
+        moved = [d for d in diffs if d.kind.startswith("reordered")]
+        self.assertEqual(moved, [], "A relocated section is matched where it stands, not a 'moved' row")
 
     def test_renumbered_and_swapped_subsections(self):
         """Test that renumbered/swapped subsections (e.g. 5.1 Ketoacidosis <-> 5.2 Ketoacidosis,
@@ -566,14 +566,14 @@ class TestMulticolumnAndPositionAgnosticDiff(unittest.TestCase):
         susp_tokens = build_comparison_tokens(susp_words)
         diffs = diff_documents(app_tokens, susp_tokens)
 
-        # Pancreatitis was relocated/swapped, so it emits a reordered_section diff
-        reordered = [d for d in diffs if d.kind == "reordered_section"]
-        self.assertEqual(len(reordered), 1, "Swapped Pancreatitis should be detected as reordered_section")
+        # Pancreatitis was relocated/swapped: matched where it stands, no "moved" row
+        moved = [d for d in diffs if d.kind.startswith("reordered")]
+        self.assertEqual(moved, [], "Swapped Pancreatitis is matched, not reported as moved")
 
         # Pancreatitis body is identical -> only the section number differs, no cross-topic body diffs
         panc_body_diffs = [
             d for d in diffs
-            if "pancreatitis" in (d.approved_text + d.suspect_text).lower() and d.kind != "reordered_section"
+            if "pancreatitis" in (d.approved_text + d.suspect_text).lower()
         ]
         self.assertEqual(len(panc_body_diffs), 0, "Pancreatitis body must match cleanly with no cross-topic diffs")
 

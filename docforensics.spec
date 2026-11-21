@@ -30,6 +30,7 @@ datas = [
 hiddenimports = [
     "core",
     "core.char_compare",
+    "core.completeness",
     "core.coverage_check",
     "core.diff_engine",
     "core.document_extractor",
@@ -45,6 +46,7 @@ hiddenimports = [
     "core.review_store",
     "core.script_text",
     "core.section_diff",
+    "core.text_search",
     "core.token_map",
     "core.word_pool",
     "ui",
@@ -52,6 +54,7 @@ hiddenimports = [
     "ui.crop_dialog",
     "ui.document_panel",
     "ui.flow_layout",
+    "ui.icons",
     "ui.merge_dialog",
     "ui.results_panel",
     "ui.theme",
@@ -76,7 +79,7 @@ hiddenimports = [
     "win32com",
     "win32com.client",
     "pythoncom",
-] + collect_submodules("diff_match_patch") + collect_submodules("pymupdf")
+] + collect_submodules("core") + collect_submodules("ui") + collect_submodules("workers") + collect_submodules("diff_match_patch") + collect_submodules("pymupdf")
 
 # Exclude unrelated heavyweight machine learning & web packages present in local environment
 excludes = [

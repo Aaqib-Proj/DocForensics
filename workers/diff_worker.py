@@ -28,10 +28,11 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from core.coverage_check import coverage_is_serious, coverage_warnings
 from core.diff_engine import DiffItem, diff_documents
-from core.page_furniture import drop_repeated_furniture
+from core.completeness import furniture_rows, place_insertion_points, unaccounted_rows
+from core.page_furniture import drop_repeated_furniture, furniture_repeats
 from core.review_store import comparison_key
 from core.document_extractor import extract_document_tokens
-from core.token_map import TokenMap
+from core.token_map import APPROVED, SUSPECT, TokenMap
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,10 @@ class DiffWorker(QRunnable):
                 )
 
             # Running headers/footers repeated on every page: compare the
-            # first occurrence, drop the repeats (core/page_furniture.py).
+            # first occurrence, drop the repeats (core/page_furniture.py)
+            # -- which are then listed, one row per line, below.
+            repeats_a = furniture_repeats(approved_tokens, suspect_tokens)
+            repeats_b = furniture_repeats(suspect_tokens, approved_tokens)
             approved_tokens, furniture_a, suspect_tokens, furniture_b = (
                 *drop_repeated_furniture(approved_tokens, suspect_tokens),
                 *drop_repeated_furniture(suspect_tokens, approved_tokens),
@@ -149,6 +153,24 @@ class DiffWorker(QRunnable):
             items = diff_documents(
                 approved_tokens, suspect_tokens, matches, on_found=self._on_found
             )
+            token_map = TokenMap(approved_tokens, suspect_tokens, matches)
+            # Every word matched or listed -- never neither
+            # (core/completeness.py): the repeats set aside, then any word
+            # still unaccounted for.
+            self._progress("Checking every word is accounted for...")
+            extra = furniture_rows(repeats_a, APPROVED, len(items))
+            extra += furniture_rows(repeats_b, SUSPECT, len(items) + len(extra))
+            # Words left over join the row beside them (rows may merge, so
+            # the list itself is handed over and kept).
+            items = items + extra
+            new_rows = unaccounted_rows(items, token_map, len(items))
+            items = items + new_rows
+            extra += new_rows
+            if extra:
+                self._on_found(extra)
+            # Every row missing on one side marks where it belongs in the
+            # other document (never the same coordinates on another layout).
+            place_insertion_points(items, token_map)
             self._progress("Checking what could be compared...")
             warnings = coverage_warnings(
                 self.approved_path, self.suspect_path, approved_tokens, suspect_tokens
@@ -159,7 +181,7 @@ class DiffWorker(QRunnable):
                 review_key = ""
             result = ComparisonResult(
                 items,
-                TokenMap(approved_tokens, suspect_tokens, matches),
+                token_map,
                 warnings=warnings,
                 serious_warning=coverage_is_serious(approved_tokens, suspect_tokens),
                 review_key=review_key,

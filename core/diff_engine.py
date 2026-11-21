@@ -53,14 +53,14 @@ The ruleset below is a strict PRIORITY LADDER, most dangerous first:
 6. Anything else -- a genuine wording change -- "critical".
 
 Severity order for sorting/filtering purposes:
-    critical > major > minor > typo > reorder
+    critical > major > minor > typo
 
-The lowest tier, "reorder" (MVP-7), is produced by the pairing pass
-in `_downgrade_reorder_pairs`: identical text flagged removed on one
-side and added on the other is a reading-order artifact (a word that
-wrapped to an adjacent line, a column read in a marginally different
-order), not a content change. Those pairs are relabeled "reordered"
-and sorted to the bottom -- visible, never dropped.
+Text that only MOVED is not a difference at all (a concise version
+reorders text as a matter of course): `_pair_moved_text` pairs its words
+one for one, so it is matched like any other text, and only an edit
+inside it is reported -- see the note above that function. ("reorder"
+stays in SEVERITY_ORDER for reviews saved by earlier versions; nothing
+is rated so any more.)
 
 --------------------------------------------------------------------
 MVP-8: out-of-order section matching
@@ -101,27 +101,18 @@ documents contain at least two numbered section headers (e.g.
    in isolation (the same word-stream matcher, scoped to the
    section), so a moved section's genuine internal edits are still
    caught at their real severity -- while its identical words produce
-   nothing. Sections whose MATCHED POSITION RANK changed are reported
-   as one low-severity "reordered_section" item instead of critical
-   removed/added noise; sections present on only one side become a
-   single removed/added item (never a cascade).
-4. RELOCATION DEMOTION: `_downgrade_relocated_runs` demotes any
-   multi-word removed/added/replace run that exists VERBATIM
-   elsewhere in the other document to "reorder" -- the signature of
-   a section fragment printed in a different column (section 3's body
-   in a side panel), present on both sides but not at the same
-   position. Genuine single-word edits and runs that differ by even
-   one word stay at their real severity.
-
-5. MOVED-TEXT PASS: section chunking depends on header detection, and
+   nothing, wherever the section now stands; sections present on only
+   one side become a single removed/added item (never a cascade).
+4. MOVED-TEXT PASS: section chunking depends on header detection, and
    a print layout can defeat it -- e.g. a figure's axis label read as a
    heading swallows the rest of a section into an unrelated chunk.
    Whatever the section pairs leave unexplained (removed runs, added
    runs, both sides of replacements, unmatched sections) is searched
    for runs of `_MIN_MOVED_RUN_WORDS`+ identical words present on both
-   sides. Those are paired as moved text (one low-severity "reordered"
-   row per moved passage) and the remaining text is diffed again
-   without them, so only genuine differences are reported.
+   sides. Those are paired as moved text (matched, no row) and the
+   remaining text is diffed again without them, so only genuine
+   differences are reported. `_pair_moved_text` does the same, once
+   more, over everything still unexplained at the end.
 
 Documents without detected numbered headers (plain paragraphs, a
 single header, or tables) fall back to the original whole-stream
@@ -139,7 +130,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from core.pdf_extractor import ComparisonToken, Word
-from core.script_text import SCRIPT_DIGITS
+from core.script_text import _SUBSCRIPT_MAP, _SUPERSCRIPT_MAP, SCRIPT_DIGITS
 from core.section_diff import build_section_list, section_key
 
 # Map difflib opcodes -> a stable name for the UI/report layer.
@@ -248,6 +239,11 @@ class DiffItem:
     suspect_location: Optional[Location]
     approved_caret: Optional[Location] = None
     suspect_caret: Optional[Location] = None
+    # The words of each document this row stands for (None for a row not
+    # built from the word streams). Used once the comparison is done, to
+    # pair text that only moved (`_pair_moved_text`); never shown.
+    approved_span: Optional[list] = field(default=None, repr=False, compare=False)
+    suspect_span: Optional[list] = field(default=None, repr=False, compare=False)
 
 
 # (approved token, suspect token) pairs the matcher found identical.
@@ -273,9 +269,10 @@ def diff_documents(
 
     When BOTH documents contain at least two numbered section headers,
     the comparison runs per-section (see the MVP-8 module note): moved
-    sections are matched globally and reported as "reordered_section"
-    instead of removed/added cascades. Otherwise the whole-stream
-    word diff runs unchanged.
+    sections are matched globally and compared where they stand, not
+    reported as removed/added cascades. Otherwise the whole-stream
+    word diff runs unchanged. Either way, text that only moved is
+    paired, not reported (`_pair_moved_text`).
 
     If ``matches`` is given, every pair of tokens found identical (and
     therefore corresponding to each other) is appended to it -- the UI
@@ -301,6 +298,8 @@ def diff_documents(
         if worth_showing:
             on_found(worth_showing)
 
+    if matches is None:
+        matches = []  # moved text is paired through it (`_pair_moved_text`)
     _harmonize_line_break_hyphens(approved_tokens, suspect_tokens)
     sections_a = _split_sections(approved_tokens)
     sections_b = _split_sections(suspect_tokens)
@@ -310,7 +309,7 @@ def diff_documents(
         )
     whole = _diff_runs(approved_tokens, suspect_tokens, matches)
     _found(whole)
-    return _finalize_items(whole, approved_tokens, suspect_tokens)
+    return _finalize_items(whole, approved_tokens, suspect_tokens, matches)
 
 
 def _harmonize_line_break_hyphens(
@@ -341,6 +340,18 @@ def _harmonize_line_break_hyphens(
         for t in tokens
         if getattr(t, "line_break_hyphen", None) is None
     }
+    # Two words printed one after the other: a dash between them at a line
+    # end is not a word broken in two when the halves are words of their
+    # own and the joined word is printed nowhere -- "INFORMATION-" over
+    # "needed", a dash typed after a word that the line then broke at. Read
+    # stitched ("INFORMATIONneeded"), it compared as a spacing slip against
+    # "INFORMATION needed" and was dropped.
+    word_pairs = {
+        (_EDGE_PUNCTUATION.sub("", a.text), _EDGE_PUNCTUATION.sub("", b.text))
+        for tokens in (approved_tokens, suspect_tokens)
+        for a, b in zip(tokens, tokens[1:])
+        if getattr(a, "line_break_hyphen", None) is None and getattr(b, "line_break_hyphen", None) is None
+    }
     for tokens in (approved_tokens, suspect_tokens):
         for token in tokens:
             at = getattr(token, "line_break_hyphen", None)
@@ -352,7 +363,11 @@ def _harmonize_line_break_hyphens(
             # is evidence for "short-" + "term." as much as "short-term".
             with_hyphen = _EDGE_PUNCTUATION.sub("", hyphenated) in whole
             without = _EDGE_PUNCTUATION.sub("", stitched) in whole
-            token.text = hyphenated if with_hyphen and not without else stitched
+            apart = (
+                _EDGE_PUNCTUATION.sub("", stitched[:at]),
+                _EDGE_PUNCTUATION.sub("", stitched[at:]),
+            ) in word_pairs
+            token.text = hyphenated if (with_hyphen or apart) and not without else stitched
 
 
 # Punctuation at either end of a word (and nothing else).
@@ -429,6 +444,11 @@ def _items_from_opcodes(
 
         approved_slice = approved_tokens[i1:i2]
         suspect_slice = suspect_tokens[j1:j2]
+        if tag == "replace":
+            split = _split_artwork(approved_tokens, suspect_tokens, i1, i2, j1, j2, matches, len(items))
+            if split is not None:
+                items.extend(split)
+                continue
         # A "replace" spanning several words on each side is usually
         # several SEPARATE small edits sitting next to each other
         # (e.g. one word changed, then two words later another word
@@ -473,6 +493,59 @@ def _items_from_opcodes(
     return items
 
 
+def _split_artwork(
+    approved_tokens: list[ComparisonToken],
+    suspect_tokens: list[ComparisonToken],
+    i1: int, i2: int, j1: int, j2: int,
+    matches: Optional[TokenMatches],
+    base_index: int,
+) -> Optional[list[DiffItem]]:
+    """A replacement in which only ONE side holds an artwork sheet's box
+    (or its note) -- an outsert against the Word draft it was set from --
+    as rows: the box words deleted (or inserted) on their own, the rest
+    compared as usual. Set against the draft's text, the box read as a
+    "change" of "PRODUCT NAME" into "FDA-Approved Patient Labeling".
+    None when neither side, or both, hold artwork."""
+    a_art = [getattr(t, "artwork", False) for t in approved_tokens[i1:i2]]
+    b_art = [getattr(t, "artwork", False) for t in suspect_tokens[j1:j2]]
+    if any(a_art) == any(b_art):
+        return None
+    items: list[DiffItem] = []
+    if any(a_art):
+        rest = [t for t, art in zip(approved_tokens[i1:i2], a_art) if not art]
+        for start, stop in _flag_runs(a_art):
+            items.append(_make_diff_item(
+                "delete", approved_tokens[i1 + start:i1 + stop], [], index=base_index + len(items),
+                approved_tokens=approved_tokens, suspect_tokens=suspect_tokens,
+                i1=i1 + start, i2=i1 + stop, j1=j1, j2=j1,
+            ))
+        others = suspect_tokens[j1:j2]
+        items.extend(_items_from_opcodes(rest, others, _opcodes(rest, others), matches))
+    else:
+        rest = [t for t, art in zip(suspect_tokens[j1:j2], b_art) if not art]
+        for start, stop in _flag_runs(b_art):
+            items.append(_make_diff_item(
+                "insert", [], suspect_tokens[j1 + start:j1 + stop], index=base_index + len(items),
+                approved_tokens=approved_tokens, suspect_tokens=suspect_tokens,
+                i1=i1, i2=i1, j1=j1 + start, j2=j1 + stop,
+            ))
+        others = approved_tokens[i1:i2]
+        items.extend(_items_from_opcodes(others, rest, _opcodes(others, rest), matches))
+    return items
+
+
+def _flag_runs(flags: list[bool]) -> list[tuple[int, int]]:
+    """(start, stop) of each run of True in ``flags``."""
+    runs, start = [], None
+    for k, flag in enumerate(flags + [False]):
+        if flag and start is None:
+            start = k
+        elif not flag and start is not None:
+            runs.append((start, k))
+            start = None
+    return runs
+
+
 def _make_diff_item(
     tag: str,
     approved_slice: list[ComparisonToken],
@@ -503,6 +576,8 @@ def _make_diff_item(
         suspect_caret=(
             _caret_location(suspect_tokens, j1, j2) if suspect_location is None else None
         ),
+        approved_span=list(approved_slice),
+        suspect_span=list(suspect_slice),
     )
 
 
@@ -633,7 +708,48 @@ def _is_whitespace_artifact(item: DiffItem) -> bool:
 
 
 def _is_whitespace_only(approved: str, suspect: str) -> bool:
-    return approved != suspect and re.sub(r"\s+", "", approved) == re.sub(r"\s+", "", suspect)
+    """The same characters, spaced differently -- raised and lowered text
+    compared as written either way: "α_{2C}" (one lowered run) and "α₂
+    _{C}" (the same run split in two) are one subscript."""
+    if approved == suspect:
+        return False
+    if re.sub(r"\s+", "", approved) == re.sub(r"\s+", "", suspect):
+        return True
+    return _script_canonical(approved) == _script_canonical(suspect)
+
+
+# Each raised/lowered character -> (marker, the character it raises/lowers).
+_UNSCRIPT = {
+    **{raised: ("^", base) for base, raised in _SUPERSCRIPT_MAP.items()},
+    **{lowered: ("_", base) for base, lowered in _SUBSCRIPT_MAP.items()},
+}
+
+
+def _script_canonical(text: str, *, plain: bool = False) -> str:
+    """``text`` with every raised/lowered run written "^{...}" / "_{...}"
+    (neighbouring runs of a kind joined) and no whitespace; ``plain``
+    writes them as ordinary text instead."""
+    out = []
+    for ch in text:
+        marker, base = _UNSCRIPT.get(ch, (None, ch))
+        out.append(base if marker is None or plain else f"{marker}{{{base}}}")
+    canon = re.sub(r"\s+", "", "".join(out))
+    if plain:
+        return re.sub(r"[_^]\{([^}]*)\}", r"\1", canon)
+    previous = None
+    while previous != canon:
+        previous, canon = canon, re.sub(r"([_^])\{([^}]*)\}\1\{", r"\1{\2", canon)
+    return canon
+
+
+def _is_script_only(approved: str, suspect: str) -> bool:
+    """The same letters, only raised or lowered differently -- "Cmax" /
+    "Cₘₐₓ" -- with no digit among them: a lost subscript on a word is a
+    formatting slip, while "2⁴" / "24" or "H₂O" / "H2O" change a value and
+    are left to the number rules."""
+    if approved == suspect or _script_canonical(approved, plain=True) != _script_canonical(suspect, plain=True):
+        return False
+    return not any(ch.isdigit() or ch in SCRIPT_DIGITS for ch in approved + suspect)
 
 
 def _space_positions(text: str) -> set[int]:
@@ -657,140 +773,81 @@ def _finalize_items(
     items: list[DiffItem],
     approved_tokens: Optional[list[ComparisonToken]] = None,
     suspect_tokens: Optional[list[ComparisonToken]] = None,
+    matches: Optional[TokenMatches] = None,
 ) -> list[DiffItem]:
-    """Shared tail of every diff path: filter identical-text whitespace
-    artifacts, reorder-pair demotion, severity sort, and stable index
-    renumbering."""
+    """Shared tail of every diff path: text that only moved is paired
+    (`_pair_moved_text`), identical-text whitespace artifacts are
+    filtered, then severity sort and stable index renumbering.
+
+    Moved text is paired only for a whole comparison, which records the
+    pairs in ``matches`` (`diff_documents`). A rematch passes none: the
+    reviewer chose what to compare, and a pairing it could not keep would
+    only turn rows into unplaced fragments."""
+    if approved_tokens is not None and suspect_tokens is not None and matches is not None:
+        items = _pair_moved_text(items, approved_tokens, suspect_tokens, matches)
     items = [item for item in items if not _is_whitespace_artifact(item)]
-    items = _downgrade_reorder_pairs(items)
-    if approved_tokens is not None and suspect_tokens is not None:
-        _downgrade_relocated_runs(items, approved_tokens, suspect_tokens)
-        items = _deduplicate_reordered_pairs(items)
-        _locate_moved_counterparts(items, approved_tokens, suspect_tokens)
+    _rate_systematic_letter_loss(items)
     items.sort(key=lambda item: SEVERITY_ORDER.index(item.severity))
     for new_index, item in enumerate(items):
         item.index = new_index
     return items
 
 
-def _downgrade_reorder_pairs(items: list[DiffItem]) -> list[DiffItem]:
-    """Pair identical-text removals/additions and demote to 'reordered'.
-    Keeps only the Original reference, setting its suspect_location to the
-    paired addition's location and discarding the duplicate addition, so
-    reordered text is reported only ONCE rather than twice.
-    """
-    added_by_text: dict[str, list[DiffItem]] = {}
-    for i in items:
-        if i.kind == "added_in_suspect":
-            added_by_text.setdefault(i.suspect_text, []).append(i)
-
-    items_to_drop: set[int] = set()
-
-    for item in items:
-        if item.kind == "removed_in_suspect":
-            text = item.approved_text
-            matching_added = added_by_text.get(text)
-            if matching_added:
-                added_item = matching_added.pop(0)
-                item.kind = "reordered"
-                item.severity = "reorder"
-                item.suspect_text = added_item.suspect_text
-                item.suspect_location = added_item.suspect_location
-                item.suspect_caret = added_item.suspect_caret
-                items_to_drop.add(id(added_item))
-
-    return [i for i in items if id(i) not in items_to_drop]
+# Doubled-letter losses in longer words that show the text layer drops a
+# letter pair (its ligature glyph) throughout the document.
+_LETTER_LOSS_MIN_EVIDENCE = 3
+# Short words a lost letter can turn one into another -- never noise.
+_SHORT_WORDS = frozenset(
+    "a an as at be by do go he if in is it me my no of on or so to up us we "
+    "al am ad ed el em en er es ex"
+    .split()
+)
 
 
-def _deduplicate_reordered_pairs(items: list[DiffItem]) -> list[DiffItem]:
-    """Ensure that any text present on both sides as reordered is only listed
-    ONCE, anchored to the Original reference position with suspect_location set."""
-    added_reorders_by_text: dict[str, list[DiffItem]] = {}
-    for i in items:
-        if i.kind == "reordered" and not i.approved_text and i.suspect_text:
-            added_reorders_by_text.setdefault(i.suspect_text, []).append(i)
-
-    items_to_drop: set[int] = set()
-    for item in items:
-        if item.kind == "reordered" and item.approved_text and not item.suspect_text:
-            matching = added_reorders_by_text.get(item.approved_text)
-            if matching:
-                add_it = matching.pop(0)
-                item.suspect_text = add_it.suspect_text
-                item.suspect_location = add_it.suspect_location
-                item.suspect_caret = add_it.suspect_caret
-                items_to_drop.add(id(add_it))
-
-    return [i for i in items if id(i) not in items_to_drop]
-
-
-def _locate_moved_counterparts(
-    items: list[DiffItem],
-    approved_tokens: list[ComparisonToken],
-    suspect_tokens: list[ComparisonToken],
-) -> None:
-    """Give a one-sided "moved" row its other side: WHERE the passage
-    sits in the other document. Without it the row reads as text that is
-    simply missing on that side, and the reviewer cannot check the claim
-    that it moved rather than disappeared."""
-    used: dict[str, set[int]] = {"approved": set(), "suspect": set()}
-    for item in items:
-        if item.kind != "reordered":
-            continue
-        if item.approved_text and not item.suspect_text:
-            side, text, tokens = "suspect", item.approved_text, suspect_tokens
-        elif item.suspect_text and not item.approved_text:
-            side, text, tokens = "approved", item.suspect_text, approved_tokens
-        else:
-            continue
-        start = _find_token_run(tokens, text.split(), used[side])
-        if start is not None:
-            run = tokens[start:start + len(text.split())]
-        else:
-            # Found by its letters and digits (a heading whose dash rules
-            # differ in length): locate it the same way.
-            run = _find_alnum_run(tokens, text, used[side])
-            if not run:
-                continue
-            start = tokens.index(run[0])
-        used[side].add(start)
-        if side == "suspect":
-            item.suspect_text = text
-            item.suspect_location = _location_of(run)
-        else:
-            item.approved_text = text
-            item.approved_location = _location_of(run)
-
-
-def _find_alnum_run(tokens: list[ComparisonToken], text: str, taken: set[int]) -> list[ComparisonToken]:
-    """The shortest run of tokens whose letters and digits spell ``text``'s,
-    ignoring punctuation and case; [] when there is none."""
-    target = "".join(ch for ch in text if ch.isalnum()).casefold()
-    if len(target) < 12:
-        return []
-    keys = ["".join(ch for ch in t.text if ch.isalnum()).casefold() for t in tokens]
-    for i, key in enumerate(keys):
-        if i in taken or not key or not target.startswith(key):
-            continue
-        built, j = "", i
-        while j < len(tokens) and len(built) < len(target):
-            built += keys[j]
-            j += 1
-        if built == target:
-            return tokens[i:j]
-    return []
-
-
-def _find_token_run(tokens: list[ComparisonToken], words: list[str], taken: set[int]) -> Optional[int]:
-    if not words:
+def _lost_double(approved: str, suspect: str) -> Optional[tuple[str, str]]:
+    """(the letter, the side that lost it) when one side is the other with
+    one letter of a doubled pair gone ("well" / "wel": ("l", "suspect")),
+    else None."""
+    if " " in approved.strip() or " " in suspect.strip():
         return None
-    n = len(words)
-    for i in range(len(tokens) - n + 1):
-        if i in taken or tokens[i].text != words[0]:
-            continue
-        if all(tokens[i + k].text == words[k] for k in range(1, n)):
-            return i
+    a, b = _letters(approved), _letters(suspect)
+    if abs(len(a) - len(b)) != 1:
+        return None
+    longer, shorter, side = (a, b, "suspect") if len(a) > len(b) else (b, a, "approved")
+    for i in range(len(longer) - 1):
+        if longer[i] == longer[i + 1] and longer[:i] + longer[i + 1:] == shorter:
+            return longer[i], side
     return None
+
+
+def _rate_systematic_letter_loss(items: list[DiffItem]) -> None:
+    """Rate a short word's lost doubled letter as the text-layer noise it
+    is, when the same document drops the same doubled letter in longer
+    words too. Words under six letters are left out of `_looks_like_typo`
+    -- one letter is often their whole meaning -- so "well" / "wel" was a
+    major misspelling while "hallucinations" / "halucinations", the same
+    "ll" glyph lost on the same page, was noise. With three or more such
+    losses on the same side (the evidence), a short word losing that letter
+    is noise too -- never when what is left is a word of its own ("to",
+    "of")."""
+    evidence: Counter = Counter()
+    for item in items:
+        if item.severity == "typo":
+            lost = _lost_double(item.approved_text, item.suspect_text)
+            if lost is not None:
+                evidence[lost] += 1
+    if not evidence:
+        return
+    for item in items:
+        if item.kind != "text_changed" or item.severity != "major":
+            continue
+        lost = _lost_double(item.approved_text, item.suspect_text)
+        if lost is None or evidence[lost] < _LETTER_LOSS_MIN_EVIDENCE:
+            continue
+        a, b = _letters(item.approved_text), _letters(item.suspect_text)
+        if min((a, b), key=len) in _SHORT_WORDS:
+            continue
+        item.severity = "typo"
 
 
 def _location_of(tokens: list[ComparisonToken]) -> Optional[Location]:
@@ -1643,17 +1700,6 @@ def _same_title(sec_a: _Section, sec_b: _Section) -> bool:
     )
 
 
-def _titles_alike(sec_a: _Section, sec_b: _Section) -> bool:
-    """Stricter than `_same_title`: the titles name the same section,
-    not merely share a number and a few letters."""
-    if sec_a.header_key == sec_b.header_key:
-        return True
-    title_a, title_b = sec_a.header_key[1], sec_b.header_key[1]
-    return bool(title_a and title_b) and (
-        difflib.SequenceMatcher(None, title_a, title_b).ratio() >= _UNNUMBERED_SECTION_TITLE_RATIO
-    )
-
-
 def _longest_increasing_subsequence_indices(seq: list[int]) -> set[int]:
     """Return the set of indices in `seq` that belong to the longest strictly
     increasing subsequence. Elements at indices NOT in this set are the ones
@@ -1688,67 +1734,6 @@ def _longest_increasing_subsequence_indices(seq: list[int]) -> set[int]:
     return lis_indices
 
 
-def _moved_section_pairs(b_to_a: dict[int, int]) -> set[int]:
-    """Approved section indices whose matched suspect twin sits out of
-    order -- a genuine section MOVE, not a content change.
-
-    Pairs are walked in approved order; the subset of suspect positions that
-    preserved monotonicity forms the Longest Increasing Subsequence (LIS).
-    Any section not in the LIS is the displaced (moved) one: approved [A B C D]
-    vs suspect [D A B C] gives suspect positions 1,2,3,0 -> LIS is 1,2,3 -> D is moved.
-    """
-    pairs = sorted((a_idx, b_idx) for b_idx, a_idx in b_to_a.items())
-    seq = [b_idx for _, b_idx in pairs]
-    lis = _longest_increasing_subsequence_indices(seq)
-    return {pairs[i][0] for i in range(len(pairs)) if i not in lis}
-
-
-def _has_matching_context(
-    span_a: list[ComparisonToken],
-    span_b: list[ComparisonToken],
-    tokens_a: list[ComparisonToken],
-    tokens_b: list[ComparisonToken],
-    k: int = 3,
-) -> bool:
-    """Check if span_a and span_b share either preceding or succeeding context
-    in the full token streams. If they do, they occupy the same relative position
-    in the document flow and are not a genuine relocation."""
-    try:
-        id_a_start = id(span_a[0])
-        id_a_end = id(span_a[-1])
-        id_b_start = id(span_b[0])
-        id_b_end = id(span_b[-1])
-
-        idx_a_start = next(i for i, t in enumerate(tokens_a) if id(t) == id_a_start)
-        idx_a_end = next(i for i, t in enumerate(tokens_a) if id(t) == id_a_end)
-        idx_b_start = next(i for i, t in enumerate(tokens_b) if id(t) == id_b_start)
-        idx_b_end = next(i for i, t in enumerate(tokens_b) if id(t) == id_b_end)
-    except (StopIteration, IndexError):
-        return False
-
-    def norm_toks(toks: list[ComparisonToken]) -> list[str]:
-        words = []
-        for t in toks:
-            clean = "".join(ch for ch in t.text if ch.isalnum()).casefold()
-            if clean:
-                words.append(clean)
-        return words
-
-    # Check succeeding tokens
-    succ_a = norm_toks(tokens_a[idx_a_end + 1 : idx_a_end + 15])[:k]
-    succ_b = norm_toks(tokens_b[idx_b_end + 1 : idx_b_end + 15])[:k]
-    if len(succ_a) >= k and len(succ_b) >= k and succ_a == succ_b:
-        return True
-
-    # Check preceding tokens
-    prec_a = norm_toks(tokens_a[max(0, idx_a_start - 15) : idx_a_start])[-k:]
-    prec_b = norm_toks(tokens_b[max(0, idx_b_start - 15) : idx_b_start])[-k:]
-    if len(prec_a) >= k and len(prec_b) >= k and prec_a == prec_b:
-        return True
-
-    return False
-
-
 def _diff_by_sections(
     approved_tokens: list[ComparisonToken],
     suspect_tokens: list[ComparisonToken],
@@ -1766,14 +1751,13 @@ def _diff_by_sections(
        on both sides (see the module note, step 5) and diff the rest
        again without it -- genuine internal edits are caught at their
        real severity; identical content produces nothing.
-    4. Report each position-rank change as ONE low-severity
-       "reordered_section" item and each moved passage as ONE
-       "reordered" item (never critical removed/added noise).
+    4. A section or passage that only moved is not a difference: its
+       words are matched where they are, and only edits inside it are
+       reported (a concise version reorders text as a matter of course).
     5. Section text present on only one side becomes removed/added
        items -- never a cascade.
     """
     b_to_a, unmatched_a, unmatched_b = _match_sections(sections_a, sections_b)
-    moved_sections = _moved_section_pairs(b_to_a)
     pairs = sorted((a, b) for b, a in b_to_a.items())
 
     # Pass 1: what each section pairing leaves unexplained.
@@ -1796,7 +1780,9 @@ def _diff_by_sections(
     # Pass 2: the same text on both sides, in sections that weren't
     # paired. Each moved passage (with any small edits inside it) is
     # compared as a unit and left out of the section comparison.
-    passages = _moved_passages(_find_moved_blocks(leftover_a, leftover_b), leftover_a, leftover_b)
+    passages = _moved_passages(
+        _find_moved_blocks(leftover_a, leftover_b, (approved_tokens, suspect_tokens)), leftover_a, leftover_b
+    )
     moved_a = {id(t) for span_a, _ in passages for t in span_a}
     moved_b = {id(t) for _, span_b in passages for t in span_b}
 
@@ -1813,30 +1799,6 @@ def _diff_by_sections(
         items.extend(found)
         if on_found is not None and found:
             on_found(found)
-        # Sections paired only by content (different headers -- e.g. a
-        # figure label read as a header) aren't reported as moved: that
-        # would claim a section move the documents don't have.
-        # Only when the titles are recognizably the SAME section. One
-        # that moved and was renumbered or lightly retitled ("5.2
-        # Pancreatitis" -> "5.1 Pancreatitis", "Diabetic Ketoacidosis" ->
-        # "Ketoacidosis") is a move. Two different titles paired by their
-        # number ("2.1 Recommendations for All Patients" -> "2.1 Important
-        # Dosage and Administration Information", 0.41 alike) are not: the
-        # change is already an edit in this section's own comparison, and
-        # a "moved" row setting them side by side reads as a wrong
-        # comparison.
-        if a_idx in moved_sections and _titles_alike(sec_a, sec_b):
-            items.append(
-                DiffItem(
-                    index=len(items),
-                    kind="reordered_section",
-                    severity="reorder",
-                    approved_text=sec_a.title,
-                    suspect_text=sec_b.title,
-                    approved_location=_location_of(sec_a.tokens),
-                    suspect_location=_location_of(sec_b.tokens),
-                )
-            )
 
     before_unmatched = len(items)
     for a_idx in sorted(unmatched_a):
@@ -1850,6 +1812,7 @@ def _diff_by_sections(
                     suspect_text="",
                     approved_location=_location_of(run),
                     suspect_location=None,
+                    approved_span=list(run),
                 )
             )
     for b_idx in sorted(unmatched_b):
@@ -1863,6 +1826,7 @@ def _diff_by_sections(
                     suspect_text=" ".join(t.text for t in run),
                     approved_location=None,
                     suspect_location=_location_of(run),
+                    suspect_span=list(run),
                 )
             )
 
@@ -1871,23 +1835,13 @@ def _diff_by_sections(
 
     before_passages = len(items)
     for span_a, span_b in passages:
-        items.extend(_diff_runs(span_a, span_b, matches))  # edits inside the moved text
-        if not _has_matching_context(span_a, span_b, approved_tokens, suspect_tokens):
-            items.append(
-                DiffItem(
-                    index=len(items),
-                    kind="reordered",
-                    severity="reorder",
-                    approved_text=" ".join(t.text for t in span_a),
-                    suspect_text=" ".join(t.text for t in span_b),
-                    approved_location=_location_of(span_a),
-                    suspect_location=_location_of(span_b),
-                )
-            )
+        # The moved text itself is matched (its words are paired); only
+        # the edits inside it are rows -- moving is not a difference.
+        items.extend(_diff_runs(span_a, span_b, matches))
 
     if on_found is not None and len(items) > before_passages:
         on_found(items[before_passages:])
-    return _finalize_items(items, approved_tokens, suspect_tokens)
+    return _finalize_items(items, approved_tokens, suspect_tokens, matches)
 
 
 # A moved passage must be at least this many identical words: shorter
@@ -1895,56 +1849,129 @@ def _diff_by_sections(
 _MIN_MOVED_RUN_WORDS = 6
 # Candidate positions examined per phrase (repeated boilerplate).
 _MAX_MOVE_CANDIDATES = 25
+# A moved block made only of phrases that recur in the documents ("[see
+# Boxed Warning and Warnings and Precautions") says nothing about where
+# its text went unless it is this long -- or stays within this share of
+# the documents' length of where it was.
+_MIN_BOILERPLATE_MOVE_WORDS = 12
+_MAX_BOILERPLATE_DRIFT = 0.1
 
 
 def _find_moved_blocks(
-    runs_a: list[list[ComparisonToken]], runs_b: list[list[ComparisonToken]]
+    runs_a: list[list[ComparisonToken]],
+    runs_b: list[list[ComparisonToken]],
+    whole: Optional[tuple[list[ComparisonToken], list[ComparisonToken]]] = None,
 ) -> list[tuple[list[ComparisonToken], list[ComparisonToken]]]:
     """Maximal runs of identical words present in both ``runs_a`` and
     ``runs_b`` (each a list of contiguous token runs), at least
     `_MIN_MOVED_RUN_WORDS` long. Order-independent, so passages that
     swapped places are found too; each token is used at most once.
-    A phrase occurring at several places on the other side goes to the
-    occurrence giving the longest match."""
+    Longest matches are taken first, across the whole document: a phrase
+    occurring at several places goes to the copy it matches longest. Taken
+    in document order instead, "physical condition. It is not known if
+    sildenafil tablets are safe" took the copy in "pregnant. It is not known
+    if sildenafil tablets will harm your unborn baby" for its first seven
+    words, and that sentence -- present in both documents -- was reported
+    as deleted.
+
+    With ``whole`` (the two documents' full token lists), a block made only
+    of phrases that recur in them must be `_MIN_BOILERPLATE_MOVE_WORDS`
+    long or stay near where it was: a 2017 sentence on page 22, deleted in
+    the 2024 label, had its cross-reference "[see Boxed Warning and
+    Warnings and Precautions" paired with the same words closing a
+    different sentence on page 6."""
     k = _MIN_MOVED_RUN_WORDS
+    boilerplate = _boilerplate_check(whole, k)
+    texts_a = [[t.text for t in run] for run in runs_a]
     texts_b = [[t.text for t in run] for run in runs_b]
     index: dict[tuple[str, ...], list[tuple[int, int]]] = {}
     for r, texts in enumerate(texts_b):
         for p in range(len(texts) - k + 1):
             index.setdefault(tuple(texts[p : p + k]), []).append((r, p))
-    used_b: set[tuple[int, int]] = set()
 
-    blocks = []
-    for run_a in runs_a:
-        texts_a = [t.text for t in run_a]
-        p = 0
-        while p + k <= len(texts_a):
-            best_len, best = 0, None
-            for r, q in index.get(tuple(texts_a[p : p + k]), ())[:_MAX_MOVE_CANDIDATES]:
-                length = 0
-                while (
-                    p + length < len(texts_a)
-                    and q + length < len(texts_b[r])
-                    and texts_a[p + length] == texts_b[r][q + length]
-                    and (r, q + length) not in used_b
-                ):
+    # Every maximal common run (it can't be extended to the left).
+    candidates: list[tuple[int, int, int, int, int]] = []  # (length, run_a, p, run_b, q)
+    for ra, ta in enumerate(texts_a):
+        for p in range(len(ta) - k + 1):
+            for rb, q in index.get(tuple(ta[p : p + k]), ())[:_MAX_MOVE_CANDIDATES]:
+                tb = texts_b[rb]
+                if p > 0 and q > 0 and ta[p - 1] == tb[q - 1]:
+                    continue
+                length = k
+                while p + length < len(ta) and q + length < len(tb) and ta[p + length] == tb[q + length]:
                     length += 1
-                if length > best_len:
-                    best_len, best = length, (r, q)
-            if best_len < k:
-                p += 1
+                candidates.append((length, ra, p, rb, q))
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2], c[3], c[4]))
+
+    used_a: set[tuple[int, int]] = set()
+    used_b: set[tuple[int, int]] = set()
+    blocks = []
+    for length, ra, p, rb, q in candidates:
+        # What is still free of it, on both sides, in stretches of k+.
+        i = 0
+        while i < length:
+            if (ra, p + i) in used_a or (rb, q + i) in used_b:
+                i += 1
                 continue
-            r, q = best
-            used_b.update((r, q + i) for i in range(best_len))
-            blocks.append((run_a[p : p + best_len], runs_b[r][q : q + best_len]))
-            p += best_len
+            j = i
+            while j < length and (ra, p + j) not in used_a and (rb, q + j) not in used_b:
+                j += 1
+            if j - i >= k and not boilerplate(runs_a[ra][p + i : p + j], runs_b[rb][q + i : q + j]):
+                used_a.update((ra, p + n) for n in range(i, j))
+                used_b.update((rb, q + n) for n in range(i, j))
+                blocks.append((runs_a[ra][p + i : p + j], runs_b[rb][q + i : q + j]))
+            i = j
     return blocks
+
+
+def _boilerplate_check(
+    whole: Optional[tuple[list[ComparisonToken], list[ComparisonToken]]], k: int
+) -> Callable[[list[ComparisonToken], list[ComparisonToken]], bool]:
+    """A test telling whether a candidate moved block (its words on each
+    side) is boilerplate that moved too far to be trusted -- see
+    `_find_moved_blocks`. Always False without the whole documents."""
+    if whole is None:
+        return lambda block_a, block_b: False
+    tokens_a, tokens_b = whole
+    texts_a, texts_b = [t.text for t in tokens_a], [t.text for t in tokens_b]
+    recurring = {
+        gram
+        for texts in (texts_a, texts_b)
+        for gram, count in Counter(tuple(texts[i : i + k]) for i in range(len(texts) - k + 1)).items()
+        if count >= 2
+    }
+    position_a = {id(t): i / max(1, len(tokens_a)) for i, t in enumerate(tokens_a)}
+    position_b = {id(t): i / max(1, len(tokens_b)) for i, t in enumerate(tokens_b)}
+
+    def too_far(block_a: list[ComparisonToken], block_b: list[ComparisonToken]) -> bool:
+        if len(block_a) >= _MIN_BOILERPLATE_MOVE_WORDS:
+            return False
+        words = [t.text for t in block_a]
+        if not all(tuple(words[i : i + k]) in recurring for i in range(len(words) - k + 1)):
+            return False
+        drift = abs(position_a.get(id(block_a[0]), 0.0) - position_b.get(id(block_b[0]), 0.0))
+        return drift > _MAX_BOILERPLATE_DRIFT
+
+    return too_far
 
 
 # Moved fragments at most this many words apart (on both sides) are one
 # moved passage with small edits inside -- reported as one row; the
 # edits themselves still get their own rows.
 _MAX_MOVED_FRAGMENT_GAP = 5
+# Farther apart, they are still one passage when the words between them
+# are mostly the same words, ignoring case and punctuation: "Sildenafil
+# tablets? • Take or give Sildenafil" against "sildenafil tablets? • Take
+# or give sildenafil" (7 words) between two moved fragments of a Patient
+# Information leaflet was left uncompared -- every word of it a critical
+# "Inserted" row instead of two capitalization changes.
+_MIN_MOVED_GAP_SIMILARITY = 0.5
+
+
+def _gaps_alike(gap_a: list[ComparisonToken], gap_b: list[ComparisonToken]) -> bool:
+    keys_a = [_alnum_key(t.text) for t in gap_a]
+    keys_b = [_alnum_key(t.text) for t in gap_b]
+    return difflib.SequenceMatcher(None, keys_a, keys_b, autojunk=False).ratio() >= _MIN_MOVED_GAP_SIMILARITY
 
 
 def _moved_passages(
@@ -1952,10 +1979,11 @@ def _moved_passages(
     runs_a: list[list[ComparisonToken]],
     runs_b: list[list[ComparisonToken]],
 ) -> list[tuple[list[ComparisonToken], list[ComparisonToken]]]:
-    """Join moved blocks that follow each other closely in BOTH
-    documents (same run, gap <= `_MAX_MOVED_FRAGMENT_GAP` words) into
-    passages: the contiguous span on each side from the first block's
-    start to the last block's end, gaps (the edits) included."""
+    """Join moved blocks that follow each other in BOTH documents (same
+    run; gap <= `_MAX_MOVED_FRAGMENT_GAP` words, or gaps that are mostly
+    the same words) into passages: the contiguous span on each side from
+    the first block's start to the last block's end, gaps (the edits)
+    included."""
     position_a = {id(t): (r, i) for r, run in enumerate(runs_a) for i, t in enumerate(run)}
     position_b = {id(t): (r, i) for r, run in enumerate(runs_b) for i, t in enumerate(run)}
 
@@ -1964,6 +1992,7 @@ def _moved_passages(
         return run, start, start + len(block)
 
     ordered = sorted(blocks, key=lambda blk: position_a[id(blk[0][0])])
+    starts_b = [position_b[id(block_b[0])] for _, block_b in blocks]
     # [run_a, start_a, end_a, run_b, start_b, end_b] per passage
     spans: list[list[int]] = []
     for block_a, block_b in ordered:
@@ -1974,12 +2003,37 @@ def _moved_passages(
             last is not None
             and last[0] == run_a
             and last[3] == run_b
-            and 0 <= start_a - last[2] <= _MAX_MOVED_FRAGMENT_GAP
-            and 0 <= start_b - last[5] <= _MAX_MOVED_FRAGMENT_GAP
+            and 0 <= start_a - last[2]
+            and 0 <= start_b - last[5]
+            # Never across a block moved somewhere else: its words would
+            # be paired twice.
+            and not any(r == run_b and last[5] <= q < start_b for r, q in starts_b)
+            and (
+                max(start_a - last[2], start_b - last[5]) <= _MAX_MOVED_FRAGMENT_GAP
+                or _gaps_alike(runs_a[run_a][last[2]:start_a], runs_b[run_b][last[5]:start_b])
+            )
         ):
             last[2], last[5] = end_a, end_b
         else:
             spans.append([run_a, start_a, end_a, run_b, start_b, end_b])
+
+    # The words before a passage's first fragment (after its last), up to
+    # the edge of the unmatched text on both sides, belong to it too when
+    # they are mostly the same words: "Know the medicines you or your
+    # child" / "Know the medicines you" opening a moved paragraph.
+    def alone(s, k_run, k_start, before):
+        return not any(
+            o is not s and o[k_run] == s[k_run] and (o[k_start] < s[k_start]) == before
+            for o in spans
+        )
+
+    for s in spans:
+        ra, sa, ea, rb, sb, eb = s
+        if alone(s, 0, 1, True) and alone(s, 3, 4, True) and _gaps_alike(runs_a[ra][:sa], runs_b[rb][:sb]):
+            s[1], s[4] = 0, 0
+        if (alone(s, 0, 1, False) and alone(s, 3, 4, False)
+                and _gaps_alike(runs_a[ra][ea:], runs_b[rb][eb:])):
+            s[2], s[5] = len(runs_a[ra]), len(runs_b[rb])
     return [
         (runs_a[ra][sa:ea], runs_b[rb][sb:eb]) for ra, sa, ea, rb, sb, eb in spans
     ]
@@ -2003,122 +2057,246 @@ def _runs_without(
     return runs
 
 
-# A removed/added run must contain at least this many words before it
-# can be reclassified as relocated content -- single common words ("the",
-# "mg") appear everywhere and would mass-demote genuine edits.
-_MIN_RELOCATION_RUN_WORDS = 3
+# --- Moved text (a concise version reorders as a matter of course) -----
+#
+# Text that is in both documents, only somewhere else, is not a
+# difference. It is MATCHED -- its words paired one for one, so it is shown
+# like any matched text -- and only an edit inside it is reported. Never by
+# text alone: a word is paired only with a word no other match has taken,
+# so a sentence printed twice in one document and once in the other leaves
+# its second copy a deletion.
+#
+# 1. A deleted row and an inserted row of the same words: paired, one for
+#    one. A row of one or two words only when the pair cannot be chance --
+#    a word of 4+ letters, and as many such rows deleted as inserted
+#    ("Total cholesterol" moved across a table) -- and then as
+#    a `TrustedPair`, shown matched though no text around it confirms it.
+#    A lone "and" or "All" deleted here and inserted there stays two rows.
+#    Three or more words with the same letters in another case or
+#    punctuation ("KEEP OUT OF REACH" / "Keep out of reach"): one row
+#    comparing the two.
+# 2. A passage of `_MIN_MOVED_RUN_WORDS`+ identical words among what is
+#    still unmatched: compared as a unit -- its identical words paired, the
+#    edits inside it rows of their own.
+# 3. A deleted or inserted row of 3+ words found whole, unmatched, in the
+#    other document: paired. Only a WHOLE row: a short phrase inside a
+#    different sentence ("of the patient") recurs by chance.
+# Re-cased whole rows and phrases found inside other rows need at least
+# this many words: at one or two, "by" / "By" or "of the" recur by chance.
+_MIN_MOVED_ROW_WORDS = 3
+# A word this long (letters) makes a short moved row distinctive.
+_MIN_DISTINCTIVE_LETTERS = 4
 
 
-def _downgrade_relocated_runs(
+class TrustedPair(tuple):
+    """A matched (approved, suspect) token pair confirmed by what it is
+    rather than by matched text around it: a word of a short row found
+    moved, whole, to a place of its own (see `_pair_moved_text`).
+    `core.token_map.TokenMap` shows it matched."""
+
+
+def _distinctive_short_row(text: str, deleted: Counter, inserted: Counter) -> bool:
+    """A one- or two-word row that cannot be paired by chance: it holds a
+    word of `_MIN_DISTINCTIVE_LETTERS`+ letters, and exactly as many rows
+    reading so are deleted as are inserted (each copy moved: paired in
+    order)."""
+    return (
+        any(sum(ch.isalpha() for ch in word) >= _MIN_DISTINCTIVE_LETTERS for word in text.split())
+        and deleted[text] == inserted[text]
+    )
+
+
+def _pair_moved_text(
     items: list[DiffItem],
     approved_tokens: list[ComparisonToken],
     suspect_tokens: list[ComparisonToken],
-) -> None:
-    """Demote multi-word runs that exist VERBATIM elsewhere in the other
-    document to "reorder" -- layout relocation, not content change.
+    matches: Optional[TokenMatches],
+) -> list[DiffItem]:
+    """``items`` with the text that only moved paired (into ``matches``)
+    instead of reported, and every row it touched rebuilt from the words
+    it still stands for."""
+    if matches is None:
+        matches = []
+    position_a = {id(t): i for i, t in enumerate(approved_tokens)}
+    position_b = {id(t): j for j, t in enumerate(suspect_tokens)}
+    taken_a: set[int] = set()
+    taken_b: set[int] = set()
+    extra: list[DiffItem] = []
 
-    Multi-column leaflets interleave sections across columns (section
-    2's tail printed in column 3 AFTER sections 4 and 5, section 3's
-    body in a side panel with no header of its own), so a section's
-    chunk can absorb another section's overflow. The absorbed content is
-    a CONTIGUOUS multi-word run that exists word-for-word in the other
-    document's own section -- but as cleanly-matched content, so the
-    exact-text pairing pass cannot see it. This pass checks each
-    multi-word removed/added run AND each side of a multi-word replace
-    against the other document's full text: if the run appears verbatim
-    (or with minor whitespace artifacts) there, the content is present
-    on both sides (just relocated by layout), so it is demoted to the
-    lowest "reorder" tier instead of a false critical finding.
+    def free(span: Optional[list], taken: set[int]) -> bool:
+        return bool(span) and not any(id(t) in taken for t in span)
 
-    Runs that differ by even one word stay untouched, so genuine edits
-    inside a relocated span remain critical. Single/common words are
-    exempt (see `_MIN_RELOCATION_RUN_WORDS`).
-    """
-    approved_full = " ".join(t.text for t in approved_tokens)
-    suspect_full = " ".join(t.text for t in suspect_tokens)
-    approved_alnum = "".join(ch for ch in approved_full if ch.isalnum()).casefold()
-    suspect_alnum = "".join(ch for ch in suspect_full if ch.isalnum()).casefold()
-    # The relocation test below is COUNT-based, never a bare "appears
-    # somewhere" check: text only counts as relocated when the other
-    # document holds at least as many copies of it as this one does. A
-    # substring/membership test demoted genuine edits -- an added
-    # "daily" (present elsewhere in the approved text) silently became
-    # "reorder" and was hidden by the "Ignore minor and below" filter.
-    approved_side = (approved_full, approved_alnum)
-    suspect_side = (suspect_full, suspect_alnum)
+    def pair(span_a: list, span_b: list, trusted: bool = False) -> None:
+        matches.extend(TrustedPair(p) if trusted else p for p in zip(span_a, span_b))
+        taken_a.update(id(t) for t in span_a)
+        taken_b.update(id(t) for t in span_b)
 
-    for item in items:
-        # A REPLACEMENT is never relabelled as moved: a row comparing two
-        # different texts is an edit, whatever else the documents contain.
-        # Deciding otherwise from document-wide word counts hid real edits
-        # in heavily revised labels -- "healthcare" -> "health" was called
-        # moved because, across a label where "doctor" became "healthcare
-        # provider" throughout, the counts happened to balance.
-        if item.kind == "text_changed":
+    removed = [it for it in items if it.kind == "removed_in_suspect" and it.approved_span]
+    added = [it for it in items if it.kind == "added_in_suspect" and it.suspect_span]
+    deleted_texts = Counter(it.approved_text for it in removed)
+    inserted_texts = Counter(it.suspect_text for it in added)
+
+    # 1. Whole rows: the same words, or the same letters re-cased/re-punctuated.
+    exact: dict[str, list[DiffItem]] = defaultdict(list)
+    loose: dict[str, list[DiffItem]] = defaultdict(list)
+    for it in added:
+        exact[it.suspect_text].append(it)
+        if len(it.suspect_span) >= _MIN_MOVED_ROW_WORDS:
+            loose[_alnum_key(it.suspect_text)].append(it)
+    for it in removed:
+        # A row of bare marks ("•") says nothing about where it belongs:
+        # one inserted before "If you take too much" was paired with a
+        # bullet 40 pages away.
+        twin = next(
+            (o for o in exact.get(it.approved_text, ())
+             if free(o.suspect_span, taken_b) and len(o.suspect_span) == len(it.approved_span)),
+            None,
+        ) if _alnum_key(it.approved_text) else None
+        if twin is not None and len(it.approved_span) < _MIN_MOVED_ROW_WORDS:
+            if _distinctive_short_row(it.approved_text, deleted_texts, inserted_texts):
+                pair(it.approved_span, twin.suspect_span, trusted=True)
             continue
-
-        # (text, its own document, the other document)
-        if item.kind == "removed_in_suspect":
-            candidates = [(item.approved_text, approved_side, suspect_side)]
-        elif item.kind == "added_in_suspect":
-            candidates = [(item.suspect_text, suspect_side, approved_side)]
-        else:
+        if twin is not None:
+            pair(it.approved_span, twin.suspect_span)
             continue
-        # A pure deletion/insertion is only "moved" when the passage is
-        # in the other document VERBATIM -- the same words, contiguous, at
-        # least as many copies. Finding its words scattered about is not
-        # finding the passage: a deleted "Patients should not take this
-        # medicine with alcohol." was demoted that way because each of its
-        # words occurs somewhere in the other document.
-        if all(_is_relocated(text, own, other) for text, own, other in candidates):
-            item.kind = "reordered"
-            item.severity = "reorder"
+        if len(it.approved_span) < _MIN_MOVED_ROW_WORDS:
+            continue
+        twin = next((o for o in loose.get(_alnum_key(it.approved_text), ()) if free(o.suspect_span, taken_b)), None)
+        if twin is not None and _alnum_key(it.approved_text):
+            # Moved AND changed: one row setting the two side by side.
+            taken_a.update(id(t) for t in it.approved_span)
+            taken_b.update(id(t) for t in twin.suspect_span)
+            extra.append(_rebuilt_row("text_changed", it.approved_span, twin.suspect_span))
 
+    # 2. Passages of identical words among what is still unmatched.
+    runs_a = _unmatched_runs(items, "approved", taken_a, position_a)
+    runs_b = _unmatched_runs(items, "suspect", taken_b, position_b)
+    found = _find_moved_blocks(runs_a, runs_b, (approved_tokens, suspect_tokens))
+    for span_a, span_b in _moved_passages(found, runs_a, runs_b):
+        taken_a.update(id(t) for t in span_a)
+        taken_b.update(id(t) for t in span_b)
+        extra.extend(_diff_runs(span_a, span_b, matches))
 
-def _is_relocated(text: str, own_side: tuple, other_side: tuple) -> bool:
-    own_full, own_alnum = own_side
-    other_full, other_alnum = other_side
-    word_count = text.count(" ") + 1
-    text_alnum = "".join(ch for ch in text if ch.isalnum()).casefold()
-    if word_count >= _MIN_RELOCATION_RUN_WORDS and (
-        other_full.count(text) >= own_full.count(text) > 0
-        or (
-            len(text_alnum) >= 12
-            and other_alnum.count(text_alnum) >= own_alnum.count(text_alnum) > 0
-        )
+    # 3. Whole short rows found, unmatched, in the other document.
+    for rows, own_taken, other_runs, other_taken, side in (
+        (removed, taken_a, _unmatched_runs(items, "suspect", taken_b, position_b), taken_b, "approved"),
+        (added, taken_b, _unmatched_runs(items, "approved", taken_a, position_a), taken_a, "suspect"),
     ):
-        return True
-    # A run stitched together from FRAGMENTS printed elsewhere -- column
-    # interleaving put "help protect the environment." and "from the
-    # prefilled syringe." side by side in one document -- is moved when
-    # every fragment is itself found verbatim, a few whole phrases rather
-    # than scattered words.
-    return _splits_into_verbatim_fragments(text, own_full, other_full)
+        for it in rows:
+            span = it.approved_span if side == "approved" else it.suspect_span
+            if len(span) < _MIN_MOVED_ROW_WORDS or not free(span, own_taken):
+                continue
+            words = [t.text for t in span]
+            found = _find_unmatched_run(other_runs, words, other_taken)
+            if found is not None:
+                if side == "approved":
+                    pair(span, found)
+                else:
+                    pair(found, span)
+
+    rebuilt: list[DiffItem] = []
+    for it in items:
+        rebuilt.extend(_without_paired(it, taken_a, taken_b, position_a, position_b))
+    return rebuilt + extra
 
 
-_MIN_FRAGMENT_WORDS = 4
-_MAX_FRAGMENTS = 4
+def _alnum_key(text: str) -> str:
+    return "".join(ch for ch in text if ch.isalnum()).casefold()
 
 
-def _splits_into_verbatim_fragments(text: str, own_full: str, other_full: str) -> bool:
-    words = text.split()
-    if len(words) < 2 * _MIN_FRAGMENT_WORDS:
-        return False
-    start, fragments = 0, 0
-    while start < len(words):
-        end = None
-        for stop in range(len(words), start + _MIN_FRAGMENT_WORDS - 1, -1):
-            piece = " ".join(words[start:stop])
-            if other_full.count(piece) >= own_full.count(piece) > 0:
-                end = stop
-                break
-        if end is None:
-            return False
-        fragments += 1
-        if fragments > _MAX_FRAGMENTS:
-            return False
-        start = end
-    return True
+def _unmatched_runs(
+    items: list[DiffItem], side: str, taken: set[int], position: dict[int, int]
+) -> list[list[ComparisonToken]]:
+    """The words of one document still in a row and not paired, as runs
+    of consecutive words (document order)."""
+    words: dict[int, ComparisonToken] = {}
+    for it in items:
+        span = it.approved_span if side == "approved" else it.suspect_span
+        for token in span or ():
+            if id(token) not in taken and id(token) in position:
+                words[position[id(token)]] = token
+    runs: list[list[ComparisonToken]] = []
+    previous = None
+    for index in sorted(words):
+        if previous is None or index != previous + 1:
+            runs.append([])
+        runs[-1].append(words[index])
+        previous = index
+    return runs
+
+
+def _find_unmatched_run(
+    runs: list[list[ComparisonToken]], words: list[str], taken: set[int]
+) -> Optional[list[ComparisonToken]]:
+    n = len(words)
+    for run in runs:
+        for start in range(len(run) - n + 1):
+            piece = run[start:start + n]
+            if [t.text for t in piece] == words and not any(id(t) in taken for t in piece):
+                return piece
+    return None
+
+
+def _rebuilt_row(
+    kind: str, span_a: list, span_b: list, approved_caret=None, suspect_caret=None
+) -> DiffItem:
+    tag = {"text_changed": "replace", "removed_in_suspect": "delete", "added_in_suspect": "insert"}[kind]
+    return DiffItem(
+        index=0,
+        kind=kind,
+        severity=_classify_severity(tag, span_a, span_b),
+        approved_text=" ".join(t.text for t in span_a),
+        suspect_text=" ".join(t.text for t in span_b),
+        approved_location=_location_of(span_a),
+        suspect_location=_location_of(span_b),
+        approved_caret=approved_caret if not span_a else None,
+        suspect_caret=suspect_caret if not span_b else None,
+        approved_span=list(span_a),
+        suspect_span=list(span_b),
+    )
+
+
+def _without_paired(
+    item: DiffItem,
+    taken_a: set[int],
+    taken_b: set[int],
+    position_a: dict[int, int],
+    position_b: dict[int, int],
+) -> list[DiffItem]:
+    """``item`` as it stands once moved text was paired out of it: itself
+    if untouched, nothing if all of it moved, else rows for what is left
+    (a deletion/insertion split at the gaps the moved words left)."""
+    span_a = item.approved_span or []
+    span_b = item.suspect_span or []
+    left_a = [t for t in span_a if id(t) not in taken_a]
+    left_b = [t for t in span_b if id(t) not in taken_b]
+    if len(left_a) == len(span_a) and len(left_b) == len(span_b):
+        return [item]
+    if not left_a and not left_b:
+        return []
+    if left_a and left_b:
+        return [_rebuilt_row("text_changed", left_a, left_b)]
+    if left_a:
+        return [
+            _rebuilt_row("removed_in_suspect", part, [], suspect_caret=item.suspect_caret)
+            for part in _consecutive_parts(left_a, position_a)
+        ]
+    return [
+        _rebuilt_row("added_in_suspect", [], part, approved_caret=item.approved_caret)
+        for part in _consecutive_parts(left_b, position_b)
+    ]
+
+
+def _consecutive_parts(tokens: list, position: dict[int, int]) -> list[list]:
+    parts: list[list] = []
+    previous = None
+    for token in tokens:
+        index = position.get(id(token))
+        if not parts or index is None or previous is None or index != previous + 1:
+            parts.append([])
+        parts[-1].append(token)
+        previous = index
+    return parts
 
 
 _MAX_SLUG_WORDS = 12
@@ -2266,6 +2444,45 @@ def _alnum_only(text: str) -> str:
     return "".join(ch for ch in text if ch.isalnum())
 
 
+_EDGE_DASHES_RE = re.compile(r"^(" + _HYPHEN_CHARS_CLASS + r"*)(.*?)(" + _HYPHEN_CHARS_CLASS + r"*)$")
+
+
+def _edge_dashes(text: str) -> list[list[str]]:
+    """[leading dashes, word, trailing dashes] per word of ``text``; a
+    word of dashes only ("OF ------") counts as trailing dashes of the
+    word before it."""
+    words: list[list[str]] = []
+    for raw in text.split():
+        lead, core, trail = _EDGE_DASHES_RE.match(raw).groups()
+        if not core:
+            if words:
+                words[-1][2] += lead + trail
+            else:
+                words.append([lead + trail, "", ""])
+            continue
+        words.append([lead, core, trail])
+    return words
+
+
+def _edge_dash_change(approved: str, suspect: str) -> Optional[str]:
+    """The severity of a difference that is only dashes added to or taken
+    off the start or end of words -- "2011" / "2011-", "OF" / "OF------",
+    "use" / "use--" -- or None when it is something else. Not hyphenation
+    (a word broken or joined differently, "HIGHLIGHTS" / "HIGH-LIGHTS",
+    "two-year" / "two year"): a dash typed before or after a word is a
+    punctuation change, major; a sign put in front of a number ("1.4" /
+    "-1.4") changes its value, critical."""
+    a, b = _edge_dashes(approved), _edge_dashes(suspect)
+    if approved == suspect or [w[1] for w in a] != [w[1] for w in b]:
+        return None
+    if all(x == y for x, y in zip(a, b)):
+        return None  # the same dashes, spaced differently
+    for (lead_a, core, _), (lead_b, _, _) in zip(a, b):
+        if lead_a != lead_b and core[:1].isdigit():
+            return "critical"
+    return "major"
+
+
 def _is_hyphenation(approved: str, suspect: str) -> bool:
     """True when the discrepancy is specifically an added, removed, or
     differently-spaced hyphen/dash between words/numbers, rather than a general
@@ -2290,10 +2507,13 @@ def _is_hyphenation(approved: str, suspect: str) -> bool:
         return True
 
     # Same count of hyphens: check if positions or spacing around them differ
-    # (e.g. 'anti - inflammatory' vs 'anti-inflammatory', or 'pre-eclampsia' vs 'preeclamp-sia')
-    no_ws_a = re.sub(r"\s+", "", approved)
-    no_ws_b = re.sub(r"\s+", "", suspect)
-    if no_ws_a.casefold() != no_ws_b.casefold():
+    # (e.g. 'anti - inflammatory' vs 'anti-inflammatory', or 'pre-eclampsia' vs 'preeclamp-sia').
+    # Letters and dashes only: "AUC_{0–∞}" / "AUC_{0–∞.}" differ by a full
+    # stop, not by where a dash stands.
+    def letters_and_dashes(text: str) -> str:
+        return "".join(ch for ch in text if ch.isalnum() or _HYPHEN_RE.match(ch)).casefold()
+
+    if letters_and_dashes(approved) != letters_and_dashes(suspect):
         return True
 
     if approved != suspect and re.search(
@@ -2326,6 +2546,11 @@ def _classify_severity(
         active_slice = approved_slice if tag == "delete" else suspect_slice
         active_text = " ".join(t.text for t in active_slice)
         if not any(c.isalnum() for c in active_text):
+            if _REPEATED_HYPHENS_RE.fullmatch(active_text.replace(" ", "")):
+                # A run of dashes outside a ruled heading (those are left out
+                # of the comparison, core/pdf_extractor.py): typed into the
+                # text, as "OF ------" -- the same weight as "OF------".
+                return "major"
             return "minor"  # pure punctuation insertion or deletion (e.g. ';', ')', ').')
         if _is_figure_artwork_text(active_text) and not _carries_label_content(active_text):
             return "minor"  # chart/diagram labels or atom symbols with no label content
@@ -2340,6 +2565,8 @@ def _classify_severity(
     # The same characters with the spacing moved: never a changed fact
     # ("100 mg" vs "100mg", "9 8 5" vs "985"), reported as spacing.
     if _is_whitespace_only(approved_text, suspect_text):
+        return "minor"
+    if _is_script_only(approved_text, suspect_text):
         return "minor"
 
     # The same number grouped differently ("2633" vs "2,633"): the value
@@ -2364,6 +2591,10 @@ def _classify_severity(
     # ("5.000" vs "5,000") is a different number in another locale.
     if _number_forms(approved_text) != _number_forms(suspect_text):
         return "critical"
+    # Dashes added to or taken off a word ("2011-", "OF------").
+    edge_dash = _edge_dash_change(approved_text, suspect_text)
+    if edge_dash is not None:
+        return edge_dash
 
     # Figure text on BOTH sides (a chart axis read slightly differently).
     # One artwork-looking side is not enough: a short label paired with a
@@ -2471,15 +2702,13 @@ CATEGORY_LABELS = {
     "spacing": "Spacing",
     "hyphenation": "Hyphenation",
     "spelling": "Spelling",
-    "moved": "Moved",
+    "script": "Sub/superscript",
 }
 CATEGORY_ORDER = tuple(CATEGORY_LABELS)
 
 
 def category_of(item: DiffItem) -> str:
     """Which `CATEGORY_LABELS` bucket a discrepancy belongs to."""
-    if item.kind in ("reordered", "reordered_section"):
-        return "moved"
     if item.kind == "added_in_suspect":
         return "added"
     if item.kind == "removed_in_suspect":
@@ -2487,12 +2716,16 @@ def category_of(item: DiffItem) -> str:
     approved, suspect = item.approved_text, item.suspect_text
     if _is_whitespace_only(approved, suspect):
         return "spacing"
+    if _is_script_only(approved, suspect):
+        return "script"
     if _is_list_mark_only(approved, suspect):
         return "punctuation"
     if _extract_digit_runs(approved) != _extract_digit_runs(suspect) or _number_forms(
         approved
     ) != _number_forms(suspect):
         return "number"
+    if _edge_dash_change(approved, suspect) is not None:
+        return "punctuation"
     if _is_hyphenation(approved, suspect):
         return "hyphenation"
     if approved.casefold() == suspect.casefold():
@@ -2506,6 +2739,30 @@ def category_of(item: DiffItem) -> str:
     ):
         return "spelling"
     return "wording"
+
+
+# Marks the row listing the repeats of a running header/footer
+# (core/completeness.py `furniture_rows`).
+FURNITURE_NOTE = "repeated header/footer"
+
+
+def is_formatting_extra(item: DiffItem) -> bool:
+    """Whether ``item`` changes only the layout, not a word: spacing
+    ("100 mg" / "100mg"), a list mark drawn with another glyph ("ο" /
+    "○"), a bullet present on one side only, or the repeats of a running
+    header/footer (its first copy is compared with the text). Listed apart
+    from the deviations, as formatting extras, and not counted with them
+    -- never dropped."""
+    if FURNITURE_NOTE in item.approved_text or FURNITURE_NOTE in item.suspect_text:
+        return True
+    if item.kind in ("added_in_suspect", "removed_in_suspect"):
+        texts = [t for t in (item.approved_text, item.suspect_text) if t]
+        return bool(texts) and all(
+            all(word in _LIST_MARK_GLYPHS for word in text.split()) for text in texts
+        )
+    return _is_whitespace_only(item.approved_text, item.suspect_text) or _is_list_mark_only(
+        item.approved_text, item.suspect_text
+    )
 
 
 def _extract_digit_runs(text: str) -> tuple[str, ...]:
@@ -2608,12 +2865,59 @@ def _looks_like_misspelling(approved_text: str, suspect_text: str) -> bool:
         return False
     if _changes_meaning(approved_text, suspect_text):
         return False
-    a, b = _letters(approved_text), _letters(suspect_text)
-    if not a or not b or a == b:
+    # The word that differs, the words both sides share at either end left
+    # out: "severe heart failure" / "ever had heart failure" read as one
+    # misspelling once the shared words made the letters alike.
+    words_a, words_b = approved_text.split(), suspect_text.split()
+    while words_a and words_b and words_a[0] == words_b[0]:
+        words_a, words_b = words_a[1:], words_b[1:]
+    while words_a and words_b and words_a[-1] == words_b[-1]:
+        words_a, words_b = words_a[:-1], words_b[:-1]
+    if not words_a or not words_b or max(len(words_a), len(words_b)) > _MISSPELLING_MAX_WORDS:
         return False
-    if abs(len(a) - len(b)) > _TYPO_MAX_LENGTH_DELTA:
+    if len(words_a) == len(words_b):
+        # Word for word ("Состдв: Кажда" / "Состав: Каждая").
+        pairs = [(x, y) for x, y in zip(words_a, words_b) if _letters(x) != _letters(y)]
+    else:
+        # A word the text layer split or joined ("cipro oxacin" / "ciprooxacsin").
+        pairs = [("".join(words_a), "".join(words_b))]
+    return bool(pairs) and all(_is_slip(_letters(x), _letters(y)) for x, y in pairs)
+
+
+def _is_slip(a: str, b: str) -> bool:
+    """Whether ``b`` is ``a`` with a letter or two added, lost, changed or
+    swapped -- not a different word: "for" / "of", "dose" / "dosage" are
+    wording; "fom" / "from", "anhydrase" / "anhydrse" are slips."""
+    if not a or not b or a == b or min(len(a), len(b)) < _MISSPELLING_MIN_LETTERS:
+        return False
+    allowed = 1 if min(len(a), len(b)) < _MISSPELLING_LONG_WORD else 2
+    if _edit_distance(a, b) > allowed:
         return False
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= _TYPO_SIMILARITY_THRESHOLD
+
+
+# A misspelling is a slip in a word of at least this many letters: one
+# letter (two, when the shorter spelling has `_MISSPELLING_LONG_WORD`+
+# letters) added, lost, changed or swapped with its neighbour.
+_MISSPELLING_MIN_LETTERS = 3
+_MISSPELLING_LONG_WORD = 5
+# Differing words judged as a misspelling, at most, on each side.
+_MISSPELLING_MAX_WORDS = 3
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Letters added, lost, changed, or swapped with a neighbour to turn
+    ``a`` into ``b`` (optimal string alignment distance)."""
+    rows = [list(range(len(b) + 1))]
+    for i in range(1, len(a) + 1):
+        row = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            row[j] = min(rows[-1][j] + 1, row[j - 1] + 1, rows[-1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                row[j] = min(row[j], rows[-2][j - 2] + 1)
+        rows.append(row)
+    return rows[-1][-1]
 
 
 def _has_digit_or_slash(text: str) -> bool:

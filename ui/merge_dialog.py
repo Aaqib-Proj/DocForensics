@@ -59,7 +59,7 @@ class MergeDocumentsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Merge Documents — {title}")
-        self.resize(750, 480)
+        self.resize(880, 500)  # wide enough for the whole bottom row
         self.setMinimumSize(600, 360)
         self.setAcceptDrops(True)
 
@@ -203,7 +203,7 @@ class MergeDocumentsDialog(QDialog):
         bottom_layout.addWidget(self.btn_cancel)
 
         # Primary Merge Button
-        primary_text = "Merge & Compare" if self._can_compare else "Merge & Load"
+        primary_text = "Merge && Compare" if self._can_compare else "Merge && Load"
         self.btn_merge = QPushButton(primary_text)
         self.btn_merge.setObjectName("primary")
         self.btn_merge.setDefault(True)
@@ -392,9 +392,9 @@ class MergeDocumentsDialog(QDialog):
 
         # Update primary button label based on compare checkbox
         if self.compare_checkbox.isChecked():
-            self.btn_merge.setText("Merge & Compare")
+            self.btn_merge.setText("Merge && Compare")
         else:
-            self.btn_merge.setText("Merge & Load")
+            self.btn_merge.setText("Merge && Load")
 
     # ------------------------------------------------------------------
     # Merge execution

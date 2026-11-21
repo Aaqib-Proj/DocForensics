@@ -157,7 +157,8 @@ def test_merge_dialog_and_panel_ui(qapp, tmp_path):
     dialog = MergeDocumentsDialog(initial_files=[f1, f2], title="Suspect", can_compare=True)
     assert dialog.table.rowCount() == 2
     assert dialog.btn_merge.isEnabled()
-    assert dialog.btn_merge.text() == "Merge & Compare"
+    # "&&" is a literal "&" (a single "&" underlined the next letter).
+    assert dialog.btn_merge.text() == "Merge && Compare"
 
     # Reorder
     dialog.table.selectRow(0)

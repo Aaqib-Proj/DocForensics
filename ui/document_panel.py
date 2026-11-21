@@ -71,10 +71,11 @@ import queue
 import threading
 
 import fitz  # PyMuPDF
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog,
+    QGraphicsItem,
     QGestureEvent,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -92,7 +93,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui import theme
+from ui import icons, theme
 from workers.convert_worker import ConvertWorker
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,6 @@ _SEVERITY_OVERLAY_COLORS = {
     "major":    QColor(230, 81, 0, 55),      # deep orange
     "minor":    QColor(249, 168, 37, 55),    # amber
     "typo":     QColor(97, 97, 97, 55),      # gray
-    "reorder":  QColor(130, 80, 223, 45),    # purple, as "Moved" in the list
 }
 _DEFAULT_OVERLAY_COLOR = QColor(120, 120, 120, 55)
 
@@ -165,13 +165,27 @@ _SEVERITY_OVERLAY_PENS = {
 }
 _DEFAULT_OVERLAY_PEN = QPen(QColor(120, 120, 120, 120), 1)
 
-# Find bar: every match tinted green (a colour no difference uses), the
-# current one filled deeper and outlined.
-_SEARCH_BRUSH = QBrush(QColor(0, 200, 83, 60))
+# Find bar: every match tinted yellow, the current one filled deeper and
+# outlined in orange -- as a browser's Find does. (Green is the matched
+# text's color.)
+_SEARCH_BRUSH = QBrush(QColor(255, 214, 0, 95))
 _SEARCH_PEN = QPen(Qt.PenStyle.NoPen)
-_SEARCH_CURRENT_BRUSH = QBrush(QColor(0, 200, 83, 120))
-_SEARCH_CURRENT_PEN = QPen(QColor(0, 137, 60), 2)
+_SEARCH_CURRENT_BRUSH = QBrush(QColor(255, 170, 0, 140))
+_SEARCH_CURRENT_PEN = QPen(QColor(230, 110, 0), 2)
+# Text found the same in both documents (View > Show Matched Text): a very
+# light green under everything else, so the differences stand out on it.
+_MATCHED_BRUSH = QBrush(QColor(34, 197, 94, 34))
+_MATCHED_PEN = QPen(Qt.PenStyle.NoPen)
 _SEARCH_CURRENT_PEN.setCosmetic(True)
+# Table cells as the comparison detected them (View > Show Table Cells):
+# blue for a table read cell by cell, purple for a table drawn inside a
+# cell of another (read cell by cell there), grey dashes for a grid that
+# was found but is read as ordinary text (ruling lines over a paragraph).
+_TABLE_COLORS = {"table": QColor(2, 132, 199), "nested": QColor(192, 38, 211), "ignored": QColor(120, 128, 140)}
+_TABLE_LABELS = {"table": "Table", "nested": "Nested table", "ignored": "Read as text"}
+# Pages of table layout read per step (each step is drawn as it arrives).
+_TABLE_LAYOUT_PAGES_PER_STEP = 6
+
 # Typing pauses this long (ms) before the document is searched.
 _SEARCH_DELAY_MS = 180
 # Matches tinted at once; past this the count still covers them all.
@@ -312,6 +326,41 @@ class _TextIndexer(QObject):
                 logger.exception("Could not read the text of %s for searching", path)
                 index = None
             self.indexed.emit(generation, index)
+
+
+class _TableLayoutReader(QObject):
+    """Reads which tables and cells the comparison detects on each page
+    (`core.pdf_extractor.extract_words(table_layout=...)`) on a
+    background thread, a few pages at a time, each step sent as it is
+    done -- so the outlines fill in without holding up the viewer."""
+
+    ready = Signal(int, object)  # request number, {page: [table dicts]}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._requests: queue.Queue = queue.Queue()
+        threading.Thread(target=self._run, name="table-layout", daemon=True).start()
+
+    def request(self, number: int, path: str, crop: dict | None = None) -> None:
+        self._requests.put((number, path, crop))
+
+    def _run(self) -> None:
+        from core.pdf_extractor import extract_words
+
+        while True:
+            generation, path, crop = self._requests.get()
+            try:
+                with fitz.open(path) as doc:
+                    count = doc.page_count
+                for first in range(1, count + 1, _TABLE_LAYOUT_PAGES_PER_STEP):
+                    if not self._requests.empty():
+                        break  # another document was opened meanwhile
+                    layout: dict[int, list[dict]] = {}
+                    last = min(first + _TABLE_LAYOUT_PAGES_PER_STEP - 1, count)
+                    extract_words(path, first_page=first, last_page=last, table_layout=layout, crop=crop or None)
+                    self.ready.emit(generation, layout)
+            except Exception:  # noqa: BLE001 -- the outlines just stay off
+                logger.exception("Could not read the table layout of %s", path)
 
 
 class _SearchField(QLineEdit):
@@ -585,6 +634,7 @@ class DocumentPanel(QWidget):
         self._highlight_items: list[QGraphicsRectItem] = []
         self._missing_items: list[QGraphicsRectItem] = []
         self._overlay_items: list[QGraphicsRectItem] = []  # persistent severity overlays
+        self._matched_items: list[QGraphicsRectItem] = []  # text matched in both documents
         self._crop_overlay_items: list[QGraphicsRectItem] = []  # crop region overlays
         # (scene rect, DiffItem) for every overlay, to find the
         # difference under a click.
@@ -609,6 +659,18 @@ class DocumentPanel(QWidget):
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(_SEARCH_DELAY_MS)
         self._search_timer.timeout.connect(lambda: self._run_search(navigate=True))
+        # Table cells overlay: the layout read so far ({page: [table]}),
+        # whether it is shown, and the outlines drawn.
+        self._layout_reader = _TableLayoutReader()
+        self._layout_reader.ready.connect(self._on_table_layout)
+        self._table_layout: dict[int, list[dict]] = {}
+        # What the layout shown was read for: (document generation, crop);
+        # each request is numbered so a late step of an old one is ignored.
+        self._table_layout_for: tuple | None = None
+        self._layout_request = 0
+        self._crop: dict = {}
+        self._tables_visible = False
+        self._table_items: list = []
 
         # --- Multi-page state ---
         # One Y offset (in unscaled scene pixels) per page, in page order,
@@ -633,6 +695,10 @@ class DocumentPanel(QWidget):
         header.setObjectName("panelHeader")
         self.title_label = QLabel(title.upper())
         self.title_label.setObjectName("panelTitle")
+        if title.lower() in ("original", "suspect"):
+            # Colored role tag: blue Original, teal Suspect (see ui/theme.py).
+            self.title_label.setProperty("role", title.lower())
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         self.file_label = QLabel("No document")
         self.file_label.setObjectName("fileName")
         self.file_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -645,6 +711,9 @@ class DocumentPanel(QWidget):
         self.merge_button = QPushButton("Merge\u2026")
         self.merge_button.setToolTip(f"Merge multiple split files into the {title} document")
         self.merge_button.clicked.connect(lambda: self.on_merge_clicked())
+        for button, name in ((self.load_button, "folder"), (self.merge_button, "merge")):
+            button.setIconSize(QSize(15, 15))
+            icons.bind(button, name)
         text_column = QVBoxLayout()
         text_column.setSpacing(1)
         text_column.addWidget(self.title_label)
@@ -692,6 +761,17 @@ class DocumentPanel(QWidget):
         self.fit_button = self._flat_button("Fit width", "Fit the page width to this viewer (Ctrl+0)")
         self.fit_button.clicked.connect(self._on_fit_clicked)
 
+        for button, name in (
+            (self.prev_page_button, "chevron-left"), (self.next_page_button, "chevron-right"),
+            (self.zoom_out_button, "zoom-out"), (self.zoom_in_button, "zoom-in"),
+        ):
+            button.setText("")
+            button.setProperty("nav", False)
+            button.setIconSize(QSize(16, 16))
+            icons.bind(button, name)
+        self.fit_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.fit_button.setIconSize(QSize(16, 16))
+        icons.bind(self.fit_button, "fit-width")
         nav_layout = QHBoxLayout(nav)
         nav_layout.setContentsMargins(8, 3, 8, 3)
         nav_layout.setSpacing(4)
@@ -734,6 +814,12 @@ class DocumentPanel(QWidget):
         self.whole_word_button = self._flat_button("Whole word", "Match whole words only")
         self.whole_word_button.setCheckable(True)
         self.whole_word_button.toggled.connect(lambda _on: self._run_search(navigate=True))
+        search_icon = self.search_field.addAction(icons.icon("search", "muted"), QLineEdit.ActionPosition.LeadingPosition)
+        theme.manager().changed.connect(lambda: search_icon.setIcon(icons.icon("search", "muted")))
+        for button, name in ((self.search_prev_button, "chevron-up"), (self.search_next_button, "chevron-down")):
+            button.setText("")
+            button.setIconSize(QSize(16, 16))
+            icons.bind(button, name)
         search_layout = QHBoxLayout(search_bar)
         search_layout.setContentsMargins(8, 3, 8, 3)
         search_layout.setSpacing(4)
@@ -753,7 +839,10 @@ class DocumentPanel(QWidget):
         self.scene = QGraphicsScene(self)
         self.view = _ZoomableGraphicsView(self.scene)
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-        self.view.setMinimumSize(300, 300)
+        # Allow the view to flex down vertically (to 60px) so the user can freely
+        # expand the bottom deviations dock via cursor drag without being blocked
+        # by a rigid minimum central widget size.
+        self.view.setMinimumSize(160, 60)
         self.view.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.view.horizontalScrollBar().valueChanged.connect(self._on_scrolled)
         self.view.zoom_requested.connect(self._on_view_zoom_requested)
@@ -776,7 +865,7 @@ class DocumentPanel(QWidget):
 
         theme.manager().changed.connect(self._apply_theme)
         self._apply_theme()
-        self._show_message("Open a PDF or Word document,\nor drop a file here.")
+        self._show_empty_state()
         self._update_page_controls()
         self._update_search_controls()
 
@@ -792,8 +881,39 @@ class DocumentPanel(QWidget):
         button.setAutoRaise(True)
         return button
 
+    def _show_empty_state(self) -> None:
+        """No document yet: a drop zone saying what can be opened."""
+        self._show_message("")
+        t = theme.tokens()
+        width, height = 400.0, 220.0
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, width, height), 14, 14)
+        pen = QPen(QColor(t.border_strong), 1.4, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True)
+        self.scene.addPath(path, pen, QBrush(QColor(t.surface)))
+        ratio = max(self.devicePixelRatioF(), 1.0)
+        art = self.scene.addPixmap(icons.pixmap("upload", round(40 * ratio), "accent"))
+        art.setScale(1 / ratio)
+        art.setPos((width - 40) / 2, 38)
+
+        def centred(text: str, y: float, size: float, color: str, bold: bool = False) -> None:
+            font = QFont()
+            font.setPointSizeF(size)
+            font.setBold(bold)
+            item = self.scene.addText(text, font)
+            item.setDefaultTextColor(QColor(color))
+            item.setPos((width - item.boundingRect().width()) / 2, y)
+
+        centred(f"Drop the {self._title} document here", 92, 11.5, t.text, bold=True)
+        centred("PDF, Word, PowerPoint or Excel \u2014 or click Open\u2026", 124, 9, t.muted)
+        centred("Several files at once are merged into one document", 148, 8.5, t.muted)
+        self._empty_state = True
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-24, -24, 24, 24))
+
     def _apply_theme(self) -> None:
         t = theme.tokens()
+        if getattr(self, "_empty_state", False) and self._page_count == 0:
+            self._show_empty_state()
         self.view.setBackgroundBrush(QColor(t.canvas))
         pen = QPen(QColor(t.page_border), 1)
         pen.setCosmetic(True)
@@ -920,11 +1040,17 @@ class DocumentPanel(QWidget):
         self._missing_items = []
         self._overlay_items = []
         self._overlay_hits = []
+        self._matched_items = []
         self._crop_overlay_items = []
         had_area = bool(self._area)
         self._area = []
         self._area_items = []
-        # scene.clear() deleted the tints; a new document is searched anew.
+        # scene.clear() deleted the tints and table outlines; a new
+        # document is searched and analyzed anew.
+        self._table_items = []
+        self._table_layout = {}
+        self._table_layout_for = None
+        self._crop = {}  # a new document: main.py hands over its own crop
         self._search_items = []
         self._search_current_items = []
         self._search_matches = []
@@ -1061,6 +1187,7 @@ class DocumentPanel(QWidget):
 
     def _show_message(self, text: str) -> None:
         """Replace the view's content with a centered status message."""
+        self._empty_state = False
         self._reset_scene()
         self._page_count = 0
         self._pixmap_item = None
@@ -1244,6 +1371,8 @@ class DocumentPanel(QWidget):
             )
         self.layout_note.hide()
         self._request_search_index(path, "pdf")
+        if self._tables_visible:
+            self._request_table_layout()
         self.file_path = source_path or path  # set before `loaded` so listeners see it
         self.loaded.emit(self.file_path)
 
@@ -1659,6 +1788,36 @@ class DocumentPanel(QWidget):
                     self._overlay_items.append(overlay)
                     self._overlay_hits.append((rect, item))
 
+    def draw_matched(self, boxes_by_page: dict) -> None:
+        """Tint in very light green the text the comparison found the same
+        in both documents: {page: [box in PDF points]} (see
+        `core.token_map.TokenMap.matched_boxes`). Drawn under the
+        difference highlights."""
+        self.clear_matched()
+        for page, boxes in boxes_by_page.items():
+            if page < 1 or page > len(self._page_y_offsets):
+                continue
+            offset = self._page_y_offsets[page - 1]
+            for x0, top, x1, bottom in boxes:
+                rect = QRectF(
+                    x0 * RENDER_DPI_SCALE - 1, offset + top * RENDER_DPI_SCALE - 1,
+                    (x1 - x0) * RENDER_DPI_SCALE + 2, (bottom - top) * RENDER_DPI_SCALE + 2,
+                )
+                item = self.scene.addRect(rect, _MATCHED_PEN, _MATCHED_BRUSH)
+                item.setZValue(0.5)  # above the page image, under every other marker
+                self._matched_items.append(item)
+
+    def clear_matched(self) -> None:
+        for item in self._matched_items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._matched_items = []
+
+    def matched_count(self) -> int:
+        return len(self._matched_items)
+
     def clear_overlays(self) -> None:
         """Remove all persistent severity overlays."""
         for item in self._overlay_items:
@@ -1969,6 +2128,131 @@ class DocumentPanel(QWidget):
                 ),
             ))
         return boxes
+
+    # ------------------------------------------------------------------
+    # Table cells overlay (View > Show Table Cells)
+    # ------------------------------------------------------------------
+
+    def set_table_cells_visible(self, visible: bool) -> None:
+        """Outline every table and cell the comparison detects on this
+        document's pages (read in the background the first time)."""
+        self._tables_visible = visible
+        self._clear_table_items()
+        if not visible:
+            return
+        if self._table_layout_for != self._layout_key():
+            self._request_table_layout()
+        for page, tables in sorted(self._table_layout.items()):
+            self._draw_page_tables(page, tables)
+
+    def table_cells_available(self) -> bool:
+        """Whether this document has real pages to analyze (a PDF, or a
+        Word document laid out by Word) -- not an approximate layout."""
+        return self._doc_path is not None
+
+    def detected_tables(self) -> dict[int, list[dict]]:
+        """The table layout read so far: {page: [{"bbox", "cells",
+        "status", "parent"}]} in PDF points."""
+        return dict(self._table_layout)
+
+    def set_crop(self, crop: dict | None) -> None:
+        """The margins cut off this document ({page: (header_bottom,
+        footer_top, left, right)}): the table outlines are worked out
+        from the kept part, as the comparison reads it."""
+        crop = dict(crop or {})
+        if crop == self._crop:
+            return
+        self._crop = crop
+        if self._tables_visible:
+            self.set_table_cells_visible(True)
+
+    def _layout_key(self) -> tuple:
+        return (self._generation, tuple(sorted((p, tuple(m)) for p, m in self._crop.items())))
+
+    def _request_table_layout(self) -> None:
+        if self._doc_path is None:
+            return
+        self._table_layout = {}
+        self._table_layout_for = self._layout_key()
+        self._layout_request += 1
+        self._layout_reader.request(self._layout_request, self._doc_path, dict(self._crop))
+
+    def _on_table_layout(self, request: int, layout: dict) -> None:
+        if request != self._layout_request:
+            return  # for a document (or crop) no longer shown
+        self._table_layout.update(layout)
+        if self._tables_visible:
+            for page, tables in sorted(layout.items()):
+                self._draw_page_tables(page, tables)
+
+    def _clear_table_items(self) -> None:
+        for item in self._table_items:
+            try:
+                self.scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._table_items = []
+
+    def _exact_scene_rect(self, page: int, box) -> QRectF | None:
+        if page < 1 or page > len(self._page_y_offsets):
+            return None
+        x0, top, x1, bottom = box
+        offset = self._page_y_offsets[page - 1]
+        return QRectF(
+            x0 * RENDER_DPI_SCALE, offset + top * RENDER_DPI_SCALE,
+            (x1 - x0) * RENDER_DPI_SCALE, (bottom - top) * RENDER_DPI_SCALE,
+        )
+
+    def _draw_page_tables(self, page: int, tables: list[dict]) -> None:
+        for number, table in enumerate(tables, start=1):
+            outline = self._exact_scene_rect(page, table["bbox"])
+            if outline is None:
+                continue
+            status = table.get("status", "table")
+            color = QColor(_TABLE_COLORS.get(status, _TABLE_COLORS["table"]))
+            dashed = status == "ignored"
+            cell_color = QColor(color)
+            cell_color.setAlpha(150)
+            cell_pen = QPen(cell_color, 1, Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine)
+            cell_pen.setCosmetic(True)
+            for row in table["cells"]:
+                for cell in row:
+                    rect = self._exact_scene_rect(page, cell) if cell is not None else None
+                    if rect is not None:
+                        item = self.scene.addRect(rect.adjusted(1.5, 1.5, -1.5, -1.5), cell_pen)
+                        item.setZValue(1.6)
+                        self._table_items.append(item)
+            pen = QPen(color, 2.2, Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine)
+            pen.setCosmetic(True)
+            frame = self.scene.addRect(outline, pen)
+            frame.setZValue(1.7)
+            self._table_items.append(frame)
+            rows = len(table["cells"])
+            cols = max((len(row) for row in table["cells"]), default=0)
+            self._table_items.extend(
+                self._table_tag(f"{_TABLE_LABELS.get(status, 'Table')} {number} \u00b7 {rows}\u00d7{cols}", color, outline)
+            )
+
+    def _table_tag(self, text: str, color: QColor, outline: QRectF) -> list:
+        """A small label at a table's top-left corner, the same size at
+        any zoom."""
+        font = QFont()
+        font.setPointSizeF(7.5)
+        font.setBold(True)
+        label = self.scene.addSimpleText(text, font)
+        label.setBrush(QBrush(QColor(255, 255, 255)))
+        label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        bounds = label.boundingRect().adjusted(-4, -2, 4, 2)
+        back = self.scene.addRect(bounds, QPen(Qt.PenStyle.NoPen), QBrush(color))
+        back.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        back.setPos(outline.left() + 0.0, outline.top())
+        label.setPos(outline.left() + 0.0, outline.top())
+        back.setZValue(1.8)
+        label.setZValue(1.9)
+        # Above the frame, not over the table's first cell.
+        back.setTransform(back.transform().translate(4, -bounds.height() - 1))
+        label.setTransform(label.transform().translate(4, -bounds.height() - 1))
+        return [back, label]
 
     # ------------------------------------------------------------------
     # Find bar (core/text_search.py)

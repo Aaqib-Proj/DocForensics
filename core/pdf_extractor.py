@@ -199,6 +199,7 @@ import os
 import re
 import unicodedata
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Optional
@@ -522,6 +523,8 @@ GUTTER_WIDTH_MULTIPLIER = 3.5
 # noisy/rounded near-zero gap measurements producing a pathologically
 # small "gutter" requirement.
 MIN_GUTTER_WIDTH_FLOOR = 6.0
+# ...lowered, for tiny type, to this many text heights.
+_GUTTER_FLOOR_HEIGHTS = 1.5
 
 # A within-line gap wider than this is excluded when measuring a
 # page's "typical" word spacing -- a genuinely wide gap here is either
@@ -537,6 +540,10 @@ _TYPICAL_GAP_OUTLIER_CUTOFF = 15.0
 # small and floored at 1 row so a single spanning header line never
 # blocks detection of otherwise-clean column gutters.
 COLUMN_GUTTER_ROW_TOLERANCE_FRACTION = 0.06
+# In a block of fewer rows than this, a gutter some row crosses is never
+# wider than this (see `_detect_column_bands`).
+_MAX_CROSSED_GUTTER_WIDTH = 60.0
+_FEW_ROWS = 8
 
 # Hard cap on how many column bands we'll ever produce for one page.
 # Guards against pathological documents (e.g. a dense table) causing
@@ -698,6 +705,9 @@ class Word:
     # words cell-by-cell and to stop hyphen-stitching across cell
     # boundaries (see build_comparison_tokens).
     cell_id: Optional[tuple[int, int, int]] = None
+    # In an artwork sheet's box (product name, code, colours, approvals),
+    # read at the page edge (`_page_edge_of_wide_table`).
+    artwork: bool = False
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
@@ -744,6 +754,51 @@ _SCRIPT_BASE_GAP_EM = 0.3
 _SIZE_BUCKET_WIDTH = 40.0
 
 
+# A digit set at the text's own size but raised by this share of it, right
+# after a letter, is a superscript (a Word export raises "2" in "m2"
+# without making it smaller).
+_RAISED_DIGIT_MIN_RISE = 0.2
+_RAISED_DIGIT_MAX_RISE = 0.6
+_RAISED_DIGIT_MAX_RUN = 3
+
+
+def _mark_raised_digits(chars: list[dict]) -> None:
+    """Tag, in place, digits raised at full size right after a non-digit
+    -- "kg/m2" exported with the "2" lifted but not shrunk read "30kg/m 2,"
+    against "30kg/m²," -- as superscripts, on their base's line. Only
+    digits, at most `_RAISED_DIGIT_MAX_RUN` in a row, in the content
+    stream right after the glyph they belong to."""
+    k = 1
+    while k < len(chars):
+        base, c = chars[k - 1], chars[k]
+        size = float(c.get("size") or 0.0)
+        if (
+            c["text"].isdigit() and base["text"].strip() and not base["text"].isdigit()
+            and not c.get("script") and c.get("upright", True) and base.get("upright", True)
+            and size and abs(float(base.get("size") or 0.0) - size) < 0.1
+            and -0.5 <= c["x0"] - base["x1"] <= 1.0
+        ):
+            rise = c["matrix"][5] - base["matrix"][5]
+            if _RAISED_DIGIT_MIN_RISE * size <= rise <= _RAISED_DIGIT_MAX_RISE * size:
+                run = [c]
+                j = k + 1
+                while (j < len(chars) and len(run) < _RAISED_DIGIT_MAX_RUN and chars[j]["text"].isdigit()
+                       and abs(chars[j]["matrix"][5] - c["matrix"][5]) < 0.1):
+                    run.append(chars[j])
+                    j += 1
+                if j < len(chars) and chars[j]["text"].isdigit() and abs(chars[j]["matrix"][5] - c["matrix"][5]) < 0.1:
+                    k = j  # a longer raised number: not a superscript
+                    continue
+                for d in run:
+                    d["script"] = SUPERSCRIPT
+                    for key in ("top", "bottom", "doctop", "y0", "y1", "height"):
+                        if key in base:
+                            d[key] = base[key]
+                k = j
+                continue
+        k += 1
+
+
 def _mark_script_chars(chars: list[dict]) -> None:
     """Tag raised/lowered characters on one page, in place.
 
@@ -760,6 +815,7 @@ def _mark_script_chars(chars: list[dict]) -> None:
     upright = [c for c in chars if c.get("upright", True)]
     if not upright:
         return
+    _mark_raised_digits(chars)
     # Index non-space glyphs by (rounded edge x, vertical band) so each
     # lookup only checks glyphs near that edge on nearby lines. Two
     # vertically overlapping glyphs have centers less than one band
@@ -798,6 +854,23 @@ def _mark_script_chars(chars: list[dict]) -> None:
 
     def baseline(c: dict) -> float:
         return c["matrix"][5]  # PDF space, y up
+
+    def stacked_under(c: dict, d: dict) -> bool:
+        """Whether ``c`` sits under (or over) a glyph of ``d``'s line --
+        sharing more than half its width -- rather than beside ``d``: a
+        footnote "a" opening the next line, right under the "S" of "SD:",
+        is not that line's subscript."""
+        width = c["x1"] - c["x0"]
+        if width <= 0:
+            return False
+        c_band = band(c)
+        for x in range(int(c["x0"]) - 3, int(c["x1"]) + 2):
+            for b in (c_band - 1, c_band, c_band + 1):
+                for e in by_x0.get((x, b), ()):
+                    if (e is not c and abs(baseline(e) - baseline(d)) < 0.1
+                            and min(c["x1"], e["x1"]) - max(c["x0"], e["x0"]) > 0.5 * width):
+                        return True
+        return False
 
     # Sizes of glyphs already attached to a base; only a glyph of one of
     # these sizes can continue a run.
@@ -864,13 +937,21 @@ def _mark_script_chars(chars: list[dict]) -> None:
             ]
         else:
             candidates = []
-        for d in candidates:
-            if (
-                d["size"] * _SCRIPT_MIN_SIZE_RATIO <= size <= d["size"] * _SCRIPT_MAX_SIZE_RATIO
-                and abs(baseline(c) - baseline(d)) <= d["size"] * _SCRIPT_MAX_RISE
-            ):
-                base = d
-                break
+        # Of the glyphs it could be raised or lowered from, the one whose
+        # line it overlaps most: a footnote "a" between two lines of a
+        # table note reads as lowered from "SD:" above ("SₐD:") and raised
+        # from "Difference" below -- it sits on the line below.
+        fits = [
+            d for d in candidates
+            if d["size"] * _SCRIPT_MIN_SIZE_RATIO <= size <= d["size"] * _SCRIPT_MAX_SIZE_RATIO
+            and abs(baseline(c) - baseline(d)) <= d["size"] * _SCRIPT_MAX_RISE
+            and not stacked_under(c, d)
+        ]
+        if fits:
+            base = max(
+                fits,
+                key=lambda d: (min(c["bottom"], d["bottom"]) - max(c["top"], d["top"]), -fits.index(d)),
+            )
         if base is None:
             # Continuation of a run already attached on its left.
             for d in neighbors(c, left=True):
@@ -926,7 +1007,13 @@ def _mark_script_chars(chars: list[dict]) -> None:
         chars[:] = new_chars
 
 
-def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] = None) -> list[Word]:
+def extract_words(
+    pdf_path: str,
+    first_page: int = 1,
+    last_page: Optional[int] = None,
+    table_layout: Optional[dict[int, list[dict]]] = None,
+    crop: Optional[dict[int, tuple]] = None,
+) -> list[Word]:
     """Extract every word in a PDF, in column-aware reading order.
 
     Args:
@@ -934,6 +1021,14 @@ def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] =
         first_page, last_page: 1-indexed, inclusive page range (default:
             the whole document). Pages are processed independently, so
             ranges can be extracted in parallel and concatenated.
+        table_layout: When given, filled with each page's tables as the
+            reading order used them -- {page: [{"bbox", "cells",
+            "status", "parent"}]} in the same coordinates as the words
+            (see `_order_page_words`). The viewer draws them.
+        crop: Margins cut off per page, {page: (header_bottom, footer_top,
+            left, right)} in the same coordinates (the Crop Margins
+            dialog's): only what lies inside is read, and the page's
+            columns and tables are worked out from that alone.
 
     Returns:
         A flat list of Word objects covering all pages, ordered
@@ -1080,16 +1175,36 @@ def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] =
             # reconstruct rotated text separately, straight from
             # page.chars, which is what actually carries each
             # character's text matrix.
+            # Cropped margins are gone before anything is worked out:
+            # columns, zones and tables are found in what is kept, so a
+            # cropped-away column (a side-by-side document's Notations
+            # and Proposed Label) no longer shapes how the rest is read.
+            kept = _kept_area(crop, page_idx, page_x0, page_top0)
+            if kept is not None:
+                filtered_raw_words = [w for w in filtered_raw_words if _centre_inside(w, kept)]
             upright_words = [w for w in filtered_raw_words if w.get("upright", True)]
             # Tables only decide how the page's upright words are read. A
             # page without any (a scan, a blank page, artwork) skips the
             # search -- which reads every vector path on the page, a
             # million of them on an outlined scan.
             tables = _detect_page_tables(page) if upright_words else []
+            if kept is not None:
+                tables = [clipped for clipped in (_clip_table(t, kept) for t in tables) if clipped is not None]
             # One RTL decision per page -- stable across renderings.
             page_rtl = _page_is_rtl(filtered_raw_words)
-            ordered_words = _order_page_words(upright_words, tables, rtl=page_rtl, page=page)
-            rotated_chars = [c for c in page.chars if not c.get("upright", True)]
+            page_layout: Optional[list[dict]] = [] if table_layout is not None else None
+            ordered_words = _order_page_words(upright_words, tables, rtl=page_rtl, page=page, layout=page_layout)
+            if table_layout is not None:
+                table_layout[page_idx] = [_shift_table(t, page_x0, page_top0) for t in page_layout]
+            rotated_chars = [
+                c for c in page.chars
+                if not c.get("upright", True) and (kept is None or _centre_inside(c, kept))
+            ]
+            if rotated_chars and hasattr(page, "word_box_of"):
+                # The glyph stream leaves most word spaces out; MuPDF's own
+                # words say where turned words end.
+                for c in rotated_chars:
+                    c["word_box"] = page.word_box_of(c)
             ordered_words.extend(_ordered_rotated_words(rotated_chars))
             for w in ordered_words:
                 raw_text = w["text"]
@@ -1098,19 +1213,92 @@ def extract_words(pdf_path: str, first_page: int = 1, last_page: Optional[int] =
                 is_rtl_word = _text_is_rtl(raw_text)
                 if is_rtl_word:
                     raw_text = _fix_rtl_word_chars(raw_text)
+                text = _normalize_word_text(raw_text, mirror_brackets=is_rtl_word)
+                if not text.strip():
+                    # Nothing but invisible characters: a soft hyphen drawn
+                    # on its own after "N,N" at a line end. An empty word
+                    # can be neither matched nor listed.
+                    continue
 
                 all_words.append(
                     Word(
-                        text=_normalize_word_text(raw_text, mirror_brackets=is_rtl_word),
+                        text=text,
                         page=page_idx,
                         x0=w["x0"] - page_x0,
                         top=w["top"] - page_top0,
                         x1=w["x1"] - page_x0,
                         bottom=w["bottom"] - page_top0,
                         cell_id=w.get("cell_id"),
+                        artwork=bool(w.get("artwork")),
                     )
                 )
     return all_words
+
+
+def _kept_area(
+    crop: Optional[dict[int, tuple]], page_idx: int, dx: float, dy: float
+) -> Optional[tuple[float, float, float, float]]:
+    """The part of page ``page_idx`` a crop keeps, (x0, top, x1, bottom)
+    in the page's own coordinates (the crop is given in the words'
+    (0, 0)-origin space), or None when the page is not cropped."""
+    if not crop:
+        return None
+    margins = crop.get(page_idx)
+    if not margins:
+        return None
+    header_bottom, footer_top = float(margins[0]), float(margins[1])
+    left = float(margins[2]) if len(margins) >= 4 else 0.0
+    right = float(margins[3]) if len(margins) >= 4 else float("inf")
+    return (left + dx, header_bottom + dy, right + dx, footer_top + dy)
+
+
+def _centre_inside(obj: dict, area: tuple[float, float, float, float]) -> bool:
+    x = (obj["x0"] + obj["x1"]) / 2.0
+    y = (obj["top"] + obj.get("bottom", obj["top"])) / 2.0
+    return area[0] <= x <= area[2] and area[1] <= y <= area[3]
+
+
+# A cell cut down to less than this (pt) by a crop is gone.
+_MIN_CLIPPED_CELL = 2.0
+
+
+def _clip_table(table: dict, area: tuple[float, float, float, float]) -> Optional[dict]:
+    """A detected table cut to the kept part of a cropped page: cells
+    outside it are dropped (rows and columns left empty go too), cells
+    across its edge are trimmed. None when nothing of the table is left."""
+    def clip(box):
+        if box is None:
+            return None
+        x0, top, x1, bottom = max(box[0], area[0]), max(box[1], area[1]), min(box[2], area[2]), min(box[3], area[3])
+        if x1 - x0 < _MIN_CLIPPED_CELL or bottom - top < _MIN_CLIPPED_CELL:
+            return None
+        return (x0, top, x1, bottom)
+
+    grid = [[clip(cell) for cell in row] for row in table["cells"]]
+    grid = [row for row in grid if any(cell is not None for cell in row)]
+    if not grid:
+        return None
+    width = max(len(row) for row in grid)
+    keep_cols = [c for c in range(width) if any(c < len(row) and row[c] is not None for row in grid)]
+    grid = [[row[c] if c < len(row) else None for c in keep_cols] for row in grid]
+    bbox = clip(table["bbox"])
+    if bbox is None:
+        return None
+    # A table the crop cut down (a side-by-side grid kept to its RLD
+    # column) is still that table: what is kept of it is read as its
+    # cells, as without the crop -- not as loose text because only one
+    # column is left.
+    columns = max((len(row) for row in table["cells"]), default=0)
+    cut_down = columns >= 2 and len(table["cells"]) >= 3 and len(keep_cols) < columns
+    return dict(table, bbox=bbox, cells=grid, cut_down=cut_down)
+
+
+def _shift_table(table: dict, dx: float, dy: float) -> dict:
+    """A `layout` table moved into the words' (0, 0)-origin page space."""
+    def move(box):
+        return None if box is None else (box[0] - dx, box[1] - dy, box[2] - dx, box[3] - dy)
+
+    return dict(table, bbox=move(table["bbox"]), cells=[[move(cell) for cell in row] for row in table["cells"]])
 
 
 def _order_page_words(
@@ -1119,6 +1307,7 @@ def _order_page_words(
     *,
     rtl: bool = False,
     page: Optional[Any] = None,
+    layout: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Return one page's word-dicts in reading order.
 
@@ -1136,6 +1325,12 @@ def _order_page_words(
         rtl: If True, words within each line are sorted right-to-left
             (descending x0) instead of left-to-right.  Determined
             at page level by the caller.
+        layout: When given, gets one dict per detected table: its
+            "bbox" and "cells" (row-major, None where merged away), the
+            table it is drawn inside ("parent", or None), and "status":
+            "table" (read cell by cell), "nested" (read cell by cell
+            inside its parent's cell) or "ignored" (not a real table --
+            ruling lines over flowing text, one column -- read as text).
 
     Returns:
         The same word-dicts, reordered into reading order. Dicts for
@@ -1151,21 +1346,53 @@ def _order_page_words(
     content_x0 = min(w["x0"] for w in raw_words)
     content_x1 = max(w["x1"] for w in raw_words)
 
-    cell_ids = _assign_words_to_cells(raw_words, tables)
-    real_table_idxs = {
-        t_idx
-        for t_idx in range(len(tables))
-        if _looks_like_real_table(t_idx, cell_ids)
-        and not _cuts_through_words(tables[t_idx], raw_words)
-    }
+    # A table drawn inside a cell of another (a side-by-side document's
+    # "RLD Label | Notations | Proposed Label" grid with an adverse-
+    # reactions table in its first cell) is NESTED: the outer table
+    # claims the words, and the inner table only says which of its own
+    # cells each one is in -- see `_table_units_for`.
+    parents = _nesting_parents(tables)
+    top_level = [t_idx for t_idx in range(len(tables)) if t_idx not in parents]
+
+    def real_tables(candidates: list[int], ids: dict) -> set[int]:
+        return {
+            t_idx
+            for t_idx in candidates
+            if (_looks_like_real_table(t_idx, ids) or tables[t_idx].get("cut_down"))
+            and not _cuts_through_words(tables[t_idx], raw_words)
+        }
+
+    cell_ids = _assign_words_to_cells(raw_words, tables, only=top_level)
+    real_table_idxs = real_tables(top_level, cell_ids)
     cell_ids = {w_idx: cid for w_idx, cid in cell_ids.items() if cid[0] in real_table_idxs}
+    # A table inside one that is not a real table stands on its own.
+    orphans = [j for j, parent in parents.items() if parent not in real_table_idxs and parents.get(parent) is None]
+    if orphans:
+        orphan_ids = _assign_words_to_cells(raw_words, tables, only=orphans, taken=set(cell_ids))
+        kept = real_tables(orphans, orphan_ids)
+        cell_ids.update({w_idx: cid for w_idx, cid in orphan_ids.items() if cid[0] in kept})
+        real_table_idxs |= kept
+    inner_ids = _nested_cell_ids(raw_words, tables, parents, cell_ids, real_table_idxs)
 
     # Tag the word dicts themselves so extract_words() can carry each
     # word's cell membership onto the Word objects (the hyphen-stitch
     # guard in build_comparison_tokens depends on it). Body words are
-    # left without the key -> cell_id None.
+    # left without the key -> cell_id None. A nested table's word carries
+    # its own (inner) cell, so nothing is stitched across inner cells.
     for w_idx, cid in cell_ids.items():
-        raw_words[w_idx]["cell_id"] = cid
+        raw_words[w_idx]["cell_id"] = inner_ids.get(w_idx, cid)
+
+    if layout is not None:
+        nested_used = {cid[0] for cid in inner_ids.values()}
+        for t_idx, table in enumerate(tables):
+            status = (
+                "table" if t_idx in real_table_idxs
+                else "nested" if t_idx in nested_used
+                else "ignored"
+            )
+            layout.append(
+                {"bbox": table["bbox"], "cells": table["cells"], "status": status, "parent": parents.get(t_idx)}
+            )
 
     body_words = [w for i, w in enumerate(raw_words) if i not in cell_ids]
     if not body_words:
@@ -1179,7 +1406,8 @@ def _order_page_words(
             if entries:
                 table_units.extend(
                     _table_units_for(
-                        t_idx, entries, [(content_x0, content_x1)], cell_ids, tables[t_idx]["bbox"], rtl=rtl
+                        t_idx, entries, [(content_x0, content_x1)], cell_ids, tables[t_idx]["bbox"], rtl=rtl,
+                        inner_ids=inner_ids, tables=tables,
                     )
                 )
         return [w for _, _, words in sorted(table_units, key=lambda u: u[1]) for w in words]
@@ -1189,12 +1417,34 @@ def _order_page_words(
         rows, content_x0, content_x1, min_gutter=_adaptive_min_gutter(rows)
     )
     page_bands = _merge_narrow_column_bands(page_bands, min_width=25.0)
+    page_bands = _merge_label_strips(page_bands, rows)
     is_page_cols = len(page_bands) >= 2 and _is_robust_page_columns(page_bands, content_x0, content_x1)
     if not is_page_cols:
         page_panels = _detect_page_panels(rows, content_x0, content_x1)
         if page_panels is not None:
             page_bands = page_panels
             is_page_cols = True
+
+    # Lines printed across the columns right under a box at the top of the
+    # page (an outsert's "Note: Pharma code/ Bar code ... visible on folded
+    # leaflet." under its artwork box) belong with the box, not cut up
+    # among the columns they cross.
+    caption_units: list[tuple[int, float, list[dict]]] = []
+    if is_page_cols:
+        read_tables = {cid[0] for cid in cell_ids.values()}
+        for t_idx, table in enumerate(tables):
+            if t_idx not in read_tables:
+                continue
+            if _page_edge_of_wide_table(table["bbox"], page_bands, body_words) != "top":
+                continue
+            caption = _lines_under_box(table["bbox"], page_bands, rows)
+            if caption:
+                for line in caption:
+                    for w in line:
+                        w["artwork"] = True
+                taken = {id(w) for line in caption for w in line}
+                body_words = [w for w in body_words if id(w) not in taken]
+                caption_units.extend((0, min(w["top"] for w in line) - _PAGE_EDGE_KEY, line) for line in caption)
 
     body_units, bands = _order_body_units(body_words, content_x0, content_x1, rtl=rtl, page=page)
 
@@ -1240,11 +1490,22 @@ def _order_page_words(
             cand_bands,
             key=lambda b: max(band_yranges[b][0] - t_mid_y, 0.0, t_mid_y - band_yranges[b][1]),
         )
-        table_units.extend(
-            _table_units_for(t_idx, entries, bands, cell_ids, t_box, band_idx=best_b, rtl=rtl)
+        units = _table_units_for(
+            t_idx, entries, bands, cell_ids, t_box, band_idx=best_b, rtl=rtl,
+            inner_ids=inner_ids, tables=tables,
         )
+        edge = _page_edge_of_wide_table(t_box, page_bands, body_words) if is_page_cols else None
+        if edge is not None:
+            for _band, _top, words in units:
+                for w in words:
+                    w["artwork"] = True
+        if edge == "top":
+            units = [(0, top - _PAGE_EDGE_KEY, words) for _band, top, words in units]
+        elif edge == "bottom":
+            units = [(len(bands) - 1, top + _PAGE_EDGE_KEY, words) for _band, top, words in units]
+        table_units.extend(units)
 
-    all_units = body_units + table_units
+    all_units = body_units + table_units + caption_units
     ordered: list[dict] = []
     for band_idx in range(len(bands)):
         band_units = sorted(
@@ -1254,6 +1515,93 @@ def _order_page_words(
         for _, _, words in band_units:
             ordered.extend(words)
     return ordered
+
+
+# Sort-key offset that puts a unit before (after) everything on its page.
+_PAGE_EDGE_KEY = 1e6
+# Text above (below) a page-top (-bottom) box, at most this share of the
+# text below (above) it: a sheet label, not a column.
+_EDGE_TABLE_STRAY_SHARE = 0.02
+
+
+def _page_edge_of_wide_table(
+    t_box: tuple[float, float, float, float],
+    page_bands: list[tuple[float, float]],
+    body_words: list[dict],
+) -> Optional[str]:
+    """"top" (or "bottom") when the table spans two or more of the page's
+    columns with none of their text above (below) it: read whole at the
+    start (end) of the page, not inside whichever column its middle is
+    over. An outsert's artwork box (product name, code, colours, dates)
+    across four columns at the top of the sheet was read between the end
+    of the third column and the start of the fourth -- and two versions
+    break their columns at different words, so the box split the text on
+    both sides ("Table 7." / "V. No. : 01 CODE : 8099813 ... Table 8:")."""
+    x0, top, x1, bottom = t_box
+    spanned = [
+        (lo, hi) for lo, hi in page_bands
+        if min(x1, hi) - max(x0, lo) > 0.5 * (hi - lo)
+    ]
+    if len(spanned) < 2:
+        return None
+    lo_x, hi_x = min(lo for lo, _ in spanned), max(hi for _, hi in spanned)
+    under = [w for w in body_words if lo_x <= (w["x0"] + w["x1"]) / 2.0 <= hi_x]
+    above = [w for w in under if w.get("bottom", w["top"]) <= top + 1.0]
+    below = [w for w in under if w["top"] >= bottom - 1.0]
+    if len(above) + len(below) < len(under):
+        return None  # text beside the box: it sits among the columns
+    # A sheet label over the box ("1.14.2.2") does not make it mid-page.
+    if below and len(above) <= _EDGE_TABLE_STRAY_SHARE * len(below):
+        return "top"
+    if above and len(below) <= _EDGE_TABLE_STRAY_SHARE * len(above):
+        return "bottom"
+    return None
+
+
+# A line under a page-top box is part of it while it starts this many of
+# its own heights below the line above, and holds no wider gap than this.
+_BOX_CAPTION_LINE_GAP = 2.0
+_BOX_CAPTION_MAX_WORD_GAP = 15.0
+
+
+def _lines_under_box(
+    t_box: tuple[float, float, float, float],
+    page_bands: list[tuple[float, float]],
+    rows: list[list[dict]],
+) -> list[list[dict]]:
+    """The lines right under a page-top box that run across a gutter of
+    the columns it spans, each left to right -- see `_order_page_words`."""
+    x0, _top, x1, bottom = t_box
+    spanned = [(lo, hi) for lo, hi in page_bands if min(x1, hi) - max(x0, lo) > 0.5 * (hi - lo)]
+    if len(spanned) < 2:
+        return []
+    # The box's own width as well as the columns it spans: a note under a
+    # box reaching a little into the next column starts there.
+    lo_x = min(x0, min(lo for lo, _ in spanned))
+    hi_x = max(x1, max(hi for _, hi in spanned))
+    gutters = [
+        (left[1], right[0]) for left, right in zip(page_bands, page_bands[1:])
+        if lo_x <= left[1] and right[0] <= hi_x
+    ]
+    lines: list[list[dict]] = []
+    edge = bottom
+    for row in sorted(rows, key=_line_top):
+        words = sorted((w for w in row if w["x0"] >= lo_x - 5.0 and w["x1"] <= hi_x + 5.0), key=lambda w: w["x0"])
+        if not words:
+            continue
+        line_top = min(w["top"] for w in words)
+        if line_top < edge - 1.0:
+            continue
+        height = max(w.get("bottom", w["top"] + 10.0) - w["top"] for w in words)
+        if line_top - edge > _BOX_CAPTION_LINE_GAP * height:
+            break
+        gaps = [b["x0"] - a["x1"] for a, b in zip(words, words[1:])]
+        crosses = any(words[0]["x0"] < g_lo and words[-1]["x1"] > g_hi for g_lo, g_hi in gutters)
+        if not crosses or (gaps and max(gaps) > _BOX_CAPTION_MAX_WORD_GAP):
+            break
+        lines.append(words)
+        edge = max(w.get("bottom", w["top"] + 10.0) for w in words)
+    return lines
 
 
 # --- Rotated (non-upright) text reconstruction (MVP-14) ---------------
@@ -1267,6 +1615,14 @@ def _order_page_words(
 # concatenated into one reading unit or positioned as if it were one.
 ROTATED_LINE_TOLERANCE = 3.0
 ROTATED_BLOCK_GAP = 20.0
+# A gap along a turned line wider than this many type sizes starts the
+# next column.
+_ROTATED_COLUMN_GAP_EM = 1.5
+# A gap along a turned line ends a word when it is at least this wide
+# (points, type sizes) and this many times the line's usual letter gap.
+_ROTATED_WORD_GAP_MIN = 1.0
+_ROTATED_WORD_GAP_EM = 0.12
+_ROTATED_WORD_GAP_RATIO = 3.0
 
 
 def _rotation_bucket(matrix: tuple) -> tuple[float, float, float, float]:
@@ -1294,18 +1650,21 @@ def _ordered_rotated_words(rotated_chars: list[dict]) -> list[dict]:
     """
     if not rotated_chars:
         return []
-    blocks = _reconstruct_rotated_blocks(rotated_chars)
-    blocks.sort(key=lambda block: min(w["x0"] for w in block))
+    groups = _reconstruct_rotated_blocks(rotated_chars)
+    # Turned blocks of one angle stay in their own reading order; angles
+    # follow one another left to right.
+    groups.sort(key=lambda blocks: min(w["x0"] for block in blocks for w in block))
     words: list[dict] = []
-    for block in blocks:
-        words.extend(block)
+    for blocks in groups:
+        for block in blocks:
+            words.extend(block)
     return words
 
 
-def _reconstruct_rotated_blocks(chars: list[dict]) -> list[list[dict]]:
+def _reconstruct_rotated_blocks(chars: list[dict]) -> list[list[list[dict]]]:
     """Group non-upright characters by rotation angle, then reconstruct
     each angle's characters into spatially-coherent blocks of words
-    (see ``_words_from_rotated_group``).
+    (see ``_words_from_rotated_group``) -- one list of blocks per angle.
     """
     by_rotation: dict[tuple, list[dict]] = {}
     for ch in chars:
@@ -1314,47 +1673,88 @@ def _reconstruct_rotated_blocks(chars: list[dict]) -> list[list[dict]]:
             continue
         by_rotation.setdefault(_rotation_bucket(matrix), []).append(dict(ch))
 
-    blocks: list[list[dict]] = []
+    groups: list[list[list[dict]]] = []
     for (a, b, c, d), group in by_rotation.items():
-        blocks.extend(_words_from_rotated_group(group, a, b, c, d))
-    return blocks
+        blocks = _words_from_rotated_group(group, a, b, c, d)
+        if blocks:
+            groups.append(blocks)
+    return groups
 
 
 def _words_from_rotated_group(
     chars: list[dict], a: float, b: float, c: float, d: float
 ) -> list[list[dict]]:
     """One rotation angle's characters -> blocks of correctly-ordered
-    word-dicts.
+    word-dicts, in reading order along that angle.
 
     Projects each character's position onto the matrix's own advance
     direction (a, b) and perpendicular direction (c, d) -- see the
     MVP-14 module note -- to cluster characters into lines, order
     characters within a line, and order lines relative to each other,
     all without assuming horizontal text.
+
+    Lines are told apart at half the type size (a fixed 3pt merged the
+    3pt lines of a foil's upside-down text), cut where a column-sized gap
+    opens along the line, and the pieces gathered into columns read one
+    after the other: two upside-down columns side by side were read
+    across, word by word ("Each Tamoxifen uncoated Citrate tablet").
     """
     for ch in chars:
         ch["_perp"] = -c * ch["x0"] + d * ch["top"]
         ch["_adv"] = a * ch["x0"] - b * ch["top"]
+        ends = [a * x - b * y for x in (ch["x0"], ch["x1"]) for y in (ch["top"], ch["bottom"])]
+        ch["_adv_lo"], ch["_adv_hi"] = min(ends), max(ends)
+
+    def size(ch: dict) -> float:
+        return float(ch.get("size") or 0.0) or ROTATED_LINE_TOLERANCE * 2
 
     ordered = sorted(chars, key=lambda ch: ch["_perp"])
     lines: list[list[dict]] = [[ordered[0]]]
     for ch in ordered[1:]:
         line_perp = sum(x["_perp"] for x in lines[-1]) / len(lines[-1])
-        if abs(ch["_perp"] - line_perp) <= ROTATED_LINE_TOLERANCE:
+        tolerance = min(ROTATED_LINE_TOLERANCE, 0.5 * size(ch))
+        if abs(ch["_perp"] - line_perp) <= tolerance:
             lines[-1].append(ch)
         else:
             lines.append([ch])
 
-    blocks: list[list[dict]] = []
-    prev_perp: Optional[float] = None
+    # Each line cut at column-sized gaps along it.
+    pieces: list[list[dict]] = []
     for line in lines:
-        line_perp = sum(ch["_perp"] for ch in line) / len(line)
-        if prev_perp is not None and abs(line_perp - prev_perp) > ROTATED_BLOCK_GAP:
-            blocks.append([])
-        if not blocks:
-            blocks.append([])
-        blocks[-1].extend(_words_from_rotated_line(line))
-        prev_perp = line_perp
+        line.sort(key=lambda ch: ch["_adv_lo"])
+        piece = [line[0]]
+        for ch in line[1:]:
+            gap = ch["_adv_lo"] - max(x["_adv_hi"] for x in piece)
+            if gap > max(2.0, _ROTATED_COLUMN_GAP_EM * size(ch)):
+                pieces.append(piece)
+                piece = [ch]
+            else:
+                piece.append(ch)
+        pieces.append(piece)
+
+    # Pieces gathered into columns: a piece joins the column whose span
+    # along the line it overlaps.
+    columns: list[dict] = []
+    for piece in sorted(pieces, key=lambda p: sum(ch["_perp"] for ch in p) / len(p)):
+        lo, hi = min(ch["_adv_lo"] for ch in piece), max(ch["_adv_hi"] for ch in piece)
+        home = next((col for col in columns if lo < col["hi"] and col["lo"] < hi), None)
+        if home is None:
+            home = {"lo": lo, "hi": hi, "pieces": []}
+            columns.append(home)
+        home["lo"], home["hi"] = min(home["lo"], lo), max(home["hi"], hi)
+        home["pieces"].append(piece)
+    columns.sort(key=lambda col: col["lo"])
+
+    blocks: list[list[dict]] = []
+    for col in columns:
+        prev_perp: Optional[float] = None
+        blocks.append([])
+        for piece in col["pieces"]:
+            piece_perp = sum(ch["_perp"] for ch in piece) / len(piece)
+            if prev_perp is not None and abs(piece_perp - prev_perp) > ROTATED_BLOCK_GAP:
+                blocks.append([])
+            blocks[-1].extend(_words_from_rotated_line(piece))
+            prev_perp = piece_perp
     return [b for b in blocks if b]
 
 
@@ -1372,6 +1772,14 @@ def _words_from_rotated_line(line: list[dict]) -> list[dict]:
     directly instead of guessing from spacing.
     """
     line = sorted(line, key=lambda ch: ch["_adv"])
+    # The line's ordinary letter spacing, against which a word gap stands
+    # out (letters of a turned word usually touch: 0pt; words 1.5pt apart).
+    letter_gaps = sorted(
+        max(0.0, b.get("_adv_lo", 0.0) - a.get("_adv_hi", 0.0))
+        for a, b in zip(line, line[1:])
+        if not a["text"].isspace() and not b["text"].isspace()
+    )
+    usual = letter_gaps[len(letter_gaps) // 2] if letter_gaps else 0.0
     words: list[dict] = []
     current: list[dict] = []
     for ch in line:
@@ -1380,6 +1788,17 @@ def _words_from_rotated_line(line: list[dict]) -> list[dict]:
                 words.append(_merge_rotated_chars(current))
                 current = []
         else:
+            # A space the glyph stream left out: MuPDF puts the two
+            # characters in different words -- or, where MuPDF too runs
+            # them together ("yourdoctoraboutyour"), a gap clearly wider
+            # than the line's letter spacing.
+            box, last_box = ch.get("word_box"), current[-1].get("word_box") if current else None
+            gap = ch.get("_adv_lo", 0.0) - current[-1].get("_adv_hi", 0.0) if current else 0.0
+            size = float(ch.get("size") or 0.0)
+            wide = gap >= max(_ROTATED_WORD_GAP_MIN, _ROTATED_WORD_GAP_EM * size, _ROTATED_WORD_GAP_RATIO * usual + 0.3)
+            if current and ((box is not None and last_box is not None and box != last_box) or wide):
+                words.append(_merge_rotated_chars(current))
+                current = []
             current.append(ch)
     if current:
         words.append(_merge_rotated_chars(current))
@@ -1445,10 +1864,16 @@ def _detect_page_tables(page) -> list[dict]:
 def _assign_words_to_cells(
     raw_words: list[dict],
     tables: list[dict],
+    only: Optional[list[int]] = None,
+    taken: Optional[set[int]] = None,
 ) -> dict[int, tuple[int, int, int]]:
-    """Map each word whose center falls in a table to (table, row, col)."""
+    """Map each word whose center falls in a table to (table, row, col).
+    ``only``: just these tables; ``taken``: words already in a table."""
     cell_ids: dict[int, tuple[int, int, int]] = {}
+    taken = taken or set()
     for t_idx, table in enumerate(tables):
+        if only is not None and t_idx not in only:
+            continue
         t_x0, t_top, t_x1, t_bottom = table["bbox"]
         cell_index = [
             (r, c, cell)
@@ -1457,7 +1882,7 @@ def _assign_words_to_cells(
             if cell is not None
         ]
         for w_idx, w in enumerate(raw_words):
-            if w_idx in cell_ids:
+            if w_idx in cell_ids or w_idx in taken:
                 continue
             mid_x = (w["x0"] + w["x1"]) / 2.0
             mid_y = (w["top"] + w["bottom"]) / 2.0
@@ -1468,6 +1893,70 @@ def _assign_words_to_cells(
                 continue
             cell_ids[w_idx] = _cell_key_for(mid_x, mid_y, cell_index, t_idx)
     return cell_ids
+
+
+# How far (pt) a nested table may stick out of the table holding it.
+_NESTING_TOLERANCE = 2.0
+
+
+def _nesting_parents(tables: list[dict]) -> dict[int, int]:
+    """Each table drawn inside another -> the smallest table holding it."""
+    def area(box) -> float:
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    parents: dict[int, int] = {}
+    for j, inner in enumerate(tables):
+        x0, y0, x1, y1 = inner["bbox"]
+        best = None
+        for i, outer in enumerate(tables):
+            a0, b0, a1, b1 = outer["bbox"]
+            if (
+                i != j
+                and a0 - _NESTING_TOLERANCE <= x0 and b0 - _NESTING_TOLERANCE <= y0
+                and x1 <= a1 + _NESTING_TOLERANCE and y1 <= b1 + _NESTING_TOLERANCE
+                and area(outer["bbox"]) > area(inner["bbox"])
+                and (best is None or area(outer["bbox"]) < area(tables[best]["bbox"]))
+            ):
+                best = i
+        if best is not None:
+            parents[j] = best
+    return parents
+
+
+def _nested_cell_ids(
+    raw_words: list[dict],
+    tables: list[dict],
+    parents: dict[int, int],
+    cell_ids: dict[int, tuple[int, int, int]],
+    real_table_idxs: set[int],
+) -> dict[int, tuple[int, int, int]]:
+    """For the words of a table nested in a (real) table: which cell of
+    the NESTED table each is in -- (nested table, row, col). A nested
+    grid that is not a real table (a box around one paragraph) gives
+    nothing, and its words are read as the outer cell's text."""
+    inner_ids: dict[int, tuple[int, int, int]] = {}
+    for j, parent in parents.items():
+        if parent not in real_table_idxs:
+            continue
+        x0, top, x1, bottom = tables[j]["bbox"]
+        cell_index = [
+            (r, c, cell)
+            for r, row in enumerate(tables[j]["cells"])
+            for c, cell in enumerate(row)
+            if cell is not None
+        ]
+        found: dict[int, tuple[int, int, int]] = {}
+        for w_idx, cid in cell_ids.items():
+            if cid[0] != parent or w_idx in inner_ids:
+                continue
+            w = raw_words[w_idx]
+            mid_x = (w["x0"] + w["x1"]) / 2.0
+            mid_y = (w["top"] + w["bottom"]) / 2.0
+            if x0 <= mid_x <= x1 and top <= mid_y <= bottom:
+                found[w_idx] = _cell_key_for(mid_x, mid_y, cell_index, j)
+        if found and _looks_like_real_table(j, found) and not _cuts_through_words(tables[j], raw_words):
+            inner_ids.update(found)
+    return inner_ids
 
 
 # A real table's whole point is that a row's RELATED data spans
@@ -1534,14 +2023,25 @@ def _cuts_through_words(table: dict, raw_words: list[dict]) -> bool:
     ]
     if len(inside) < _MIN_STRADDLE_SAMPLE_WORDS:
         return False
-    crossing = sum(
-        1
-        for word in inside
-        if any(
-            word["x0"] < edge - _STRADDLE_TOLERANCE and word["x1"] > edge + _STRADDLE_TOLERANCE
-            for edge in edges
-        )
-    )
+    # A word crosses a column edge of ITS OWN cell. Not just any column
+    # edge of the table: a merged cell (a header spanning three dose
+    # columns) is one wide cell, and its words cross the edges the rows
+    # below have between those columns without the grid being wrong.
+    cells = [cell for row in table["cells"] for cell in row if cell is not None]
+
+    def own_cell(word: dict):
+        cx = (word["x0"] + word["x1"]) / 2.0
+        cy = (word["top"] + word["bottom"]) / 2.0
+        holding = [c for c in cells if c[0] <= cx <= c[2] and c[1] <= cy <= c[3]]
+        return min(holding, key=lambda c: (c[2] - c[0]) * (c[3] - c[1])) if holding else None
+
+    crossing = 0
+    for word in inside:
+        cell = own_cell(word)
+        if cell is not None and (
+            word["x0"] < cell[0] - _STRADDLE_TOLERANCE or word["x1"] > cell[2] + _STRADDLE_TOLERANCE
+        ):
+            crossing += 1
     return crossing / len(inside) >= _MAX_WORD_STRADDLE_FRACTION
 
 
@@ -1608,6 +2108,9 @@ def _cell_key_for(
 # `_order_body_units` runs column-gutter detection SEPARATELY within
 # each zone, so each section's own column structure is judged only
 # against its own rows.
+_BARE_NUMBER = re.compile(r"^\d+(?:\.\d+)*\.?$")
+
+
 def _split_into_zones(rows: list[list[dict]]) -> list[list[list[dict]]]:
     """Split rows (already in top-to-bottom order) into contiguous
     zones, starting a new zone at each row that looks like a section
@@ -1627,7 +2130,12 @@ def _split_into_zones(rows: list[list[dict]]) -> list[list[list[dict]]]:
                 if (b["x0"] - a["x1"]) >= MIN_COLUMN_GUTTER_WIDTH:
                     prefix_words = [w for w in sorted_r if w["x1"] <= a["x1"]]
                     prefix_text = " ".join(w["text"] for w in prefix_words)
-                    if is_likely_header_line(prefix_text):
+                    # A bare number with more numbers beside it is a row of a
+                    # table's dose headings ("20   40   80   120   160"), not
+                    # section 20: the zone it opened cut a table's header in
+                    # two, read as two tables.
+                    dose_row = _BARE_NUMBER.match(prefix_text) and _BARE_NUMBER.match(b["text"])
+                    if is_likely_header_line(prefix_text) and not dose_row:
                         is_header = True
                     break
         if zones[-1] and is_header:
@@ -1827,11 +2335,17 @@ def _order_label_value_zone(
     # RIGHTMOST band (bands[-1]), not the leftmost -- see the matching
     # RTL note in `_order_body_units`'s column-flow branch.
     label_band = bands[-1] if rtl else bands[0]
+
+    # A word before the label column (left of it; right of it in RTL),
+    # outside every band, is read with the label, not after the values:
+    # "New code | Revised: February 2026", where the bands began at "code",
+    # read "code New Revised: ...".
+    def in_label(mid_x: float) -> bool:
+        return mid_x >= label_band[0] if rtl else mid_x <= label_band[1]
+
     groups: list[list[list[dict]]] = [[]]
     for row in zone_rows:
-        has_label = any(
-            label_band[0] <= (w["x0"] + w["x1"]) / 2.0 <= label_band[1] for w in row
-        )
+        has_label = any(in_label((w["x0"] + w["x1"]) / 2.0) for w in row)
         if has_label and groups[-1]:
             groups.append([])
         groups[-1].append(row)
@@ -1843,7 +2357,7 @@ def _order_label_value_zone(
         for row in group_rows:
             for w in row:
                 mid_x = (w["x0"] + w["x1"]) / 2.0
-                if label_band[0] <= mid_x <= label_band[1]:
+                if in_label(mid_x):
                     label_words.append(w)
                 else:
                     value_words.append(w)
@@ -1958,6 +2472,55 @@ def _merge_narrow_column_bands(
                     merged.pop(i)
                 changed = True
                 break
+    return merged
+
+
+# A strip narrower than a text column averaging fewer words a line than
+# this, mostly numbering labels, holds labels hanging beside a column
+# (section numbers, line numbers), not a column of its own.
+_LABEL_STRIP_MAX_WORDS = 2.0
+_LABEL_STRIP_MIN_LABEL_SHARE = 0.6
+_NUMBERING_LABEL = re.compile(r"^\(?(?:\d{1,3}(?:\.\d{1,3})*|[ivxlc]{1,5}|[a-zA-Z])[.):]?$")
+
+
+def _merge_label_strips(
+    bands: list[tuple[float, float]], rows: list[list[dict]]
+) -> list[tuple[float, float]]:
+    """``bands`` with each strip of hanging labels merged into the column
+    it labels, the one to its right: a narrow strip, few words a line,
+    most of them numbering labels ("1", "2.3", "(a)", "iv.").
+
+    A Contents list sets "1", "2" ... "7" at x=36 and their headings at
+    x=54: the 13pt gap was taken for a gutter, the numbers became a
+    column of their own and were read first, all together ("FULL 1 2 3 4
+    5 6 7 Reference PRESCRIBING ..."), leaving every heading without its
+    number. A narrow strip of anything else (a signature block's
+    "Operator/Dev.", an artwork code) is left as it was."""
+    if len(bands) < 3:
+        return bands  # two bands: a real page of columns, or a label/value table (handled elsewhere)
+    merged = list(bands)
+    changed = True
+    while changed and len(merged) >= 3:
+        changed = False
+        lines = [0] * len(merged)
+        words: list[list[str]] = [[] for _ in merged]
+        for row in rows:
+            per_band: dict[int, list[str]] = {}
+            for w in row:
+                per_band.setdefault(_band_index_for((w["x0"] + w["x1"]) / 2.0, merged), []).append(w["text"])
+            for b, texts in per_band.items():
+                lines[b] += 1
+                words[b].extend(texts)
+        for i, (lo, hi) in enumerate(merged[:-1]):
+            if hi - lo >= _TEXT_COLUMN_MIN_WIDTH or not lines[i] or len(words[i]) / lines[i] >= _LABEL_STRIP_MAX_WORDS:
+                continue
+            labels = sum(1 for text in words[i] if _NUMBERING_LABEL.match(text))
+            if labels < _LABEL_STRIP_MIN_LABEL_SHARE * len(words[i]):
+                continue
+            merged[i + 1] = (min(lo, merged[i + 1][0]), merged[i + 1][1])
+            merged.pop(i)
+            changed = True
+            break
     return merged
 
 
@@ -2101,6 +2664,7 @@ def _order_body_units(
         rows, content_x0, content_x1, min_gutter=_adaptive_min_gutter(rows)
     )
     page_bands = _merge_narrow_column_bands(page_bands, min_width=25.0)
+    page_bands = _merge_label_strips(page_bands, rows)
     is_page_cols = len(page_bands) >= 2 and _is_robust_page_columns(page_bands, content_x0, content_x1)
     if not is_page_cols:
         page_panels = _detect_page_panels(rows, content_x0, content_x1)
@@ -2126,7 +2690,7 @@ def _order_body_units(
         def emit_stream(col_words: list[dict]) -> None:
             col_rows = sorted(_group_column_lines(col_words), key=_line_top)
             col_zones = _split_into_zones(col_rows)
-            for zone_rows in col_zones:
+            for zone_rows, peeled_bands in _peel_spanning_rows(col_zones):
                 zone_words = [w for row in zone_rows for w in row]
                 zone_x0 = min(w["x0"] for w in zone_words)
                 zone_x1 = max(w["x1"] for w in zone_words)
@@ -2136,7 +2700,7 @@ def _order_body_units(
                     for top, words in _read_lines(zone_rows, rtl=rtl):
                         all_units.append((band_offset, top, words))
                     continue
-                zone_bands = _detect_column_bands(
+                zone_bands = peeled_bands or _detect_column_bands(
                     zone_rows, zone_x0, zone_x1, min_gutter=_adaptive_min_gutter(zone_rows)
                 )
                 band_offset = len(all_bands)
@@ -2202,7 +2766,7 @@ def _order_body_units(
     zones = _split_into_zones(rows)
     all_units: list[tuple[int, float, list[dict]]] = []
     all_bands: list[tuple[float, float]] = []
-    for zone_rows in zones:
+    for zone_rows, peeled_bands in _peel_spanning_rows(zones):
         zone_words = [w for row in zone_rows for w in row]
         zone_x0 = min(w["x0"] for w in zone_words)
         zone_x1 = max(w["x1"] for w in zone_words)
@@ -2212,7 +2776,7 @@ def _order_body_units(
             for top, words in _read_lines(zone_rows, rtl=rtl):
                 all_units.append((band_offset, top, words))
             continue
-        zone_bands = _detect_column_bands(
+        zone_bands = peeled_bands or _detect_column_bands(
             zone_rows, zone_x0, zone_x1, min_gutter=_adaptive_min_gutter(zone_rows)
         )
         band_offset = len(all_bands)
@@ -2254,6 +2818,141 @@ def _order_body_units(
                 all_units.append((band_offset + out_idx, top, words))
 
     return all_units, all_bands
+
+
+# Two columns under a line that spans them -- a foil's product name over
+# its two text columns, an address line under them -- found no gutter: the
+# zone's few rows allow one crossing line, not two, and both columns were
+# read across, line by line ("Each Tamoxifen uncoated Citrate tablet IP
+# contains DRUG It is dangerous"). Up to this many lines are set aside at
+# each end of such a zone, when what is left still holds this many lines
+# in two or more columns no line crosses.
+_SPANNING_PEEL_MAX = 3
+_SPANNING_PEEL_MIN_INNER = 6
+# Share of the remaining lines with text on both sides of a gutter.
+_SPANNING_PEEL_MIN_WITNESS = 0.6
+
+
+def _zone_bands(zone_rows: list[list[dict]], tolerance_fraction: float = COLUMN_GUTTER_ROW_TOLERANCE_FRACTION) -> list[tuple[float, float]]:
+    words = [w for row in zone_rows for w in row]
+    return _detect_column_bands(
+        zone_rows, min(w["x0"] for w in words), max(w["x1"] for w in words),
+        min_gutter=_adaptive_min_gutter(zone_rows), tolerance_fraction=tolerance_fraction,
+    )
+
+
+# A narrow gutter's right column: lines opening after a gap this many word
+# spaces wide, starting within this many points of each other, in this
+# share of the lines; a strip at least this many word spaces wide clear
+# in every line; each side this wide; type sizes this different.
+_ALIGNED_EDGE_GAP_WORDS = 2.0
+_ALIGNED_EDGE_SPREAD = 2.0
+_ALIGNED_EDGE_MIN_SHARE = 0.7
+_ALIGNED_EDGE_MIN_GAP_WORDS = 1.5
+_ALIGNED_EDGE_MIN_SIDE = 30.0
+_ALIGNED_EDGE_SIZE_CONTRAST = 0.1
+
+
+def _aligned_edge_bands(rows: list[list[dict]]) -> Optional[list[tuple[float, float]]]:
+    """Two columns whose gutter is no wider than a few word spaces (2pt on
+    one foil, against 0.9pt word spacing), recognised by everything else
+    that marks a column: the right column's lines all start at one x, no
+    line crosses the strip before it, and the two sides are set in
+    different sizes of type. None when any of that is missing."""
+    if len(rows) < _SPANNING_PEEL_MIN_INNER:
+        return None
+    word_gap = _typical_word_gap(rows) or 1.0
+    # Per line, the words that open a run after a gap wider than a word space.
+    starts: list[list[float]] = []
+    for row in rows:
+        ws = sorted(row, key=lambda w: w["x0"])
+        starts.append([
+            b["x0"] for a, b in zip(ws, ws[1:]) if b["x0"] - a["x1"] >= _ALIGNED_EDGE_GAP_WORDS * word_gap
+        ])
+    best_lo, best_count = None, 0
+    for x in sorted({x for xs in starts for x in xs}):
+        count = sum(1 for xs in starts if any(x <= v <= x + _ALIGNED_EDGE_SPREAD for v in xs))
+        if count > best_count:
+            best_lo, best_count = x, count
+    if best_lo is None or best_count < _ALIGNED_EDGE_MIN_SHARE * len(rows):
+        return None
+    left = [w for row in rows for w in row if w["x0"] < best_lo - 0.01]
+    right = [w for row in rows for w in row if w["x0"] >= best_lo - 0.01]
+    if not left or not right:
+        return None
+    g_lo = max(w["x1"] for w in left)
+    if best_lo - g_lo < _ALIGNED_EDGE_MIN_GAP_WORDS * word_gap:
+        return None  # some line runs on into the strip
+    x0 = min(w["x0"] for w in left)
+    x1 = max(w["x1"] for w in right)
+    if min(g_lo - x0, x1 - best_lo) < _ALIGNED_EDGE_MIN_SIDE:
+        return None
+
+    def median_height(ws: list[dict]) -> float:
+        hs = sorted(w.get("bottom", 0.0) - w.get("top", 0.0) for w in ws)
+        return hs[len(hs) // 2]
+
+    lh, rh = median_height(left), median_height(right)
+    if abs(lh - rh) < _ALIGNED_EDGE_SIZE_CONTRAST * max(lh, rh):
+        return None
+    return [(x0, g_lo), (best_lo, x1)]
+
+
+def _peel_spanning_rows(
+    zones: list[list[list[dict]]],
+) -> list[tuple[list[list[dict]], Optional[list[tuple[float, float]]]]]:
+    """Each zone with None (its columns found as usual), or -- when it
+    reads as one band only because a line or two at its top or bottom
+    cross its columns' gutter, or because that gutter is too narrow for a
+    width test alone -- split into those lines, the columns between them
+    (with their bands) and the lines after."""
+    result: list[tuple[list[list[dict]], Optional[list[tuple[float, float]]]]] = []
+    for zone_rows in zones:
+        n = len(zone_rows)
+        if n < _SPANNING_PEEL_MIN_INNER or len(_zone_bands(zone_rows)) >= 2:
+            result.append((zone_rows, None))
+            continue
+        best: Optional[tuple[int, int, list[tuple[float, float]]]] = None
+        for peeled in range(0, 2 * _SPANNING_PEEL_MAX + 1):
+            for top in range(max(0, peeled - _SPANNING_PEEL_MAX), min(peeled, _SPANNING_PEEL_MAX) + 1):
+                bottom = peeled - top
+                inner = zone_rows[top:n - bottom]
+                if len(inner) < _SPANNING_PEEL_MIN_INNER:
+                    continue
+                bands = _zone_bands(inner, tolerance_fraction=0.0)
+                if len(bands) < 2 or not _bands_are_column_flow(bands) or _bands_are_number_table(bands, inner):
+                    bands = _aligned_edge_bands(inner)
+                    if bands is None:
+                        continue
+                gutters = [(a[1], b[0]) for a, b in zip(bands, bands[1:])]
+                witnesses = sum(
+                    1 for row in inner
+                    if all(
+                        any(w["x1"] <= g0 + 0.01 for w in row) and any(w["x0"] >= g1 - 0.01 for w in row)
+                        for g0, g1 in gutters
+                    )
+                )
+                if witnesses < _SPANNING_PEEL_MIN_WITNESS * len(inner):
+                    continue
+                spanning = zone_rows[:top] + zone_rows[n - bottom:]
+                if all(
+                    any(w["x0"] < g1 and w["x1"] > g0 for w in row for g0, g1 in gutters)
+                    for row in spanning
+                ):
+                    best = (top, bottom, bands)
+                    break
+            if best:
+                break
+        if best is None:
+            result.append((zone_rows, None))
+            continue
+        top, bottom, bands = best
+        for part, part_bands in (
+            (zone_rows[:top], None), (zone_rows[top:n - bottom], bands), (zone_rows[n - bottom:], None)
+        ):
+            if part:
+                result.append((part, part_bands))
+    return result
 
 
 # A two-column block inside ONE page column -- the Highlights box of a
@@ -2590,23 +3289,31 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
         if len(cells_of(a)) >= _ROW_MIN_COLUMNS and len(cells_of(b)) >= _ROW_MIN_COLUMNS
     )
     row_gap = row_gaps[len(row_gaps) // 2] if row_gaps else None
+    header_ids = _table_header_lines(ordered, cells_of)
     rows: list[list[list[dict]]] = []
     plain: list[bool] = []  # row made of single lines only
     stacked: list[bool] = []  # row joined by continuation (2 columns are enough)
+    headed: list[bool] = []  # row joined by a table header's lines
     carried: Optional[list[dict]] = None  # a label's first line, for the row below
     for k, group in enumerate(groups):
         if carried is not None:
             rows.append([carried] + list(group))
             plain.append(True)
             stacked.append(True)
+            headed.append(False)
             carried = None
             continue
         # Against the whole row so far: its columns are those of all its
         # lines (a fourth header line "(n = 69) ... (n = 70)" reaches the
         # Placebo column the third, "20 mg 40 mg 80 mg", leaves empty).
-        up = bool(rows) and plain[-1] and len(group) == 1 and _continues_cells(
+        # (A header's line also continues a row a centred heading holds
+        # together: "(%)" under "Adverse Event Term" beside "Placebo" over
+        # "(N=112)".)
+        header_line = id(group[0]) in header_ids
+        up = bool(rows) and (plain[-1] or header_line) and len(group) == 1 and _continues_cells(
             rows[-1][0] if len(rows[-1]) == 1 else [w for line in rows[-1] for w in line],
             group[0], label_spans, row_gap, cells_of=cells_of,
+            header=header_line,
         )
         # A label alone on its line belongs to the row it sits closer to:
         # "Limb" under "Pain in | 7% | ..." ends that label; "Extrapyramidal"
@@ -2616,22 +3323,42 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
         if down and (not up or _gap(group[0], below) < _gap(rows[-1][-1], group[0])):
             carried = group[0]
             continue
+        if not up and rows and len(group) > 1 and all(id(line) in header_ids for line in group):
+            # A header's staggered lines a straddle tied together: each in
+            # turn continues the row.
+            so_far = [w for line in rows[-1] for w in line]
+            up = True
+            for line in group:
+                if not _continues_cells(so_far, line, label_spans, row_gap, cells_of=cells_of, header=True):
+                    up = False
+                    break
+                so_far = so_far + line
+            if up:
+                rows[-1].extend(group)
+                stacked[-1] = True
+                headed[-1] = True
+                continue
         if up:
             rows[-1].append(group[0])
             stacked[-1] = True
+            headed[-1] = headed[-1] or header_line
         else:
             rows.append(list(group))
             plain.append(len(group) == 1)
             stacked.append(False)
+            headed.append(False)
     if carried is not None:
         rows.append([carried])
         plain.append(True)
         stacked.append(False)
+        headed.append(False)
     out: list[tuple[float, list[dict]]] = []
-    for row, by_continuation in zip(rows, stacked):
+    for row, by_continuation, by_header in zip(rows, stacked, headed):
+        # (A header fills every column on every line -- "Placebo | 20
+        # mg/day ..." over "(n=696) | (n=71) ..." -- and is still one row.)
         by_cells = (
             _read_row_by_cells(row, rtl=rtl, min_columns=2 if by_continuation else _ROW_MIN_COLUMNS)
-            if len(row) > 1
+            if len(row) > 1 and (by_header or not _complete_rows(row, cells_of))
             else None
         )
         if by_cells is None:
@@ -2639,6 +3366,33 @@ def _read_lines(lines: list[list[dict]], *, rtl: bool) -> list[tuple[float, list
         else:
             out.append((_line_top(row[0]), by_cells))
     return out
+
+
+def _complete_rows(row: list[list[dict]], cells_of) -> bool:
+    """Whether the lines a centred cell ties together are each a whole
+    table row of their own -- every line under the first holding the same
+    3+ cells, the first those plus the centred one -- to be read line by
+    line, not cell by cell. A study number centred beside its three arms
+    ("1" | "Lurasidone (40 mg/day)* | 54.2 (8.8) | -9.4 (1.6) | ...") was
+    read column by column: three labels, then three baselines, then three
+    changes -- against a ruled table read row by row. A cell wrapped over
+    two lines leaves fewer cells on its second line, or none under the row
+    label ("All Patients | -1.9 | -1.1" over "(n=672) | (n=70)"), and is
+    read by cells."""
+    cells = [sorted(cells_of(line), key=lambda c: min(w["x0"] for w in c)) for line in row]
+    counts = [len(c) for c in cells]
+    rest = counts[1:]
+    if not (min(rest) >= _ROW_MIN_COLUMNS and len(set(rest)) == 1 and counts[0] in (rest[0], rest[0] + 1)):
+        return False
+    extra = counts[0] - rest[0]
+    if extra and not all(_NUMBERING_LABEL.match(w["text"]) for w in cells[0][0]):
+        return False  # one cell more, and not a centred number: a cell of the row wrapped
+    label = cells[0][extra]  # the first line's row label, after a centred number
+    lo, hi = min(w["x0"] for w in label), max(w["x1"] for w in label)
+    return all(
+        min(w["x0"] for w in line_cells[0]) < hi and lo < max(w["x1"] for w in line_cells[0])
+        for line_cells in cells[1:]
+    )
 
 
 def _line_cells(line: list[dict]) -> list[list[dict]]:
@@ -2659,8 +3413,12 @@ def _continues_cells(
     label_spans: Optional[list[tuple[float, float]]] = None,
     row_gap: Optional[float] = None,
     cells_of=_line_cells,
+    header: bool = False,
 ) -> bool:
     """Whether ``line`` is the second line of the cells of ``above``.
+
+    ``header``: ``line`` is one of the lines of a table's header (see
+    `_table_header_lines`), which stack whatever sits in the label column.
 
     Either a table row whose cells all wrap ("-1.9" over "(n=672)" in
     every column) with its label on the first line only -- nothing of
@@ -2675,6 +3433,11 @@ def _continues_cells(
     its own label in the first column."""
     top_cells = cells_of(above)
     cells = cells_of(line)
+    if len(cells) == 1 and header:
+        # One column's heading running on alone (see `_table_header_lines`).
+        return _under_value_column(cells[0], top_cells) and _gap(above, line) <= 0.5 * min(
+            _height(w) for w in above
+        )
     if len(cells) == 1 and len(top_cells) >= _ROW_MIN_COLUMNS:
         # Only clearly closer than rows are to each other: the second
         # line of a label, not the first line of the next row's.
@@ -2702,23 +3465,156 @@ def _continues_cells(
                 for part in (above, line)
             )
         )
-        if not stub:
+        if not stub and not header and not _header_continuation(cells):
             return False
     elif len(top_cells) < _ROW_MIN_COLUMNS:
         return False
     used: set[int] = set()
-    for cell in cells:
+    top_x0 = min(w["x0"] for w in above)
+    for n_cell, cell in enumerate(cells):
         x0, x1 = min(w["x0"] for w in cell), max(w["x1"] for w in cell)
         under = [
             k for k, top in enumerate(top_cells)
             if x0 < max(w["x1"] for w in top) and min(w["x0"] for w in top) < x1
         ]
+        if not under and header and (n_cell > 0 or x1 < top_x0):
+            # A heading set lower than the rest, under an empty cell: the
+            # label column's ("Adverse Event Term"), or a column's whose
+            # neighbours run to more lines ("Placebo" under nothing, beside
+            # "Lurasidone / hydrochloride / 40 mg/day").
+            continue
         if len(under) != 1 or under[0] in used:
             return False
         used.add(under[0])
+    if not used:
+        return False
     # Directly below: no more than a normal line's leading apart.
     gap = min(w["top"] for w in line) - max(w.get("bottom", w["top"] + 10.0) for w in above)
     return gap <= 0.5 * min(_height(w) for w in above)
+
+
+# A column heading's own lines below its name: a group size, a unit, a
+# dose unit ("(N=708)", "(%)", "mg/day", "(n = 69)").
+_HEADER_CELL = re.compile(r"^\((?:n\s*=\s*[\d,]+|%)\)$|^(?:mg|mcg|µg|g|mL|%)(?:/\w+)?$", re.IGNORECASE)
+
+
+# A data cell of a table: a count, a percentage, a mean with its spread,
+# a fraction of patients, or a dash for none ("9", "<1%", "54.2 (8.8)",
+# "-9.4", "(15/263)", "—").
+_DATA_CELL = re.compile(
+    r"^(?:[<>≤≥~]\s*)?[-+−]?\d[\d.,]*\s*%?(?:\s*\(.*\))?$|^\(\d[\d,]*/\d[\d,]*\)$|^(?:—|–|-|NA|N/A)$",
+    re.IGNORECASE,
+)
+# A table header is at most this many lines, each of two or more cells,
+# with at most this many one-cell lines (a group heading) before the first
+# data row.
+_HEADER_MAX_LINES = 6
+_HEADER_MAX_LABEL_CELLS = 3
+# What makes a number a measurement rather than a dose heading.
+_MEASURE_MARKS = re.compile(r"[.%+\-−<>≤≥]")
+_HEADER_MAX_GROUP_LINES = 2
+
+
+def _table_header_lines(ordered: list[list[dict]], cells_of=_line_cells) -> set[int]:
+    """ids of the lines that are a table's header: the lines of two or
+    more cells directly above its first data row (a label, then nothing
+    but numbers). The same header was read cell by cell where Word drew it
+    ruled ("Lurasidone hydrochloride 20 mg/day (N=71)") and line by line
+    where an artwork set it unruled ("Lurasidone Lurasidone ... Parameter
+    (N=708) hydrochloride hydrochloride ..."), and every header showed as
+    deleted and inserted. Lines of a header stack in columns even over the
+    label column, which data rows never do (see `_continues_cells`)."""
+    if not any(len(cells_of(line)) >= _ROW_MIN_COLUMNS for line in ordered):
+        return set()
+    found: set[int] = set()
+    run: list[list[dict]] = []
+    group_lines = 0
+    previous: Optional[list[dict]] = None
+    for line in ordered:
+        cells = cells_of(line)
+        centred = previous is not None and _gap(previous, line) < 0
+        previous = line
+        if len(cells) < 2 and run and _under_value_column(cells[0], cells_of(run[0])):
+            # One column's heading running to more lines than its
+            # neighbours', staggered ("(N=334)" under "Placebo", then "20
+            # to 120 mg/day" under "Lurasidone hydrochloride").
+            run.append(line)
+            group_lines = 0
+            continue
+        if len(cells) < 2 and centred and run:
+            continue  # the label column's heading, centred beside the header's lines
+        if len(cells) < 2:
+            group_lines += 1
+            if group_lines > _HEADER_MAX_GROUP_LINES:
+                run = []
+            continue
+        texts = [" ".join(w["text"] for w in cell) for cell in cells]
+        # A data row: its label -- one to three cells, a study number and
+        # an arm among them ("1 | Lurasidone hydrochloride | 54.2 (8.8) |
+        # ...") -- then numbers only; two of them, or one measurement
+        # ("Total cholesterol | 5.4%", its other column's "5.7%" staggered).
+        trailing = 0
+        for text in reversed(texts):
+            if not _DATA_CELL.match(text):
+                break
+            trailing += 1
+        leading = texts[:len(texts) - trailing]
+        is_data = (
+            1 <= len(leading) <= _HEADER_MAX_LABEL_CELLS
+            and any(ch.isalpha() for text in leading for ch in text)
+            and (trailing >= 2 or (trailing == 1 and bool(_MEASURE_MARKS.search(texts[-1]))))
+        )
+        if is_data:
+            # Lines wholly left of the row's numbers are the first lines of
+            # its label ("Monotherapy study | Lurasidone hydrochloride" over
+            # "(20 to 60 mg/day)* | 30.3 (5.0) | ..."), not the header's.
+            first_value = min(w["x0"] for w in cells[len(cells) - trailing])
+            while run and max(w["x1"] for w in run[-1]) < first_value:
+                run.pop()
+            if 2 <= len(run) <= _HEADER_MAX_LINES:
+                found.update(id(header_line) for header_line in run)
+            run = []
+        elif all(_DATA_CELL.match(t) and _MEASURE_MARKS.search(t) for t in texts):
+            # Values whose label stands on lines of its own ("Total" /
+            # "Cholesterol" beside "5.3% | 13.8% ..."): a data row, never
+            # a header -- which holds names, sizes and doses ("20 | 40").
+            run = []
+        else:
+            if group_lines:
+                run = []  # a one-cell line inside a header ends it
+            run.append(line)
+        group_lines = 0
+    return found
+
+
+def _under_value_column(cell: list[dict], top_cells: list[list[dict]]) -> bool:
+    """Whether ``cell`` lies under exactly one of ``top_cells`` other than
+    the first (the label column's), centred within it -- a heading set
+    across columns ("Mean Change from Baseline (mg/dL)", over three dose
+    columns) reaches into one of them, off its centre."""
+    x0, x1 = min(w["x0"] for w in cell), max(w["x1"] for w in cell)
+    under = [
+        k for k, top in enumerate(top_cells)
+        if x0 < max(w["x1"] for w in top) and min(w["x0"] for w in top) < x1
+    ]
+    if len(top_cells) < 2 or len(under) != 1 or under[0] == 0:
+        return False
+    top = top_cells[under[0]]
+    return min(w["x0"] for w in top) <= (x0 + x1) / 2.0 <= max(w["x1"] for w in top)
+
+
+def _header_continuation(cells: list[list[dict]]) -> bool:
+    """Whether a line's cells after its first are mostly a header's
+    lower lines ("Organ Class | (N=708) | mg/day | mg/day ..." under "Body
+    System or | Placebo | 20 | 40 ..."). Such a line continues the header
+    above it even under the row-label column -- where a data row ("Vomiting
+    | 3 | 4 ...") never does: its cells are numbers. Read line by line, the
+    header's names and sizes came out apart, against a ruled table's cells
+    read whole ("Placebo (N=708) (%)")."""
+    values = [" ".join(w["text"] for w in cell) for cell in cells[1:]]
+    if len(values) < 2:
+        return False
+    return sum(1 for v in values if _HEADER_CELL.match(v)) * 2 > len(values)
 
 
 def _continues_label(top_cells: list[list[dict]], cell: list[dict]) -> bool:
@@ -2945,6 +3841,8 @@ def _table_units_for(
     *,
     band_idx: Optional[int] = None,
     rtl: bool = False,
+    inner_ids: Optional[dict[int, tuple[int, int, int]]] = None,
+    tables: Optional[list[dict]] = None,
 ) -> list[tuple[int, float, list[dict]]]:
     """One table's words -> (band_index, cell_top, words) per populated cell.
 
@@ -2962,11 +3860,13 @@ def _table_units_for(
     sub-column by sub-column rather than horizontal line interleaving.
     """
     by_cell: dict[tuple[int, int], list[dict]] = {}
+    by_cell_entries: dict[tuple[int, int], list[tuple[int, dict]]] = {}
     words_by_col: dict[int, list[dict]] = {}
     non_header_by_col: dict[int, list[dict]] = {}
     for w_idx, w in entries:
         r, c = cell_ids[w_idx][1:]
         by_cell.setdefault((r, c), []).append(w)
+        by_cell_entries.setdefault((r, c), []).append((w_idx, w))
         words_by_col.setdefault(c, []).append(w)
         if r >= 1:
             non_header_by_col.setdefault(c, []).append(w)
@@ -3003,18 +3903,41 @@ def _table_units_for(
     # draws "+0.10" and "(n=103)" in separate grid rows of one record
     # ("All Patients | +0.10 | ..." then " | (n=103) | ..."), where a Word
     # draft has one row of two-line cells. Read cell by cell -- "+0.10
-    # (n=103) +0.75 (n=102)" -- as the borderless table is. Header rows,
-    # which have no label either, are never merged into each other.
+    # (n=103) +0.75 (n=102)" -- as the borderless table is.
     columns_of: dict[int, set[int]] = {}
     for (r, c), words in by_cell.items():
         if words:
             columns_of.setdefault(r, set()).add(c)
     record_of: dict[int, int] = {}
+    # The header too: the grid rows of two or more cells, none in the label
+    # column, directly above the first labelled row are one header, read
+    # column by column -- "Placebo | Lurasidone hydrochloride tablets 40
+    # mg/day | ..." -- as a stacked header set without rules is (see
+    # `_table_header_lines`). Read row by row, an SPL's header ("Lurasidone
+    # hydrochloride tablets | Lurasidone ..." over "Placebo | 40 mg/day |
+    # 80 mg/day") came out apart, against its Word draft's whole cells.
+    # (Under the table's caption, when the grid draws that as its first
+    # row: "Table 10. Weight Changes (kg) ..." across the whole table.)
+    first_row = min(columns_of, default=0)
+    for labelled in sorted(r for r, cols in columns_of.items() if 0 in cols):
+        header_rows: list[int] = []
+        r = labelled - 1
+        while r in columns_of and 0 not in columns_of[r] and len(columns_of[r]) >= 2:
+            header_rows.insert(0, r)
+            r -= 1
+        at_top = r < first_row or (r == first_row and len(columns_of[r]) == 1)
+        if header_rows and at_top and 2 <= len(header_rows) <= _HEADER_MAX_LINES:
+            for r in header_rows:
+                record_of[r] = header_rows[0]
+        if labelled > first_row:
+            break
     record = None  # the labelled row the rows just read belong to
     previous = None
     for r in sorted(columns_of):
         cols = columns_of[r]
-        if 0 in cols:
+        if r in record_of:  # a header row
+            record = None
+        elif 0 in cols:
             record = r
             record_of[r] = r
         elif record is not None and previous is not None and record_of[previous] == record \
@@ -3029,7 +3952,33 @@ def _table_units_for(
     for (r, c) in sorted(by_cell):
         words = by_cell[(r, c)]
         sub_bands = col_sub_bands.get(c, [])
-        if len(sub_bands) <= 1 or not words:
+        nested: dict[int, list[tuple[int, dict]]] = {}
+        for w_idx, w in by_cell_entries[(r, c)] if inner_ids else ():
+            inner = inner_ids.get(w_idx)
+            if inner is not None and inner[0] != t_idx:
+                nested.setdefault(inner[0], []).append((w_idx, w))
+        if nested and tables is not None:
+            # The cell holds a whole table of its own: read that table
+            # cell by cell, row by row, as the same table is read where
+            # it stands alone -- never line by line across its columns,
+            # which runs one cell's words into the next ("Placebo
+            # MOUNJARO MOUNJARO Reaction (N=235) ..."). Text above or
+            # below it in the cell (a caption, a note) keeps its place.
+            blocks: list[tuple[float, list[dict]]] = []
+            for j, inner_entries in nested.items():
+                inner_units = _table_units_for(
+                    j, inner_entries, [(tables[j]["bbox"][0], tables[j]["bbox"][2])], inner_ids,
+                    tables[j]["bbox"], band_idx=0, rtl=rtl,
+                )
+                blocks.append(
+                    (tables[j]["bbox"][1], [w for _b, _k, ws in sorted(inner_units, key=lambda u: u[1]) for w in ws])
+                )
+            in_nested = {id(w) for inner_entries in nested.values() for _i, w in inner_entries}
+            loose = [w for w in words if id(w) not in in_nested]
+            if loose:
+                blocks.extend(_read_lines(_group_into_lines(loose), rtl=rtl))
+            cell_words = [w for _top, block in sorted(blocks, key=lambda b: b[0]) for w in block]
+        elif len(sub_bands) <= 1 or not words:
             cell_words: list[dict] = []
             # A cell the grid draws around a whole stacked header -- or
             # around a whole table, with no rules between its columns --
@@ -3104,7 +4053,16 @@ def _adaptive_min_gutter(rows: list[list[dict]]) -> float:
     typical_gap = _typical_word_gap(rows)
     if typical_gap is None:
         return MIN_COLUMN_GUTTER_WIDTH
-    return min(25.0, max(MIN_GUTTER_WIDTH_FLOOR, typical_gap * GUTTER_WIDTH_MULTIPLIER))
+    # The floor scales down with type too small for it: a foil set in
+    # 2.8pt type has its two columns 6pt apart -- two text heights, a wide
+    # gutter at that size -- and was read across, line by line.
+    heights = sorted(
+        w["bottom"] - w["top"] for row in rows for w in row if w.get("bottom", 0.0) > w.get("top", 0.0)
+    )
+    floor = MIN_GUTTER_WIDTH_FLOOR
+    if heights:
+        floor = min(floor, _GUTTER_FLOOR_HEIGHTS * heights[len(heights) // 2])
+    return min(25.0, max(floor, typical_gap * GUTTER_WIDTH_MULTIPLIER))
 
 
 def _detect_column_bands(
@@ -3209,7 +4167,18 @@ def _detect_column_bands(
             right_text = left_edge_at.get(end + 1)
             if left_text is not None and right_text is not None:
                 run_width = max(run_width, (right_text - left_text))
-            if run_width >= min_gutter:
+            # In a block of a few lines, a run some row crosses is a gutter
+            # only as wide as one: in a 3-line block, a full-width line ("...
+            # acidosis, including diabetic ketoacidosis [see Warnings and")
+            # was cut at the 321pt left free by a short line beside a page
+            # number, and its middle read after "Page 7 of 40". (Among many
+            # lines one crossing is the exception: a Contents list's wide
+            # gutter under its full-width title.)
+            crossed = threshold > 0 and any(counts[x] for x in range(start, end + 1))
+            too_wide = (
+                crossed and run_width > _MAX_CROSSED_GUTTER_WIDTH and total_rows < _FEW_ROWS
+            )
+            if run_width >= min_gutter and not too_wide:
                 gaps.append((x0i + start, x0i + end))
         else:
             k += 1
@@ -3422,6 +4391,11 @@ class ComparisonToken:
         return self.source_words[0].page if self.source_words else None
 
     @property
+    def artwork(self) -> bool:
+        """In an artwork sheet's box or its note (see `Word.artwork`)."""
+        return bool(self.source_words) and all(getattr(w, "artwork", False) for w in self.source_words)
+
+    @property
     def bbox(self) -> Optional[tuple[float, float, float, float]]:
         """Union bounding box across all source words (may span 2 lines)."""
         if not self.source_words:
@@ -3475,6 +4449,10 @@ def build_comparison_tokens(words: list[Word]) -> list[ComparisonToken]:
         is_hyphen_split = (
             word.text.endswith("-")
             and len(word.text) > 1  # not a bare "-" bullet/dash
+            # ...nor a rule ending a heading line ("------" + "s;" on the
+            # next line was read as "-----s;", and the heading's rules
+            # were no longer seen to frame it).
+            and not _TRAILING_DASH_RULE.search(word.text)
             and i + 1 < n
             and _is_new_line(word, words[i + 1])
             # Only when the next word is in the same table cell (or
@@ -3520,6 +4498,12 @@ _DASH_RULE = re.compile(r"^[-‐-―_]{3,}$")
 # ...and the same rule set solid against its heading ("-------DOSAGE",
 # "ADMINISTRATION-------"), as an outsert prints it.
 _GLUED_DASH_RULE = re.compile(r"^[-‐-―_]{3,}(?=\w)|(?<=\w)[-‐-―_]{3,}$")
+_LEADING_DASH_RULE = re.compile(r"^[-‐-―_]{3,}")
+_TRAILING_DASH_RULE = re.compile(r"[-‐-―_]{3,}$")
+# A heading framed by rules may wrap: "------ DOSAGE FORMS AND" over
+# "STRENGTHS ------"; it is a few words long.
+_MAX_RULED_HEADING_LINES = 3
+_MAX_RULED_HEADING_WORDS = 12
 
 
 def _drop_dash_rules(tokens: list[ComparisonToken]) -> list[ComparisonToken]:
@@ -3529,9 +4513,19 @@ def _drop_dash_rules(tokens: list[ComparisonToken]) -> list[ComparisonToken]:
     solid against a heading word are taken off it, so "-------DOSAGE"
     and "------- DOSAGE" both compare as "DOSAGE"; a single dash glued
     to a heading word beside a rule ("CHANGES-" before "--------") is
-    part of the rule, not of the word."""
+    part of the rule, not of the word.
+
+    Only where rules FRAME a heading -- a rule, a few words, a rule, on
+    one line or wrapped over a few -- or a rule stands on a line of its
+    own. Dashes anywhere else are text and are compared: "DISCONTINUATION
+    OF------" in a boxed warning was read as "OF", and dashes typed into a
+    sentence were never reported."""
+    framed = _rule_framed_tokens(tokens)
     kept: list[ComparisonToken] = []
     for k, token in enumerate(tokens):
+        if k not in framed:
+            kept.append(token)
+            continue
         if _DASH_RULE.match(token.text):
             continue
         text = _GLUED_DASH_RULE.sub("", token.text)
@@ -3545,6 +4539,56 @@ def _drop_dash_rules(tokens: list[ComparisonToken]) -> list[ComparisonToken]:
             )
         kept.append(token)
     return kept
+
+
+def _rule_framed_tokens(tokens: list[ComparisonToken]) -> set[int]:
+    """Indexes of the tokens framed by dash rules (see `_drop_dash_rules`):
+    from a token starting with a rule to the next token ending with one,
+    a heading's few words apart and on the same line or the next ones. A
+    rule alone frames itself. Not the whole line: text printed over the
+    end of a heading line (") mg to 4 mg per dose" after "------ DOSAGE
+    AND ADMINISTRATION ------") does not unframe it."""
+    line_of: list[int] = []
+    line = -1
+    previous: Optional[Word] = None
+    for token in tokens:
+        first = token.source_words[0] if token.source_words else None
+        if previous is None or first is None or _is_new_line(previous, first):
+            line += 1
+        line_of.append(line)
+        if token.source_words:
+            previous = token.source_words[-1]
+
+    def alone_on_line(k: int) -> bool:
+        return (k == 0 or line_of[k - 1] != line_of[k]) and (k + 1 == len(tokens) or line_of[k + 1] != line_of[k])
+
+    framed: set[int] = set()
+    k = 0
+    while k < len(tokens):
+        if not _LEADING_DASH_RULE.match(tokens[k].text):
+            k += 1
+            continue
+        end = None
+        if not _DASH_RULE.match(tokens[k].text) and _TRAILING_DASH_RULE.search(tokens[k].text):
+            framed.add(k)  # "-----CONTRAINDICATIONS----", one word
+            k += 1
+            continue
+        for j in range(k + 1, min(len(tokens), k + _MAX_RULED_HEADING_WORDS + 2)):
+            if line_of[j] - line_of[k] >= _MAX_RULED_HEADING_LINES:
+                break
+            if _TRAILING_DASH_RULE.search(tokens[j].text):
+                end = j
+                break
+            if _LEADING_DASH_RULE.match(tokens[j].text):
+                break  # another heading opens before this one closed
+        if end is None and _DASH_RULE.match(tokens[k].text) and alone_on_line(k):
+            end = k  # a rule on a line of its own
+        if end is None:
+            k += 1
+            continue
+        framed.update(range(k, end + 1))
+        k = end + 1
+    return framed
 
 
 def _is_new_line(word: Word, next_word: Word) -> bool:

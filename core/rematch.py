@@ -257,17 +257,6 @@ def rematch_item(
     side = _usable_side(item, side)
     if side is None:
         return Rematch([item], False, 0.0, message="This row has no text to search for.")
-    if item.kind == "reordered_section":
-        # Its text is the same on both sides by definition; what it
-        # reports is the ORDER, which a match on the text cannot undo.
-        return Rematch(
-            [item], False, 0.0,
-            message=(
-                "This row reports that a whole section sits in a different order; the "
-                "differences inside it are listed as rows of their own -- rematch those."
-            ),
-        )
-
     context = context or RematchContext(approved_tokens, suspect_tokens)
     own_tokens = context.tokens[side]
     other = other_side(side)
@@ -588,10 +577,6 @@ def rematch_areas(
     left_out: dict[str, set[int]] = {APPROVED: set(), SUSPECT: set()}
     pages = {side: {page for page, _box in areas[side]} for side in tokens}
     for item in items:
-        if item.kind == "reordered_section":
-            # It reports the ORDER of a whole section, whose words are
-            # paired; pairing passages by hand does not change the order.
-            continue
         locations = {side: _location_of_side(item, side) for side in tokens}
         # Cheap test first: only a row on a page of an area can touch it.
         if not any(

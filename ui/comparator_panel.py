@@ -64,7 +64,7 @@ from core.inline_diff import Segment, changed_words, inline_segments
 from core.token_map import APPROVED, SUSPECT, TokenMap
 from ui import theme
 
-_SEVERITY_LABEL = {"reorder": "Moved"}
+_SEVERITY_LABEL: dict[str, str] = {}
 # A space inside a changed run is drawn as this, so a spacing-only
 # difference is actually visible.
 _VISIBLE_SPACE = "·"
@@ -663,9 +663,6 @@ class ComparatorPanel(QWidget):
     def _summary(self, item: DiffItem) -> str:
         """One line naming just the words that differ."""
         left, right = changed_words(item.approved_text, item.suspect_text)
-        if item.severity == "reorder" and not left and not right:
-            # Nothing in the text changed -- where it sits did.
-            return "Same text — moved to a different position in the document."
         if not left and not right:
             # Everything that differs is whitespace.
             return "Spacing only — the words themselves are identical."
